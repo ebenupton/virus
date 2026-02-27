@@ -107,17 +107,9 @@ HARNESS_TEMPLATE = """\
 
 .segment "CODE"
 
-; Temp ZP storage (doesn't collide with raster.s $70-$84)
-save_d   = $60
-save_y   = $61
-jmp_lo   = $62
-jmp_hi   = $63
-
 main:
     CLD                         ; ensure binary mode
-    ; ── set screen page and const_ff ──
-    LDA #$FF
-    STA $77                     ; const_ff
+    ; ── set screen page ──
     LDA #${screen_hi:02X}
     STA $84                     ; screen_page
 
@@ -131,34 +123,14 @@ main:
     LDA #{y1}
     STA $83                     ; y1
 
-    ; ── call setup_line ──
-    JSR setup_line              ; returns X=d, Y=row, C=1
-
-    ; ── save returned state ──
-    STX save_d
-    STY save_y
-
-    ; ── look up entry point ──
-    LDA $80                     ; x0
-    AND #$07
-    ASL A                       ; *2 for word index
-    TAX
-    LDA entry_table,X
-    STA jmp_lo
-    LDA entry_table+1,X
-    STA jmp_hi
-
     ; ── push return address so draw_line's RTS lands at halt ──
     LDA #>(halt-1)
     PHA
     LDA #<(halt-1)
     PHA
 
-    ; ── restore state and jump ──
-    LDY save_y
-    LDX save_d
-    SEC                         ; C=1 for first SBC
-    JMP (jmp_lo)                ; enter the draw loop
+    ; ── setup and draw ──
+    JMP draw_line
 
 halt:
     STP                         ; $DB — stop the 65C02

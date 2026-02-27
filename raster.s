@@ -1,238 +1,89 @@
+; raster.s — Shallow line rasterizer (dx >= dy) for 65C02
+; Gated on byte columns (X axis), mirroring steep rasterizer's clean termination.
+;
+; Rerolled inner loop: single pixel body with LSR/ASL shift before branch.
+; LSR for forward / ASL for reverse (SMC).  Shift occurs after pixel plot.
+;
+; .smc_branch is a 3-byte SMC slot.
+; Normal columns: BCC pixel_loop + NOP (32 cycles/pixel).
+;   C=0 from LSR/ASL loops back; C=1 when last bit shifts out falls through.
+; Final column: BBR(N) mask_zp, pixel_loop (34 cycles/pixel).
+;   BBR detects the termination bit and falls through
+;   Full-column endpoints (x1&7=7 fwd, x1&7=0 rev) keep BCC mode
+;   since the column empties to $00 via carry, which BBR can't catch.
+;   Overlapping tables (fwd/rev) indexed by x1&7 give BBR opcode or $90 (BCC).
+; Outer loop counts byte columns via INC toward zero.
+;
+; Carry invariant: C=0 at pixel_loop entry (from LSR/ASL or column CLC).
+; Column transitions reload mask_zp via SMC immediate and CLC.
+; Storing dy-1 in delta_minor makes SBC with C=0 subtract dy.
+
 ; Zero page variables
 base            = $70       ; 2 bytes - pointer to current position
-delta_down      = $72       ; 1 byte - dy
-delta_up        = $73       ; 1 byte - dx
-cols_left       = $74       ; 1 byte - byte columns remaining after current
-fixup_index     = $75       ; 1 byte - index into fixup_table
-stripes_left    = $76       ; 1 byte - negated stripes remaining (INC toward zero)
-const_ff        = $77       ; 1 byte - must be initialized to $FF by caller
-final_bias      = $78       ; 1 byte - base offset for final stripe
-ret_ptr         = $79       ; 2 bytes - pointer for exit fixup
+delta_minor     = $72       ; 1 byte - dy-1 (or 0 when dy=0)
+delta_major     = $73       ; 1 byte - dx (added back on y-step)
+mask_zp         = $74       ; 1 byte - current pixel bitmask
+cols_left       = $75       ; 1 byte - negated column counter (INC toward 0)
+final_branch    = $76       ; 1 byte - precomputed BBR/BCC opcode
+x0              = $80
+y0              = $81
+x1              = $82
+y1              = $83
+screen_page     = $84
 
-; Entry points based on x0 & 7
-entry_table:
-    .word .bit7, .bit6, .bit5, .bit4, .bit3, .bit2, .bit1, .bit0
+; Opcodes used in self-modifying code
+opLSRzp         = $46
+opASLzp         = $06
+opBCC           = $90
+opNOP           = $EA
+opBBR0          = $0F
+opBBR1          = $1F
+opBBR2          = $2F
+opBBR3          = $3F
+opBBR4          = $4F
+opBBR5          = $5F
+opBBR6          = $6F
+opBBR7          = $7F
+
+; Mask initialization lookup table
+mask_init_table:
+    .byte $80, $40, $20, $10, $08, $04, $02, $01
+
+; BBR opcode tables indexed by x1 & 7.
+; $90 (BCC) sentinel shared: fwd_branch_table[7] = rev_branch_table[0].
+fwd_branch_table:
+    .byte opBBR6, opBBR5, opBBR4, opBBR3, opBBR2, opBBR1, opBBR0
+rev_branch_table:
+    .byte  opBCC, opBBR7, opBBR6, opBBR5, opBBR4, opBBR3, opBBR2, opBBR1
 
 ;---------------------------------------
 ; Main drawing routine
-; Call setup_line first, then JMP to appropriate entry point
-; Invariant: d is in X at each .bit<N> label
+; Inputs: x0, y0, x1, y1, screen_page
+; Requires: dx >= dy, x1 >= x0
 ;---------------------------------------
 
 draw_line:
-.bit7:
-    LDA (base),Y
-.mask7:
-    EOR #$80
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step7
-    ADC delta_up
-    DEY
-    BPL .step7
-    JSR do_stripe_up
-.step7:
-    TAX
-.bit6:
-    LDA (base),Y
-.mask6:
-    EOR #$40
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step6
-    ADC delta_up
-    DEY
-    BPL .step6
-    JSR do_stripe_up
-.step6:
-    TAX
-.bit5:
-    LDA (base),Y
-.mask5:
-    EOR #$20
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step5
-    ADC delta_up
-    DEY
-    BPL .step5
-    JSR do_stripe_up
-.step5:
-    TAX
-.bit4:
-    LDA (base),Y
-.mask4:
-    EOR #$10
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step4
-    ADC delta_up
-    DEY
-    BPL .step4
-    JSR do_stripe_up
-.step4:
-    TAX
-.bit3:
-    LDA (base),Y
-.mask3:
-    EOR #$08
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step3
-    ADC delta_up
-    DEY
-    BPL .step3
-    JSR do_stripe_up
-.step3:
-    TAX
-.bit2:
-    LDA (base),Y
-.mask2:
-    EOR #$04
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step2
-    ADC delta_up
-    DEY
-    BPL .step2
-    JSR do_stripe_up
-.step2:
-    TAX
-.bit1:
-    LDA (base),Y
-.mask1:
-    EOR #$02
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step1
-    ADC delta_up
-    DEY
-    BPL .step1
-    JSR do_stripe_up
-.step1:
-    TAX
-.bit0:
-    LDA (base),Y
-.mask0:
-    EOR #$01
-    STA (base),Y
-    TXA
-    SBC delta_down
-    BCS .step0
-    ADC delta_up
-    DEY
-    BPL .step0
-    JSR do_stripe_up
-.step0:
-    DEC cols_left
-    BMI .cols_done          ; no more columns
-    TAX
-    LDA base
-.advance:
-    ADC #7                  ; operand: 7 (fwd) / $F7 (rev); C=1 from draw loop
-    STA base
-    SEC
-    JMP .bit7
-
-.cols_done:
-    LDX fixup_index
-    LDA fixup_table,X
-    EOR (base),Y
-    STA (base),Y
-    RTS
-
-;---------------------------------------
-; Stripe transition handler (always upward)
-; d is in A on entry; returns d in A for caller's .step TAX
-;---------------------------------------
-do_stripe_up:
-    INC stripes_left
-    BPL .slow_path
-    ; Normal stripe transition
-    DEC base+1
-    LDY #7
-    RTS
-
-.slow_path:
-    BEQ .enter_final        ; zero: enter final stripe
-    ; positive: fall through to exit
-
-;---------------------------------------
-; Line exit: fix up overrun pixels in last byte column.
-; Uses JSR return address to find which bit we exited at.
-; ret_addr - 15 = address of EOR operand in the calling block.
-;---------------------------------------
-.exit_line:
-    PLA                     ; ret addr lo (C=1 from ADC delta_up)
-    SBC #15                 ; offset to EOR operand
-    STA ret_ptr
-    PLA                     ; ret addr hi
-    SBC #0                  ; propagate borrow
-    STA ret_ptr+1
-    LDA (ret_ptr)           ; read EOR operand = single-bit exit mask
-    STA ret_ptr             ; save mask for reverse EOR
-    ; Compute drawn_bits: (mask-1) EOR $FF = ~(mask-1) forward
-    ;                     (mask-1) EOR mask = (mask<<1)-1 reverse
-    DEC A
-.smod_eor:
-    EOR const_ff            ; SMC operand: const_ff=$77 (fwd) / ret_ptr=$79 (rev)
-    LDX fixup_index
-    AND fixup_table,X       ; isolate overrun bits within drawn region
-    EOR (base)
-    STA (base)
-    RTS
-
-;---------------------------------------
-; Enter final stripe
-;---------------------------------------
-.enter_final:
-    TAX                     ; save d — only this path clobbers A
-    DEC base+1
-    LDA base
-    CLC
-    ADC final_bias
-    STA base
-    LDA #8                  ; 8 not 7: C=0 after ADC, so SBC borrows 1
-    SBC final_bias
-    TAY
-    TXA                     ; restore d to A
-    ; C=1 from SBC (8 >= final_bias+1 always)
-    RTS
-
-;---------------------------------------
-; Setup routine
-; Inputs: x0, y0, x1, y1
-; Returns: X=d, Y=row, C=1
-;---------------------------------------
-x0          = $80
-y0          = $81
-x1          = $82
-y1          = $83
-screen_page = $84           ; 1 byte - MSB of screen base address
-
-setup_line:
     ; === Common preamble ===
 
-    ; delta_up = dx
-    LDA x1
+    LDX x1
+
+    ; delta_major = dx = x1 - x0
+    TXA
     SEC
     SBC x0
-    STA delta_up
+    STA delta_major
 
-    ; cols_left = ((x1 & $F8) - (x0 & $F8)) / 8
-    LDA x1
+    ; cols_left = (x0>>3) - (x1>>3) [always <= 0]
+    ; C=1 from delta_major SBC (x1 >= x0)
+    ; (x1|7) - x0 = (x1>>3 - x0>>3)*8 + (7 - (x0&7)), remainder in [0,7]
+    TXA
     ORA #$07
-    SBC x0                  ; C=1 from above (x1 >= x0)
+    SBC x0                  ; C=1: exact (x1|7) - x0
     LSR
     LSR
-    LSR
+    LSR                     ; A = (x1>>3) - (x0>>3)
+    EOR #$FF
+    INC A                   ; negate
     STA cols_left
 
     ; Compute dy = y0 - y1, branch on direction
@@ -241,46 +92,23 @@ setup_line:
     SBC y1
     BCC .setup_reverse      ; y1 > y0: reverse
 
-    ; Forward: A = y0 - y1 = |dy|
-    STA delta_down
-
     ;===================================
     ; SETUP FORWARD (y0 >= y1, left-to-right)
     ;===================================
-    ; fixup offset from forward table
-    LDA x1
+.setup_forward:
+    ; Forward: A = y0 - y1 = |dy|
+    STA delta_minor
+
+    ; Precompute branch opcode for final column
+    TXA
     AND #$07
-    STA fixup_index
+    TAY
+    LDA fwd_branch_table,Y
+    STA final_branch
 
-    ; Skip self-mod if already in forward state
-    BIT .mask7+1
-    BMI .setup_common       ; bit 7 set = $80 = already forward
-
-    ; Self-modify EOR masks via LSR chain
-    LDA #$80
-    STA .mask7+1
-    LSR
-    STA .mask6+1
-    LSR
-    STA .mask5+1
-    LSR
-    STA .mask4+1
-    LSR
-    STA .mask3+1
-    LSR
-    STA .mask2+1
-    LSR
-    STA .mask1+1
-    LSR
-    STA .mask0+1
-
-    ; Self-modify column advance +8
-    LDA #7
-    STA .advance+1
-
-    ; Self-modify exit EOR for forward: EOR const_ff
-    LDA #<const_ff
-    STA .smod_eor+1
+    LDA #opLSRzp
+    LDX #$80
+    LDY #$07
 
     BRA .setup_common
 
@@ -291,54 +119,25 @@ setup_line:
     ; Reverse: A = y0 - y1 (negative), negate for |dy|
     EOR #$FF
     INC A
-    STA delta_down
+    STA delta_minor
 
-    ; fixup offset into reverse half of table
+    ; Precompute branch opcode for final column
     LDA x0
     AND #$07
-    ORA #$08
-    STA fixup_index
+    TAY
+    LDA rev_branch_table,Y
+    STA final_branch
 
-    ; Swap y0 <-> y1
-    LDA y0
-    LDX y1
-    STX y0
-    STA y1
+    ; x0 <-- x1 (x1 not read after this point)
+    STX x0
 
-    ; Swap x1 into x0 and set entry bits for reversed draw order
-    LDA x1
-    EOR #$07
-    STA x0
+    ; y0 <-- y1 (y1 not read after this point)
+    LDA y1
+    STA y0
 
-    ; Skip self-mod if already in reverse state
-    BIT .mask7+1
-    BPL .setup_common       ; bit 7 clear = $01 = already reverse
-
-    ; Self-modify EOR masks via ASL chain
-    LDA #$01
-    STA .mask7+1
-    ASL
-    STA .mask6+1
-    ASL
-    STA .mask5+1
-    ASL
-    STA .mask4+1
-    ASL
-    STA .mask3+1
-    ASL
-    STA .mask2+1
-    ASL
-    STA .mask1+1
-    ASL
-    STA .mask0+1
-
-    ; Self-modify column advance -8
-    LDA #$F7                ; -8 unsigned (C=1 adds the extra 1)
-    STA .advance+1
-
-    ; Self-modify exit EOR for reverse: EOR ret_ptr (saved mask)
-    LDA #<ret_ptr
-    STA .smod_eor+1
+    LDA #opASLzp
+    LDX #$01
+    LDY #$F7
 
     ; Fall through to .setup_common
 
@@ -346,68 +145,118 @@ setup_line:
     ; SETUP COMMON (always upward after possible swap)
     ;===================================
 .setup_common:
-    ; d = dx - |dy| -> X
-    LDA delta_up
-    SEC
-    SBC delta_down
-    TAX
+    STA .smc_shift
+    STX .smc_mask + 1
+    STY .smc_advance + 1
 
-    ; base+1 = (y0/8) + screen_page; stash y0/8 in stripes_left
+    ; mask_zp = mask_init_table[x0 & 7]
+    LDA x0
+    AND #$07
+    TAX
+    LDA mask_init_table,X
+    STA mask_zp
+
+    ; base+1 = (y0/8) + screen_page
     LDA y0
     LSR
     LSR
     LSR
-    STA stripes_left
     CLC
     ADC screen_page
     STA base+1
 
+    ; base = x0 & $F8
     LDA x0
     AND #$F8
     STA base
 
-    ; final_bias = y1 & 7
-    LDA y1
-    AND #$07
-    STA final_bias
-
-    ; stripes_left = y1/8 - y0/8
-    LDA y1
-    LSR
-    LSR
-    LSR
-    SEC
-    SBC stripes_left
-    STA stripes_left
-    BMI .multi
-
-    ; === Single stripe ===
-    LDA base
-    CLC
-    ADC final_bias
-    STA base
-
-    ; Y = (y0 & 7) - final_bias
-    LDA y0
-    AND #$07
-    SEC
-    SBC final_bias
-    TAY
-    ; C=1 from SBC (y0&7 >= final_bias in single stripe)
-    RTS
-
-.multi:
     ; Y = y0 & 7
     LDA y0
     AND #$07
     TAY
 
+    ; Write BCC default to .smc_branch (fast path for normal columns)
+    LDA #opBCC
+    STA .smc_branch
+    LDA #<(pixel_loop - (.smc_branch + 2))   ; backward offset to pixel_loop
+    STA .smc_branch + 1
+    LDA #opNOP                            ; NOP padding
+    STA .smc_branch + 2
+
+    ; Single-column override: write branch for immediate termination
+    LDA cols_left
+    BNE .setup_multi
+    JSR write_final_branch     ; apply precomputed branch (preserves X, Y)
+
+.setup_multi:
+    ; d = dx - dy → X (delta_minor still holds original dy here)
+    LDA delta_major
     SEC
-    RTS
+    SBC delta_minor
+    TAX
+
+    ; Adjust delta_minor: store dy-1 for the C=0 SBC trick
+    ; (dy=0 stays 0: SBC 0 with C=0 gives d-1, correct BCS until phantom)
+    LDA delta_minor
+    BEQ .keep
+    DEC delta_minor
+.keep:
+
+    CLC                     ; C=0 for pixel_loop entry
+
+    ; Fall through to pixel_loop
+
+pixel_loop:
+    LDA (base),Y
+    EOR mask_zp
+    STA (base),Y
+    TXA
+    SBC delta_minor         ; C=0: A - (dy-1) - 1 = A - dy
+    BCS .no_ystep
+    ADC delta_major         ; d += dx; C=1 guaranteed (dx >= dy)
+    DEY
+    BPL .no_ystep
+    DEC base+1
+    LDY #7
+.no_ystep:
+    TAX                     ; save d; C=1 here (from BCS or ADC)
+.smc_shift:
+    LSR mask_zp             ; SMC: LSR $46 (fwd) / ASL $06 (rev)
+.smc_branch:
+    BCC pixel_loop              ; SMC'd: BCC pixel_loop + NOP (normal cols)
+    NOP                         ;     or BBR(N) mask_zp, pixel_loop (final col)
+
+    ; C=1 here from LSR/ASL (last bit shifted out) for normal cols
+    LDA base
+.smc_advance:
+    ADC #7                  ; SMC: +7+C=+8 (fwd) / +$F7+C=-8 (rev)
+    STA base
+.smc_mask:
+    LDA #$80                ; SMC: $80 (fwd) / $01 (rev)
+    STA mask_zp
+
+    INC cols_left           ; N/Z from result; C preserved
+    BMI .resume
+    BNE .complete
+    JSR write_final_branch     ; apply precomputed branch (preserves C, X, Y)
+.resume:
+    CLC
+    BRA pixel_loop
+.complete:
+    RTS                     ; line complete
 
 ;---------------------------------------
-; Lookup tables for fixup masks
+; Write precomputed branch to .smc_branch
+; If final_branch = $90 (BCC sentinel), leaves BCC default in place.
+; Preserves: C, X, Y
 ;---------------------------------------
-fixup_table:
-    .byte $7F, $3F, $1F, $0F, $07, $03, $01, $00
-    .byte $00, $80, $C0, $E0, $F0, $F8, $FC, $FE
+write_final_branch:
+    LDA final_branch
+    BMI .done               ; bit 7 set → $90 (BCC)
+    STA .smc_branch         ; byte 0: BBR opcode
+    LDA #mask_zp
+    STA .smc_branch + 1     ; byte 1: ZP address ($74)
+    LDA #<(pixel_loop - (.smc_branch + 3))
+    STA .smc_branch + 2     ; byte 2: backward offset to pixel_loop
+.done:
+    RTS

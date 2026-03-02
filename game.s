@@ -16,7 +16,11 @@ OSBYTE      = $FFF4
 CRTC_REG    = $FE00
 CRTC_DAT    = $FE01
 SYS_VIA_IFR = $FE4D
-KEYBOARD    = $FC00
+SYS_VIA_DDRA = $FE43
+SYS_VIA_ORA  = $FE4F
+KEY_Z        = $61
+KEY_X        = $42
+KEY_RETURN   = $49
 
 ; === Zero page: rasterizer ($70-$84) ===
 base            = $70       ; 2 bytes
@@ -220,31 +224,33 @@ main_loop:
 ; =====================================================================
 
 read_input:
-    LDA KEYBOARD
+    LDA #$7F
+    STA SYS_VIA_DDRA       ; bits 0-6 output, bit 7 input
 
-    ; Bit 0: Z = rotate left (angle increases)
-    BIT #$01
-    BEQ @no_left
+    LDA #KEY_Z
+    STA SYS_VIA_ORA
+    LDA SYS_VIA_ORA
+    BMI @no_left            ; bit 7 set = not pressed
     LDA player_angle
     CLC
     ADC #2
     STA player_angle
-    LDA KEYBOARD
 @no_left:
 
-    ; Bit 1: X = rotate right (angle decreases)
-    BIT #$02
-    BEQ @no_right
+    LDA #KEY_X
+    STA SYS_VIA_ORA
+    LDA SYS_VIA_ORA
+    BMI @no_right
     LDA player_angle
     SEC
     SBC #2
     STA player_angle
-    LDA KEYBOARD
 @no_right:
 
-    ; Bit 2: Return = move forward
-    BIT #$04
-    BEQ @no_forward
+    LDA #KEY_RETURN
+    STA SYS_VIA_ORA
+    LDA SYS_VIA_ORA
+    BMI @no_forward
     JSR move_forward
 @no_forward:
     RTS

@@ -3078,10 +3078,12 @@ obj_table:
 mask_init_table:
     .byte $80, $40, $20, $10, $08, $04, $02, $01
 
+.ifndef UNROLL_SHALLOW
 fwd_branch_table:
     .byte opBBR6, opBBR5, opBBR4, opBBR3, opBBR2, opBBR1, opBBR0
 rev_branch_table:
     .byte opBCC, opBBR7, opBBR6, opBBR5, opBBR4, opBBR3, opBBR2, opBBR1
+.endif
 
 draw_line:
     LDA x1
@@ -3111,7 +3113,211 @@ draw_line:
     BCS shallow_setup
     JMP steep_setup
 
-; === SHALLOW PATH ===
+.ifdef UNROLL_SHALLOW
+
+; === SHALLOW PATH (unrolled, 8 pixels/byte) ===
+
+smc_rts_needed = final_branch           ; reuse ZP $76
+
+.macro UPIX n, default_eor
+.ident(.concat("s_upix", .string(n))):
+    LDA (base),Y
+.ident(.concat("smc_eor_", .string(n))):
+    EOR #default_eor
+    STA (base),Y
+    TXA
+    SBC delta_minor
+    BCS :+
+    ADC delta_major
+    DEY
+    BPL :+
+    DEC base+1
+    LDY #7
+:   TAX
+.endmacro
+
+su_entry_lo:
+    .byte <(s_upix0-1), <(s_upix1-1), <(s_upix2-1), <(s_upix3-1)
+    .byte <(s_upix4-1), <(s_upix5-1), <(s_upix6-1), <(s_upix7-1)
+su_entry_hi:
+    .byte >(s_upix0-1), >(s_upix1-1), >(s_upix2-1), >(s_upix3-1)
+    .byte >(s_upix4-1), >(s_upix5-1), >(s_upix6-1), >(s_upix7-1)
+
+su_rts_lo:
+    .byte <s_upix1, <s_upix2, <s_upix3, <s_upix4
+    .byte <s_upix5, <s_upix6, <s_upix7, <s_upix0
+su_rts_hi:
+    .byte >s_upix1, >s_upix2, >s_upix3, >s_upix4
+    .byte >s_upix5, >s_upix6, >s_upix7, >s_upix0
+
+su_write_rts:
+    LDA smc_rts_needed
+    BEQ :+
+smc_su_rts_sta:
+    STA $FFFF
+:   RTS
+
+shallow_setup:
+    STA delta_major
+
+    LDA x1
+    ORA #$07
+    SBC x0
+    LSR
+    LSR
+    LSR
+    EOR #$FF
+    INC A
+    STA cols_left
+
+    LDA #$B1
+su_prev_restore:
+    STA s_upix0
+
+    LDA y0
+    CMP y1
+    BCC @su_rev
+
+    ;=== FORWARD ===
+    LDA x1
+    AND #$07
+    STA smc_rts_needed
+
+    LDA x0
+    AND #$07
+    PHA
+
+    BIT smc_eor_0+1
+    BMI @su_common
+    LDA #$80
+    STA smc_eor_0+1
+    LSR A
+    STA smc_eor_1+1
+    LSR A
+    STA smc_eor_2+1
+    LSR A
+    STA smc_eor_3+1
+    LSR A
+    STA smc_eor_4+1
+    LSR A
+    STA smc_eor_5+1
+    LSR A
+    STA smc_eor_6+1
+    LSR A
+    STA smc_eor_7+1
+
+    LDA #$07
+    STA smc_su_advance+1
+
+    BRA @su_common
+
+    ;=== REVERSE ===
+@su_rev:
+    LDA x0
+    AND #$07
+    EOR #$07
+    STA smc_rts_needed
+
+    LDA x1
+    AND #$07
+    EOR #$07
+    PHA
+
+    LDA x1
+    STA x0
+    LDA y1
+    STA y0
+
+    BIT smc_eor_0+1
+    BPL @su_common
+    LDA #$01
+    STA smc_eor_0+1
+    ASL A
+    STA smc_eor_1+1
+    ASL A
+    STA smc_eor_2+1
+    ASL A
+    STA smc_eor_3+1
+    ASL A
+    STA smc_eor_4+1
+    ASL A
+    STA smc_eor_5+1
+    ASL A
+    STA smc_eor_6+1
+    ASL A
+    STA smc_eor_7+1
+
+    LDA #$F7
+    STA smc_su_advance+1
+
+@su_common:
+    JSR init_base
+
+    LDX smc_rts_needed
+    LDA su_rts_lo,X
+    STA smc_su_rts_sta+1
+    STA smc_su_rts_restore+1
+    STA su_prev_restore+1
+    LDA su_rts_hi,X
+    STA smc_su_rts_sta+2
+    STA smc_su_rts_restore+2
+    STA su_prev_restore+2
+
+    LDA #$60
+    CPX #7
+    BNE :+
+    LDA #$00
+:   STA smc_rts_needed
+
+    LDA cols_left
+    BNE @su_multi
+    JSR su_write_rts
+
+@su_multi:
+    PLA
+    TAX
+    LDA su_entry_hi,X
+    PHA
+    LDA su_entry_lo,X
+    PHA
+
+    LDA delta_major
+    SEC
+    SBC delta_minor
+    TAX
+
+    SEC
+    RTS
+
+    UPIX 0, $80
+    UPIX 1, $40
+    UPIX 2, $20
+    UPIX 3, $10
+    UPIX 4, $08
+    UPIX 5, $04
+    UPIX 6, $02
+    UPIX 7, $01
+
+    LDA base
+smc_su_advance:
+    ADC #$07
+    STA base
+    INC cols_left
+    BMI @su_resume
+    BNE @su_complete
+    JSR su_write_rts
+@su_resume:
+    SEC
+    JMP s_upix0
+@su_complete:
+    LDA #$B1
+smc_su_rts_restore:
+    STA $FFFF
+    RTS
+
+.else
+
+; === SHALLOW PATH (rolled) ===
 
 shallow_setup:
     STA delta_major
@@ -3227,6 +3433,8 @@ s_write_final:
     STA smc_s_branch + 2
 @wf_done:
     RTS
+
+.endif
 
 ; === STEEP PATH ===
 

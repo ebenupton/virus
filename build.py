@@ -22,14 +22,18 @@ DEMO_LOAD = 0x2000
 DEMO_EXEC = 0x2000
 
 
-def assemble(src, binfile, objfile=None):
+def assemble(src, binfile, objfile=None, extra_flags=None):
     """Assemble a .s file → .bin via ca65 + ld65."""
     if objfile is None:
         objfile = src.replace(".s", ".o")
     print(f"Assembling {src} ...")
 
+    cmd = ["ca65", "--cpu", "65C02", "-g"]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd.extend([src, "-o", objfile])
     r = subprocess.run(
-        ["ca65", "--cpu", "65C02", "-g", src, "-o", objfile],
+        cmd,
         capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -301,7 +305,8 @@ def build_demo():
 def build_game():
     """Build the Battlezone game + emulator."""
     generate_tables()
-    game_size = assemble("game.s", "game.bin", "game.o")
+    game_size = assemble("game.s", "game.bin", "game.o",
+                         extra_flags=["-DUNROLL_SHALLOW=1"])
     create_ssd("game.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ")
     compile_emu()
     print(f"\nDone!  Run: ./emu game.bin")

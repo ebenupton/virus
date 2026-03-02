@@ -257,7 +257,7 @@ TEST_CASES = [
 ]
 
 
-def generate_soak_cases(count=200, seed=42):
+def generate_soak_cases(count=5000, seed=42):
     """Generate random test cases with dx, dy up to 255."""
     rng = random.Random(seed)
     cases = []

@@ -3108,10 +3108,13 @@ draw_line:
     LDA x1
     SEC
     SBC x0
+    BEQ @go_vertical
     STY delta_minor
     CMP delta_minor
     BCS shallow_setup
     JMP steep_setup
+@go_vertical:
+    JMP vertical_setup
 
 .ifdef UNROLL_SHALLOW
 
@@ -3554,6 +3557,172 @@ t_no_x:
     BRA t_pixel_loop
 @t_complete:
     RTS
+
+;=======================================
+; VERTICAL PATH — dx=0, major axis Y only
+; Unrolled 8 pixels/stripe, 15 cycles/pixel
+;=======================================
+
+;--- Macro: one vertical pixel iteration ---
+.macro VPIX n
+.ident(.concat("v_iter", .string(n))):
+    LDA (base),Y
+.ident(.concat("smc_v_eor_", .string(n))):
+    EOR #$80                ; SMC'd: mask_init_table[x0 & 7]
+    STA (base),Y
+    DEY                     ; 15 cycles/pixel
+.endmacro
+
+;--- Entry address tables ---
+v_entry_lo:
+    .byte <v_iter0, <v_iter1, <v_iter2, <v_iter3
+    .byte <v_iter4, <v_iter5, <v_iter6, <v_iter7
+v_entry_hi:
+    .byte >v_iter0, >v_iter1, >v_iter2, >v_iter3
+    .byte >v_iter4, >v_iter5, >v_iter6, >v_iter7
+
+;--- Vertical setup ---
+; Entry: A=0 (dx), Y=|dy|. x0, y0, x1, y1 set.
+vertical_setup:
+    ; 1. Normalize: ensure y0 >= y1 (draw downward with DEY)
+    LDA y0
+    CMP y1
+    BCS @v_sorted
+    LDX y1
+    STX y0
+    STA y1
+@v_sorted:
+
+    ; 2. SMC 8 EOR immediates with mask_init_table[x0 & 7]
+    LDA x0
+    AND #$07
+    TAX
+    LDA mask_init_table,X
+    STA smc_v_eor_0+1
+    STA smc_v_eor_1+1
+    STA smc_v_eor_2+1
+    STA smc_v_eor_3+1
+    STA smc_v_eor_4+1
+    STA smc_v_eor_5+1
+    STA smc_v_eor_6+1
+    STA smc_v_eor_7+1
+
+    ; 3. Compute base (inline, no init_base needed — mask_zp not used)
+    LDA y0
+    LSR
+    LSR
+    LSR
+    CLC
+    ADC screen_page
+    STA base+1
+    LDA x0
+    AND #$F8
+    STA base
+
+    ; 4. Compute stripes_left and final_bias
+    ;    final_bias = y1 & 7
+    LDA y1
+    AND #$07
+    STA final_bias
+
+    ;    stripes_left = -((y0>>3) - (y1>>3))
+    LDA y0
+    ORA #$07
+    SEC
+    SBC y1                  ; (y0|7) - y1
+    LSR
+    LSR
+    LSR                     ; = (y0>>3) - (y1>>3)
+    EOR #$FF
+    INC A
+    STA stripes_left
+
+    ; Y = y0 & 7
+    LDA y0
+    AND #$07
+    TAY
+
+    ; 5. Branch single vs multi stripe
+    LDA stripes_left
+    BNE @v_multi
+
+    ; --- Single-stripe ---
+    ; base += final_bias, Y = (y0&7) - final_bias
+    LDA base
+    CLC
+    ADC final_bias
+    STA base
+    TYA
+    SEC
+    SBC final_bias
+    TAY
+
+    ; entry_index = Y EOR $07 (= 7 - Y = skip count)
+    EOR #$07
+    TAX
+    LDA v_entry_lo,X
+    STA smc_v_entry+1
+    LDA v_entry_hi,X
+    STA smc_v_entry+2
+    JMP @v_go
+
+@v_multi:
+    ; Precompute final entry: v_entry[final_bias] → smc_v_final
+    LDX final_bias
+    LDA v_entry_lo,X
+    STA smc_v_final+1
+    LDA v_entry_hi,X
+    STA smc_v_final+2
+
+    ; Compute first entry: entry_index = 7 - (y0&7)
+    TYA                     ; Y = y0 & 7
+    EOR #$07                ; = 7 - (y0&7)
+    TAX
+    LDA v_entry_lo,X
+    STA smc_v_entry+1
+    LDA v_entry_hi,X
+    STA smc_v_entry+2
+
+    ; Y already = y0 & 7
+
+@v_go:
+smc_v_entry:
+    JMP v_iter0             ; SMC'd to correct first-stripe entry
+
+;--- Unrolled vertical pixel loop ---
+    VPIX 0
+    VPIX 1
+    VPIX 2
+    VPIX 3
+    VPIX 4
+    VPIX 5
+    VPIX 6
+    VPIX 7
+
+    ; --- Stripe transition (after v_iter7's DEY, Y = $FF) ---
+    INC stripes_left
+    BMI @v_full_stripe      ; stripes_left < 0: more full stripes
+    BEQ @v_final_stripe     ; stripes_left = 0: entering final stripe
+@v_complete:
+    RTS
+
+@v_full_stripe:
+    DEC base+1
+    LDY #7
+    BRA v_iter0
+
+@v_final_stripe:
+    DEC base+1
+    LDA base
+    CLC
+    ADC final_bias
+    STA base
+    LDA #7
+    SEC
+    SBC final_bias
+    TAY
+smc_v_final:
+    JMP v_iter0             ; SMC'd during setup to v_entry[final_bias]
 
 init_base:
     LDA x0

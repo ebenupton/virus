@@ -25,14 +25,10 @@ SCREEN_BASE    = SCREEN_BASE_HI << 8
 
 # ── Reference Bresenham ──────────────────────────────────────────────
 
-def reference_bresenham(x0, y0, x1, y1):
+def reference_shallow(x0, y0, x1, y1):
     """
-    Match the assembly's draw order.  For upward lines (y0 >= y1) we
-    traverse left-to-right.  For downward lines (y1 > y0) the assembly
-    swaps endpoints and draws right-to-left (backward), so the
-    Bresenham step decisions land at different x positions.  We
-    replicate that here.
-    Requires  x1 >= x0,  (x1-x0) >= abs(y0-y1).
+    Shallow path reference (dx >= |dy|).
+    Requires x1 >= x0, dx >= dy.
     """
     dx = x1 - x0
     dy = abs(y0 - y1)
@@ -58,6 +54,61 @@ def reference_bresenham(x0, y0, x1, y1):
                 d += dx
                 y -= 1
     return pixels
+
+
+def reference_steep(x0, y0, x1, y1):
+    """
+    Steep path reference (|dy| > dx).
+    Requires x1 >= x0, dy > dx.
+    """
+    dx = x1 - x0
+    dy = abs(y0 - y1)
+    going_down = y1 > y0
+    pixels = set()
+    d = dy - dx
+    if going_down:
+        # Reverse: start at (x1, y1), walk up, x moves left
+        x = x1
+        for i in range(dy + 1):
+            pixels.add((x, y1 - i))
+            d -= dx
+            if d < 0:
+                d += dy
+                x -= 1
+    else:
+        # Forward: start at (x0, y0), walk up, x moves right
+        x = x0
+        for j in range(dy + 1):
+            pixels.add((x, y0 - j))
+            d -= dx
+            if d < 0:
+                d += dy
+                x += 1
+    return pixels
+
+
+def reference_vertical(x0, y0, x1, y1):
+    """Vertical path reference (dx=0)."""
+    x = x0  # x0 == x1
+    y_lo = min(y0, y1)
+    y_hi = max(y0, y1)
+    return {(x, y) for y in range(y_lo, y_hi + 1)}
+
+
+def reference_line(x0, y0, x1, y1):
+    """Dispatch to correct reference based on line slope, matching assembly."""
+    # Assembly normalizes x1 >= x0
+    if x1 < x0:
+        x0, x1 = x1, x0
+        y0, y1 = y1, y0
+    dx = x1 - x0
+    dy = abs(y0 - y1)
+    if dx == 0:
+        return reference_vertical(x0, y0, x1, y1)
+    elif dx >= dy:
+        return reference_shallow(x0, y0, x1, y1)
+    else:
+        return reference_steep(x0, y0, x1, y1)
 
 
 # ── Screen memory extraction ─────────────────────────────────────────
@@ -231,6 +282,7 @@ def visual_diff(emu_pixels, ref_pixels, x0, y0, x1, y1):
 # ── Test cases ───────────────────────────────────────────────────────
 
 TEST_CASES = [
+    # ── Shallow ──
     # (name, x0, y0, x1, y1)
     ("horizontal 0-15",              0,   7,  15,  7),
     ("horizontal 8-23",              8,  10,  23, 10),
@@ -254,32 +306,86 @@ TEST_CASES = [
     ("down cross-stripe 0,0 -> 10,8",    0,   0,  10,  8),
     ("down one-pixel dy 0,7 -> 15,8",    0,   7,  15,  8),
     ("down long line 0,8 -> 63,31",      0,   8,  63, 31),
+    # ── Steep ──
+    ("steep up 5,15 -> 7,0",             5,  15,   7,  0),
+    ("steep up single stripe 3,7 -> 4,0", 3,   7,   4,  0),
+    ("steep up multi 10,31 -> 13,8",     10,  31,  13,  8),
+    ("steep up cross-stripe 5,16 -> 7,0", 5,  16,   7,  0),
+    ("steep down 5,0 -> 7,15",            5,   0,   7, 15),
+    ("steep down single stripe 3,0 -> 4,7", 3, 0,   4,  7),
+    ("steep down multi 10,8 -> 13,31",   10,   8,  13, 31),
+    ("steep near-45 up 0,20 -> 9,0",      0,  20,   9,  0),
+    ("steep 1px dx 0,0 -> 1,255",          0,   0,   1,255),
+    # ── Vertical ──
+    ("vert single pixel 5,10 -> 5,10",    5,  10,   5, 10),
+    ("vert single stripe 5,7 -> 5,0",     5,   7,   5,  0),
+    ("vert single stripe 5,0 -> 5,7",     5,   0,   5,  7),
+    ("vert cross-stripe 3,15 -> 3,0",     3,  15,   3,  0),
+    ("vert cross-stripe 3,0 -> 3,15",     3,   0,   3, 15),
+    ("vert multi-stripe 10,31 -> 10,0",  10,  31,  10,  0),
+    ("vert long 0,0 -> 0,255",            0,   0,   0,255),
+    ("vert long 7,255 -> 7,0",            7, 255,   7,  0),
+    ("vert mid-byte 4,20 -> 4,5",         4,  20,   4,  5),
+    ("vert partial stripe 2,13 -> 2,10",  2,  13,   2, 10),
+    ("vert bit0 7,0 -> 7,31",             7,   0,   7, 31),
 ]
 
 
-def generate_soak_cases(count=5000, seed=42):
-    """Generate random test cases with dx, dy up to 255."""
+def generate_shallow_soak(count=5000, seed=42):
+    """Generate random shallow test cases (dx >= dy)."""
     rng = random.Random(seed)
     cases = []
     for i in range(count):
-        # dx in 1..255
         dx = rng.randint(1, 255)
-        # dy in 0..dx (shallow octant)
         dy = rng.randint(0, dx)
-        # x0 anywhere that leaves room for dx
         x0 = rng.randint(0, 255 - dx)
         x1 = x0 + dx
-        # Pick direction: up or down
         if rng.random() < 0.5:
-            # Upward: y0 >= y1, y0 = y1 + dy
             y1 = rng.randint(0, 255 - dy)
             y0 = y1 + dy
         else:
-            # Downward: y1 > y0, y1 = y0 + dy
             y0 = rng.randint(0, 255 - dy)
             y1 = y0 + dy
-        name = f"soak {i}: ({x0},{y0})->({x1},{y1})"
+        name = f"shallow soak {i}: ({x0},{y0})->({x1},{y1})"
         cases.append((name, x0, y0, x1, y1))
+    return cases
+
+
+def generate_steep_soak(count=2000, seed=99):
+    """Generate random steep test cases (dy > dx)."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(count):
+        dy = rng.randint(2, 255)
+        dx = rng.randint(1, dy - 1)
+        x0 = rng.randint(0, 255 - dx)
+        x1 = x0 + dx
+        if rng.random() < 0.5:
+            y1 = rng.randint(0, 255 - dy)
+            y0 = y1 + dy
+        else:
+            y0 = rng.randint(0, 255 - dy)
+            y1 = y0 + dy
+        name = f"steep soak {i}: ({x0},{y0})->({x1},{y1})"
+        cases.append((name, x0, y0, x1, y1))
+    return cases
+
+
+def generate_vertical_soak(count=500, seed=77):
+    """Generate random vertical test cases (dx=0)."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(count):
+        x = rng.randint(0, 255)
+        dy = rng.randint(0, 255)
+        if rng.random() < 0.5:
+            y1 = rng.randint(0, 255 - dy)
+            y0 = y1 + dy
+        else:
+            y0 = rng.randint(0, 255 - dy)
+            y1 = y0 + dy
+        name = f"vert soak {i}: ({x},{y0})->({x},{y1})"
+        cases.append((name, x, y0, x, y1))
     return cases
 
 
@@ -301,7 +407,10 @@ def main():
     passes = 0
     fails  = 0
 
-    all_cases = TEST_CASES + generate_soak_cases()
+    all_cases = (TEST_CASES
+                 + generate_shallow_soak()
+                 + generate_steep_soak()
+                 + generate_vertical_soak())
 
     with tempfile.TemporaryDirectory(prefix="raster_test_") as tmpdir:
         for name, x0, y0, x1, y1 in all_cases:
@@ -310,11 +419,7 @@ def main():
             tag = f"({x0},{y0})->({x1},{y1}) dx={dx} dy={dy}"
             print(f"  {name:40s} {tag} ... ", end="", flush=True)
 
-            # Sanity check test params
-            assert x1 >= x0, f"x1 < x0 in test '{name}'"
-            assert dx >= dy, f"dx < dy in test '{name}'"
-
-            ref = reference_bresenham(x0, y0, x1, y1)
+            ref = reference_line(x0, y0, x1, y1)
 
             src = generate_harness(x0, y0, x1, y1)
             try:

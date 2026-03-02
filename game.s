@@ -78,7 +78,8 @@ rot_hx_frac     = $A6       ; fractional h*cos corner offset
 rot_kx_frac     = $A7       ; fractional h*sin corner offset
 vx_frac         = $A8       ; per-vertex fractional X (passed to projection)
 center_vz_frac  = $A9       ; fractional center view Z (0.8 format)
-z_delta         = $AA       ; (unused, kept for clipper alias)
+ws_face_vis     = $AA       ; world-space face visibility fallback bitmask
+z_delta         = $AA       ; (clipper alias, shares with ws_face_vis)
 rot_hz_frac     = $AB       ; fractional part of rot_hz (8.8 negation)
 vz_frac         = $AC       ; per-vertex fractional view Z
 recip_shift     = $AD       ; 0, 1, or 2: post-multiply right-shift for extended recip range
@@ -116,6 +117,36 @@ proj_y_hi       = $0220     ; 8 bytes: projected screen Y (hi byte, sign)
 ; Each screen buffer has its own line buffer; erase old, build new, draw new in place
 lines_0         = $0228     ; buffer 0 lines (256 bytes) → $0228-$0327
 lines_1         = $0328     ; buffer 1 lines (256 bytes) → $0328-$0427
+
+; Per-vertex view-space coords (for 3D near-plane clipper, 8.8 format)
+view_x          = $0428     ; 8 bytes: signed 8-bit view X (integer part)
+view_z          = $0430     ; 8 bytes: signed 8-bit view Z (integer part)
+view_x_frac     = $0438     ; 8 bytes: unsigned 8-bit view X (fractional part)
+view_z_frac     = $0440     ; 8 bytes: unsigned 8-bit view Z (fractional part)
+
+; === Particle system ===
+PARTICLE_COUNT = 32
+
+; ZP — 16-bit LFSR seed
+rng_lo         = $AE       ; LFSR state lo
+rng_hi         = $AF       ; LFSR state hi
+
+; RAM — particle world positions (immediately after view_z_frac)
+particle_wx      = $0448   ; 32 bytes: world X (signed 8-bit)
+particle_wz      = $0468   ; 32 bytes: world Z (signed 8-bit)
+
+; Buffer 0 erase data (pre-computed screen address components)
+particle_blo_0   = $0488   ; 32 bytes: base address lo byte
+particle_bhi_0   = $04A8   ; 32 bytes: base address hi byte
+particle_yoff_0  = $04C8   ; 32 bytes: Y offset within char row (0-7)
+particle_mask_0  = $04E8   ; 32 bytes: pixel mask ($80..$01), 0 = not drawn
+
+; Buffer 1 erase data
+particle_blo_1   = $0508   ; 32 bytes
+particle_bhi_1   = $0528   ; 32 bytes
+particle_yoff_1  = $0548   ; 32 bytes
+particle_mask_1  = $0568   ; 32 bytes
+; Total particle RAM: $0448-$0587 = 320 bytes
 
 ; === Opcodes for self-modifying code ===
 opLSRzp     = $46
@@ -206,6 +237,8 @@ entry:
     LDA #1
     STA back_buf_idx
 
+    JSR init_particles
+
 ; =====================================================================
 ; Main loop
 ; =====================================================================
@@ -213,8 +246,10 @@ entry:
 main_loop:
     JSR read_input
     JSR erase_lines
+    JSR erase_particles
     JSR build_scene
     JSR draw_lines
+    JSR draw_particles
     JSR wait_vsync
     JSR flip_buffers
     JMP main_loop
@@ -789,15 +824,84 @@ process_object:
     ; Reload corrected view_z for the bounds check
     LDA temp1
 
-    ; Check if object is in front of camera (Z >= 3)
-    BMI @obj_behind      ; negative Z → behind camera
-    CMP #3
-    BCS @obj_in_front
-@obj_behind:
-    PLA                  ; discard type from stack
+    ; Check if object is close enough to process (allow partial near-clip)
+    BPL @obj_in_front       ; vz >= 0 → always process
+    ; vz < 0: allow if |vz| <= 2*h (vertices may still be in front)
+    EOR #$FF
+    INC A                   ; A = |vz|
+    LDY temp3
+    STY temp2               ; save h
+    ASL temp2               ; temp2 = 2*h
+    CMP temp2
+    BCC @obj_in_front       ; |vz| < 2h → process
+    BEQ @obj_in_front       ; |vz| = 2h → borderline, process
+    PLA                     ; discard type from stack
     RTS
 @obj_in_front:
+    ; --- Near-clip proximity check ---
+    ; If center_vz - h >= 2, all vertices are safely in front → skip near-clip overhead
+    LDA temp1               ; center view Z (signed)
+    BMI @nc_needed           ; center behind camera → near-clip needed
+    SEC
+    SBC temp3               ; A = center_vz - h
+    BCC @nc_needed           ; underflow → center_vz < h → near-clip possible
+    CMP #2
+    BCS @nc_not_needed       ; all vertices have vz >= 2 → no near-clip
+@nc_needed:
+    ; Near-clip possible: compute world-space face visibility fallback
+    LDA #0
+    STA ws_face_vis
+    ; Face 0 (+Z): -rel_z > h
+    LDA rel_z
+    BPL @ws_f1
+    EOR #$FF
+    INC A
+    CMP temp3
+    BEQ @ws_f1
+    BCC @ws_f1
+    INC ws_face_vis
+@ws_f1:
+    ; Face 1 (-Z): rel_z > h
+    LDA rel_z
+    BMI @ws_f2
+    CMP temp3
+    BEQ @ws_f2
+    BCC @ws_f2
+    LDA #$02
+    ORA ws_face_vis
+    STA ws_face_vis
+@ws_f2:
+    ; Face 2 (+X): -rel_x > h
+    LDA rel_x
+    BPL @ws_f3
+    EOR #$FF
+    INC A
+    CMP temp3
+    BEQ @ws_f3
+    BCC @ws_f3
+    LDA #$04
+    ORA ws_face_vis
+    STA ws_face_vis
+@ws_f3:
+    ; Face 3 (-X): rel_x > h
+    LDA rel_x
+    BMI @ws_done
+    CMP temp3
+    BEQ @ws_done
+    BCC @ws_done
+    LDA #$08
+    ORA ws_face_vis
+    STA ws_face_vis
+@ws_done:
+    LDA #1
+    STA rel_x               ; nearclip_flag = 1 (rel_x dead after rotation)
+    BRA @nc_dispatch
 
+@nc_not_needed:
+    STZ ws_face_vis
+    STZ rel_x               ; nearclip_flag = 0
+
+@nc_dispatch:
     ; Face visibility computed per-object type using screen-space winding
     LDA #0
     STA face_vis
@@ -1004,12 +1108,13 @@ process_cube:
     ; --- Screen-space face culling (8-bit quantized, strict >) ---
     ; Both on-screen (hi=0): 8-bit strict > rejects edge-on at pixel resolution.
     ; Either off-screen: 16-bit >= (correct winding, edge-on impossible).
+    ; Invalid vertex (proj_z=0): fall back to world-space visibility test.
 
     ; Face 0 (+Z front): visible if proj_x[v3] > proj_x[v2]
     LDA proj_z + 3
-    BEQ @face0_vis
+    BEQ @face0_ws
     LDA proj_z + 2
-    BEQ @face0_vis
+    BEQ @face0_ws
     LDA proj_x_hi + 3
     ORA proj_x_hi + 2
     BEQ @f0_8bit
@@ -1024,6 +1129,11 @@ process_cube:
     LDA proj_x + 2
     CMP proj_x + 3
     BCS @no_f0
+    BRA @face0_vis
+@face0_ws:
+    LDA ws_face_vis
+    AND #$01
+    BEQ @no_f0
 @face0_vis:
     LDA face_vis
     ORA #$01
@@ -1032,9 +1142,9 @@ process_cube:
 
     ; Face 1 (-Z back): visible if proj_x[v1] > proj_x[v0]
     LDA proj_z + 1
-    BEQ @face1_vis
+    BEQ @face1_ws
     LDA proj_z + 0
-    BEQ @face1_vis
+    BEQ @face1_ws
     LDA proj_x_hi + 1
     ORA proj_x_hi + 0
     BEQ @f1_8bit
@@ -1049,6 +1159,11 @@ process_cube:
     LDA proj_x + 0
     CMP proj_x + 1
     BCS @no_f1
+    BRA @face1_vis
+@face1_ws:
+    LDA ws_face_vis
+    AND #$02
+    BEQ @no_f1
 @face1_vis:
     LDA face_vis
     ORA #$02
@@ -1057,9 +1172,9 @@ process_cube:
 
     ; Face 2 (+X right): visible if proj_x[v2] > proj_x[v1]
     LDA proj_z + 2
-    BEQ @face2_vis
+    BEQ @face2_ws
     LDA proj_z + 1
-    BEQ @face2_vis
+    BEQ @face2_ws
     LDA proj_x_hi + 2
     ORA proj_x_hi + 1
     BEQ @f2_8bit
@@ -1074,6 +1189,11 @@ process_cube:
     LDA proj_x + 1
     CMP proj_x + 2
     BCS @no_f2
+    BRA @face2_vis
+@face2_ws:
+    LDA ws_face_vis
+    AND #$04
+    BEQ @no_f2
 @face2_vis:
     LDA face_vis
     ORA #$04
@@ -1082,9 +1202,9 @@ process_cube:
 
     ; Face 3 (-X left): visible if proj_x[v0] > proj_x[v3]
     LDA proj_z + 0
-    BEQ @face3_vis
+    BEQ @face3_ws
     LDA proj_z + 3
-    BEQ @face3_vis
+    BEQ @face3_ws
     LDA proj_x_hi + 0
     ORA proj_x_hi + 3
     BEQ @f3_8bit
@@ -1099,6 +1219,11 @@ process_cube:
     LDA proj_x + 3
     CMP proj_x + 0
     BCS @no_f3
+    BRA @face3_vis
+@face3_ws:
+    LDA ws_face_vis
+    AND #$08
+    BEQ @no_f3
 @face3_vis:
     LDA face_vis
     ORA #$08
@@ -1123,15 +1248,12 @@ process_cube:
     LDA cube_edge_v1,X
     TAX
 
-    ; Both vertices must be valid
+    ; Near-clip dispatch: check vertex validity
     LDA proj_z,Y
-    BEQ @cube_pop
+    BEQ @cube_v0_inv
     LDA proj_z,X
-    BEQ @cube_pop
-
-    ; Emit line
-    JSR emit_edge
-
+    BEQ @cube_clip_v1       ; v0 ok, v1 behind
+    JSR emit_edge           ; both ok → normal (fall through)
 @cube_pop:
     PLX
 @cube_skip:
@@ -1139,6 +1261,22 @@ process_cube:
     BRA @cube_edge_loop
 @cube_done:
     RTS
+
+    ; Near-clip handlers (outside hot loop)
+@cube_v0_inv:
+    LDA proj_z,X
+    BEQ @cube_pop           ; both behind → skip
+    ; v0 behind, v1 ok — swap so Y=front, X=behind
+    STY temp2
+    TXA
+    TAY
+    LDX temp2
+    JSR clip_edge_near
+    BRA @cube_pop
+
+@cube_clip_v1:
+    JSR clip_edge_near      ; Y=front(v0), X=behind(v1)
+    BRA @cube_pop
 
 ; Cube edge tables
 cube_edge_v0:
@@ -1482,11 +1620,13 @@ process_pyramid:
 @no_top:
 
     ; --- Screen-space face culling (8-bit quantized, strict >) ---
+    ; Invalid vertex (proj_z=0): fall back to world-space visibility test.
+
     ; Face 0 (+Z front): visible if proj_x[v3] > proj_x[v2]
     LDA proj_z + 3
-    BEQ @face0_vis
+    BEQ @face0_ws
     LDA proj_z + 2
-    BEQ @face0_vis
+    BEQ @face0_ws
     LDA proj_x_hi + 3
     ORA proj_x_hi + 2
     BEQ @f0_8bit
@@ -1501,6 +1641,11 @@ process_pyramid:
     LDA proj_x + 2
     CMP proj_x + 3
     BCS @no_f0
+    BRA @face0_vis
+@face0_ws:
+    LDA ws_face_vis
+    AND #$01
+    BEQ @no_f0
 @face0_vis:
     LDA face_vis
     ORA #$01
@@ -1509,9 +1654,9 @@ process_pyramid:
 
     ; Face 1 (-Z back): visible if proj_x[v1] > proj_x[v0]
     LDA proj_z + 1
-    BEQ @face1_vis
+    BEQ @face1_ws
     LDA proj_z + 0
-    BEQ @face1_vis
+    BEQ @face1_ws
     LDA proj_x_hi + 1
     ORA proj_x_hi + 0
     BEQ @f1_8bit
@@ -1526,6 +1671,11 @@ process_pyramid:
     LDA proj_x + 0
     CMP proj_x + 1
     BCS @no_f1
+    BRA @face1_vis
+@face1_ws:
+    LDA ws_face_vis
+    AND #$02
+    BEQ @no_f1
 @face1_vis:
     LDA face_vis
     ORA #$02
@@ -1534,9 +1684,9 @@ process_pyramid:
 
     ; Face 2 (+X right): visible if proj_x[v2] > proj_x[v1]
     LDA proj_z + 2
-    BEQ @face2_vis
+    BEQ @face2_ws
     LDA proj_z + 1
-    BEQ @face2_vis
+    BEQ @face2_ws
     LDA proj_x_hi + 2
     ORA proj_x_hi + 1
     BEQ @f2_8bit
@@ -1551,6 +1701,11 @@ process_pyramid:
     LDA proj_x + 1
     CMP proj_x + 2
     BCS @no_f2
+    BRA @face2_vis
+@face2_ws:
+    LDA ws_face_vis
+    AND #$04
+    BEQ @no_f2
 @face2_vis:
     LDA face_vis
     ORA #$04
@@ -1559,9 +1714,9 @@ process_pyramid:
 
     ; Face 3 (-X left): visible if proj_x[v0] > proj_x[v3]
     LDA proj_z + 0
-    BEQ @face3_vis
+    BEQ @face3_ws
     LDA proj_z + 3
-    BEQ @face3_vis
+    BEQ @face3_ws
     LDA proj_x_hi + 0
     ORA proj_x_hi + 3
     BEQ @f3_8bit
@@ -1576,6 +1731,11 @@ process_pyramid:
     LDA proj_x + 3
     CMP proj_x + 0
     BCS @no_f3
+    BRA @face3_vis
+@face3_ws:
+    LDA ws_face_vis
+    AND #$08
+    BEQ @no_f3
 @face3_vis:
     LDA face_vis
     ORA #$08
@@ -1599,13 +1759,12 @@ process_pyramid:
     LDA pyr_edge_v1,X
     TAX
 
+    ; Near-clip dispatch: check vertex validity
     LDA proj_z,Y
-    BEQ @pyr_pop
+    BEQ @pyr_v0_inv
     LDA proj_z,X
-    BEQ @pyr_pop
-
-    JSR emit_edge
-
+    BEQ @pyr_clip_v1        ; v0 ok, v1 behind
+    JSR emit_edge            ; both ok → normal (fall through)
 @pyr_pop:
     PLX
 @pyr_skip:
@@ -1613,6 +1772,22 @@ process_pyramid:
     BRA @pyr_edge_loop
 @pyr_done:
     RTS
+
+    ; Near-clip handlers (outside hot loop)
+@pyr_v0_inv:
+    LDA proj_z,X
+    BEQ @pyr_pop             ; both behind → skip
+    ; v0 behind, v1 ok — swap so Y=front, X=behind
+    STY temp2
+    TXA
+    TAY
+    LDX temp2
+    JSR clip_edge_near
+    BRA @pyr_pop
+
+@pyr_clip_v1:
+    JSR clip_edge_near       ; Y=front(v0), X=behind(v1)
+    BRA @pyr_pop
 
 pyr_edge_v0:
     .byte 0, 1, 2, 3,  4, 5, 6, 7,  0, 1, 2, 3
@@ -1634,9 +1809,26 @@ project_corner:
     ; Save vertex indices
     STX pc_base_idx
     STY pc_top_idx
-
-    ; Validity check
+    ; Conditionally store view-space coords (only when near-clip possible)
+    LDA rel_x              ; nearclip_flag
+    BEQ @pc_no_store
+    LDA vx_temp
+    STA view_x,X
+    STA view_x,Y
+    LDA vx_frac
+    STA view_x_frac,X
+    STA view_x_frac,Y
     LDA vz_temp
+    STA view_z,X
+    STA view_z,Y
+    LDA vz_frac
+    STA view_z_frac,X
+    STA view_z_frac,Y
+    LDA vz_temp             ; reload for validity check
+    BRA @pc_check_vz
+@pc_no_store:
+    LDA vz_temp
+@pc_check_vz:
     BMI @pc_inv_jmp
     CMP #128
     BCS @pc_inv_jmp          ; far clip
@@ -1885,7 +2077,22 @@ pc_top_idx:     .byte 0
 ; Input: vx_temp, vz_temp, X = vertex index
 project_base_only:
     STX pc_base_idx     ; save vertex index (smul8x8 clobbers X)
+    ; Conditionally store view-space coords (8.8)
+    LDA rel_x              ; nearclip_flag
+    BEQ @pb_no_store
+    LDA vx_temp
+    STA view_x,X
+    LDA vx_frac
+    STA view_x_frac,X
     LDA vz_temp
+    STA view_z,X
+    LDA vz_frac
+    STA view_z_frac,X
+    LDA vz_temp             ; reload for validity check
+    BRA @pb_check_vz
+@pb_no_store:
+    LDA vz_temp
+@pb_check_vz:
     BMI @pb_inv_jmp
     CMP #128
     BCS @pb_inv_jmp      ; far clip
@@ -2043,7 +2250,22 @@ project_base_only:
 ; Input: vx_temp, vz_temp, X = vertex index (4)
 project_apex:
     STX pc_base_idx     ; save vertex index (smul8x8 clobbers X)
+    ; Conditionally store view-space coords (8.8)
+    LDA rel_x              ; nearclip_flag
+    BEQ @pa_no_store
+    LDA vx_temp
+    STA view_x,X
+    LDA vx_frac
+    STA view_x_frac,X
     LDA vz_temp
+    STA view_z,X
+    LDA vz_frac
+    STA view_z_frac,X
+    LDA vz_temp             ; reload for validity check
+    BRA @pa_check_vz
+@pa_no_store:
+    LDA vz_temp
+@pa_check_vz:
     BMI @pa_inv_jmp
     CMP #128
     BCS @pa_inv_jmp      ; far clip
@@ -2284,6 +2506,8 @@ emit_edge:
     LDA proj_y_hi,X
     STA clip_y1_hi
 
+ee_2d_clip:
+    ; Entry point for 3D near-clipper (clip coords pre-loaded)
     ; Quick check: both X on-screen? (both hi bytes = 0)
     LDA clip_x0_hi
     ORA clip_x1_hi
@@ -2803,6 +3027,265 @@ y_clip_endpoint_1:
     STZ clip_y1_hi
     RTS
 
+; ── 3D near-plane edge clipper ──────────────────────────────────────
+; Clips one edge to z_near=1, projects clip point, feeds to 2D clipper.
+; Y = front vertex (proj_z[Y] > 0, valid projection)
+; X = behind vertex (proj_z[X] = 0, vz < 1)
+; Clobbers: A, X, Y, math workspace, clip workspace
+
+clip_edge_near:
+    ; Check line buffer capacity
+    LDA num_new_lines
+    CMP #64
+    BCC @cn_go
+    RTS
+@cn_go:
+    STY cn_front
+    STX cn_behind
+
+    ; --- Step 1: t = (1.0 - z_behind) / (z_front - z_behind) [8.8 precision] ---
+    ; Numerator: $0100 - z_behind_8.8 (16-bit)
+    LDA #0
+    SEC
+    SBC view_z_frac,X
+    STA clip_num_lo
+    LDA #1
+    SBC view_z,X
+    STA clip_num_hi
+
+    ; Denominator: z_front_8.8 - z_behind_8.8 (16-bit)
+    LDA view_z_frac,Y
+    SEC
+    SBC view_z_frac,X
+    STA clip_dx_lo
+    LDA view_z,Y
+    SBC view_z,X
+    STA clip_dx_hi
+
+    ; Degenerate check: denominator = 0
+    LDA clip_dx_lo
+    ORA clip_dx_hi
+    BNE @cn_den_ok
+    RTS
+@cn_den_ok:
+    ; Ensure numerator < denominator (t < 1.0) for div_frac8
+    LDA clip_num_hi
+    CMP clip_dx_hi
+    BCC @cn_ratio_ok
+    BNE @cn_bail
+    LDA clip_num_lo
+    CMP clip_dx_lo
+    BCC @cn_ratio_ok
+@cn_bail:
+    RTS                         ; t >= 1 → degenerate, skip
+@cn_ratio_ok:
+    JSR div_frac8               ; → clip_ratio = t (0.8 fraction)
+
+    ; --- Step 2: x_clip = x_behind + t * dx [8.8 precision] ---
+    ; dx_8.8 = front_x_8.8 - behind_x_8.8 (natural 16-bit subtraction)
+    LDY cn_front
+    LDX cn_behind
+    LDA view_x_frac,Y
+    SEC
+    SBC view_x_frac,X
+    STA clip_dx_lo              ; dx frac
+    LDA view_x,Y
+    SBC view_x,X
+    STA clip_dx_hi              ; dx int (signed 16-bit in 8.8 format)
+
+    ; Take |dx|, save sign on stack
+    BPL @cn_dx_pos
+    LDA #0
+    SEC
+    SBC clip_dx_lo
+    STA clip_dx_lo
+    LDA #0
+    SBC clip_dx_hi
+    STA clip_dx_hi
+    SEC                         ; C=1: dx was negative
+    BRA @cn_dx_abs
+@cn_dx_pos:
+    CLC                         ; C=0: dx was positive
+@cn_dx_abs:
+    PHP                         ; save sign on stack
+
+    ; 16×8→16 multiply: |dx_8.8| * clip_ratio >> 8 → displacement_8.8
+    LDA clip_dx_lo
+    STA math_a
+    LDA clip_ratio
+    STA math_b
+    JSR umul8x8
+    LDA math_res_hi
+    STA temp2                   ; partial product hi
+
+    LDA clip_dx_hi
+    STA math_a
+    ; math_b still = clip_ratio (umul8x8 preserves it)
+    JSR umul8x8
+    LDA math_res_lo
+    CLC
+    ADC temp2
+    STA temp2                   ; displacement frac (8.8 lo)
+    LDA math_res_hi
+    ADC #0
+    STA temp3                   ; displacement int (8.8 hi)
+
+    ; Apply sign and add to x_behind_8.8
+    PLP
+    LDX cn_behind
+    BCS @cn_sub_dx
+    ; Positive dx: x_clip_8.8 = behind_8.8 + displacement_8.8
+    LDA view_x_frac,X
+    CLC
+    ADC temp2
+    STA cn_xclip_frac
+    LDA view_x,X
+    ADC temp3
+    BRA @cn_have_xclip
+@cn_sub_dx:
+    ; Negative dx: x_clip_8.8 = behind_8.8 - displacement_8.8
+    LDA view_x_frac,X
+    SEC
+    SBC temp2
+    STA cn_xclip_frac
+    LDA view_x,X
+    SBC temp3
+@cn_have_xclip:
+    ; A = x_clip_int (signed), cn_xclip_frac = x_clip_frac
+
+    ; --- Step 3: screen_x = 128 + x_clip_int*127 + (x_clip_frac>>1)*127>>7 ---
+    ; Main term: x_clip_int * 127
+    STA math_a
+    LDA #127
+    STA math_b
+    JSR smul8x8                 ; signed 16-bit result
+    LDA math_res_lo
+    STA temp2                   ; save main_lo
+    LDA math_res_hi
+    PHA                         ; save main_hi
+
+    ; Fractional correction: (x_clip_frac >> 1) * 127 >> 7
+    LDA cn_xclip_frac
+    LSR A                       ; 0..127 (positive for smul8x8)
+    STA math_a
+    LDA #127
+    STA math_b
+    JSR smul8x8
+    ASL math_res_lo
+    ROL math_res_hi             ; >> 7
+
+    ; Add correction (always positive)
+    CLC
+    LDA temp2
+    ADC math_res_hi
+    STA math_res_lo
+    PLA
+    ADC #0
+    STA math_res_hi
+
+    ; screen_x = 128 + result
+    CLC
+    LDA #128
+    ADC math_res_lo
+    STA clip_x1_lo
+    LDA #0
+    ADC math_res_hi
+    STA clip_x1_hi
+
+    ; --- Step 4: screen_y_clip based on height tier ---
+    ; Vertex index & $04: 0 = ground (y=0), nonzero = top (y=H)
+    LDA cn_behind
+    AND #$04
+    STA cn_btier                ; behind tier (0 or 4)
+    LDA cn_front
+    AND #$04
+    CMP cn_btier
+    BNE @cn_mixed_y
+
+    ; Same tier
+    LDA cn_btier
+    BNE @cn_top_y
+
+    ; Ground tier: screen_y = 509 ($01FD) — off-screen, Y clipper handles
+    LDA #$FD
+    STA clip_y1
+    LDA #$01
+    STA clip_y1_hi
+    BRA @cn_load_front
+
+@cn_top_y:
+    ; Top tier: screen_y = 128 + (CAMERA_Y - obj_height) * 127
+    LDA #CAMERA_Y
+    SEC
+    SBC obj_height              ; A = 3-H (signed)
+    STA math_a
+    LDA #127
+    STA math_b
+    JSR smul8x8
+    CLC
+    LDA #128
+    ADC math_res_lo
+    STA clip_y1
+    LDA #0
+    ADC math_res_hi
+    STA clip_y1_hi
+    BRA @cn_load_front
+
+@cn_mixed_y:
+    ; Mixed tiers: interpolate height, then project
+    ; Compute t * H: y_height at clip point
+    LDA obj_height
+    STA math_a
+    LDA clip_ratio
+    STA math_b
+    JSR umul8x8                 ; math_res = H * t (unsigned 16-bit)
+    ; If behind=ground: y_height = t*H = math_res_hi
+    ; If behind=top: y_height = H - t*H = H - math_res_hi
+    LDA cn_btier
+    BNE @cn_behind_top
+    LDA math_res_hi             ; behind=ground: y_height = t*H
+    BRA @cn_proj_y
+@cn_behind_top:
+    LDA obj_height              ; behind=top: y_height = H*(1-t)
+    SEC
+    SBC math_res_hi
+@cn_proj_y:
+    ; A = y_height (0..H, unsigned)
+    ; screen_y = 509 - y_height * 127 (16-bit)
+    STA math_a
+    LDA #127
+    STA math_b
+    JSR umul8x8                 ; math_res = y_height * 127 (unsigned 16-bit)
+    ; 509 = $01FD, subtract product
+    LDA #$FD
+    SEC
+    SBC math_res_lo
+    STA clip_y1
+    LDA #$01
+    SBC math_res_hi
+    STA clip_y1_hi
+
+@cn_load_front:
+    ; --- Step 5: Load front vertex projection as endpoint 0 ---
+    LDY cn_front
+    LDA proj_x,Y
+    STA clip_x0_lo
+    LDA proj_x_hi,Y
+    STA clip_x0_hi
+    LDA proj_y,Y
+    STA clip_y0
+    LDA proj_y_hi,Y
+    STA clip_y0_hi
+
+    ; --- Step 6: Enter 2D clipper ---
+    JMP ee_2d_clip
+
+; Scratch storage for clip_edge_near
+cn_front:       .byte 0
+cn_behind:      .byte 0
+cn_btier:       .byte 0
+cn_xclip_frac:  .byte 0
+
 ; ── 16÷16 fractional division ────────────────────────────────────────
 ; Input:  clip_num_hi:clip_num_lo = numerator (unsigned, < denominator)
 ;         clip_dx_hi:clip_dx_lo = denominator (unsigned, > 0)
@@ -3064,6 +3547,518 @@ obj_table:
     .byte 160, 110, 1, 4, 14, 0, 0, 0
     ; Object 5: cube near-left
     .byte 115, 80, 0, 3, 10, 0, 0, 0
+
+; =====================================================================
+; Particle system
+; =====================================================================
+
+; --- 16-bit Galois LFSR random number generator ---
+random:
+    LDA rng_lo
+    ASL A
+    ROL rng_hi
+    BCC @no_fb
+    EOR #$2D
+@no_fb:
+    STA rng_lo
+    RTS                     ; A = random byte (rng_lo)
+
+; --- Initialize 32 particles with random positions ---
+init_particles:
+    LDA #$E1
+    STA rng_lo
+    LDA #$AC
+    STA rng_hi
+    LDX #PARTICLE_COUNT-1
+@init_loop:
+    JSR random
+    AND #$3F
+    SEC
+    SBC #32
+    STA particle_wx,X
+    JSR random
+    AND #$3F
+    SEC
+    SBC #32
+    STA particle_wz,X
+    STZ particle_mask_0,X
+    STZ particle_mask_1,X
+    DEX
+    BPL @init_loop
+    RTS
+
+; --- XOR-draw a single pixel at (x0, y0) ---
+draw_point:
+    JSR init_base           ; base = screen addr, mask_zp = bit, Y = y0&7
+    LDA (base),Y
+    EOR mask_zp
+    STA (base),Y
+    RTS
+
+; --- Erase particles from back buffer (XOR using saved erase data) ---
+erase_particles:
+    LDA back_buf_idx
+    BNE @erase_buf1
+
+    ; Erase from buffer 0
+    LDX #PARTICLE_COUNT-1
+@erase_loop_0:
+    LDA particle_mask_0,X
+    BEQ @skip_0
+    LDA particle_blo_0,X
+    STA base
+    LDA particle_bhi_0,X
+    STA base+1
+    LDY particle_yoff_0,X
+    LDA (base),Y
+    EOR particle_mask_0,X
+    STA (base),Y
+    STZ particle_mask_0,X
+@skip_0:
+    DEX
+    BPL @erase_loop_0
+    RTS
+
+@erase_buf1:
+    LDX #PARTICLE_COUNT-1
+@erase_loop_1:
+    LDA particle_mask_1,X
+    BEQ @skip_1
+    LDA particle_blo_1,X
+    STA base
+    LDA particle_bhi_1,X
+    STA base+1
+    LDY particle_yoff_1,X
+    LDA (base),Y
+    EOR particle_mask_1,X
+    STA (base),Y
+    STZ particle_mask_1,X
+@skip_1:
+    DEX
+    BPL @erase_loop_1
+    RTS
+
+; --- Draw particles: wrap, rotate, project, XOR-draw ---
+
+; Scratch bytes (in code segment, modified at runtime)
+dp_sin:          .byte 0
+dp_cos:          .byte 0
+dp_idx:          .byte 0
+dp_corr_vx_frac: .byte 0    ; sub-pixel player correction for vx (fractional)
+dp_corr_vx_int:  .byte 0    ; sub-pixel player correction for vx (integer, ±1)
+dp_corr_vz_frac: .byte 0    ; sub-pixel player correction for vz (fractional)
+dp_corr_vz_int:  .byte 0    ; sub-pixel player correction for vz (integer, ±1)
+dp_vx_frac:      .byte 0    ; corrected vx fractional part (for screen X correction)
+
+draw_particles:
+    ; Setup: cache sin/cos for player angle
+    LDY player_angle
+    LDA sin_table,Y
+    STA dp_sin
+    LDA cos_table,Y
+    STA dp_cos
+
+    ; --- Pre-compute sub-pixel player position corrections ---
+    ; Same for all particles; matches object pipeline (lines 698-822)
+    ; Corrects for player_x_lo/player_z_lo fractional position
+    STZ dp_corr_vx_frac
+    STZ dp_corr_vx_int
+    STZ dp_corr_vz_frac
+    STZ dp_corr_vz_int
+
+    ; Term 1: subtract (player_x_lo * cos) >> 7 from corr_vx
+    LDA player_x_lo
+    STA math_a
+    LDA dp_cos
+    STA math_b
+    JSR smul8x8
+    LDA player_x_lo
+    BPL @spc1_ok
+    CLC
+    LDA math_res_hi
+    ADC dp_cos
+    STA math_res_hi
+@spc1_ok:
+    ASL math_res_lo
+    ROL math_res_hi
+    BCC @spc1_pos
+    LDX #$FF
+    BRA @spc1_sub
+@spc1_pos:
+    LDX #0
+@spc1_sub:
+    LDA dp_corr_vx_frac
+    SEC
+    SBC math_res_hi
+    STA dp_corr_vx_frac
+    TXA
+    STA math_a
+    LDA dp_corr_vx_int
+    SBC math_a
+    STA dp_corr_vx_int
+
+    ; Term 2: subtract (player_z_lo * sin) >> 7 from corr_vx
+    LDA player_z_lo
+    STA math_a
+    LDA dp_sin
+    STA math_b
+    JSR smul8x8
+    LDA player_z_lo
+    BPL @spc2_ok
+    CLC
+    LDA math_res_hi
+    ADC dp_sin
+    STA math_res_hi
+@spc2_ok:
+    ASL math_res_lo
+    ROL math_res_hi
+    BCC @spc2_pos
+    LDX #$FF
+    BRA @spc2_sub
+@spc2_pos:
+    LDX #0
+@spc2_sub:
+    LDA dp_corr_vx_frac
+    SEC
+    SBC math_res_hi
+    STA dp_corr_vx_frac
+    TXA
+    STA math_a
+    LDA dp_corr_vx_int
+    SBC math_a
+    STA dp_corr_vx_int
+
+    ; Term 3: subtract (player_z_lo * cos) >> 7 from corr_vz
+    LDA player_z_lo
+    STA math_a
+    LDA dp_cos
+    STA math_b
+    JSR smul8x8
+    LDA player_z_lo
+    BPL @spc3_ok
+    CLC
+    LDA math_res_hi
+    ADC dp_cos
+    STA math_res_hi
+@spc3_ok:
+    ASL math_res_lo
+    ROL math_res_hi
+    BCC @spc3_pos
+    LDX #$FF
+    BRA @spc3_sub
+@spc3_pos:
+    LDX #0
+@spc3_sub:
+    LDA dp_corr_vz_frac
+    SEC
+    SBC math_res_hi
+    STA dp_corr_vz_frac
+    TXA
+    STA math_a
+    LDA dp_corr_vz_int
+    SBC math_a
+    STA dp_corr_vz_int
+
+    ; Term 4: ADD (player_x_lo * sin) >> 7 to corr_vz
+    LDA player_x_lo
+    STA math_a
+    LDA dp_sin
+    STA math_b
+    JSR smul8x8
+    LDA player_x_lo
+    BPL @spc4_ok
+    CLC
+    LDA math_res_hi
+    ADC dp_sin
+    STA math_res_hi
+@spc4_ok:
+    ASL math_res_lo
+    ROL math_res_hi
+    BCC @spc4_pos
+    LDX #$FF
+    BRA @spc4_add
+@spc4_pos:
+    LDX #0
+@spc4_add:
+    LDA dp_corr_vz_frac
+    CLC
+    ADC math_res_hi
+    STA dp_corr_vz_frac
+    TXA
+    STA math_a
+    LDA dp_corr_vz_int
+    ADC math_a
+    STA dp_corr_vz_int
+
+    ; --- Particle loop ---
+    LDX #PARTICLE_COUNT-1
+
+@particle_loop:
+    ; === Wrap X (modular, 64-unit period, instant convergence) ===
+    LDA particle_wx,X
+    SEC
+    SBC player_x_hi
+    AND #$3F                   ; mod 64 → 0..63
+    CMP #32
+    BCC @xdone
+    ORA #$C0                   ; 32..63 → -32..-1
+@xdone:
+    STA rel_x
+
+    ; === Wrap Z (modular, 64-unit period) ===
+    LDA particle_wz,X
+    SEC
+    SBC player_z_hi
+    AND #$3F
+    CMP #32
+    BCC @zdone
+    ORA #$C0
+@zdone:
+    STA rel_z
+
+    ; Save particle index (smul8x8 clobbers X)
+    STX dp_idx
+
+    ; === Rotate (16-bit accumulation, matching object pipeline) ===
+    ; vx = (rel_x * cos + rel_z * sin) >> 7
+    LDA rel_x
+    STA math_a
+    LDA dp_cos
+    STA math_b
+    JSR smul8x8
+    PHA                        ; save term1 hi
+    LDA math_res_lo
+    PHA                        ; save term1 lo
+
+    LDA rel_z
+    STA math_a
+    LDA dp_sin
+    STA math_b
+    JSR smul8x8
+
+    PLA                        ; term1 lo
+    CLC
+    ADC math_res_lo
+    STA math_res_lo
+    PLA                        ; term1 hi
+    ADC math_res_hi
+
+    ASL math_res_lo
+    ROL A                      ; >>7 → A = vx int
+    STA temp0
+    ; Apply sub-pixel correction to vx (8.8 fixed-point)
+    LDA math_res_lo            ; raw vx frac (from >>7 shift)
+    CLC
+    ADC dp_corr_vx_frac
+    STA dp_vx_frac             ; corrected vx frac
+    LDA temp0                  ; raw vx int
+    ADC dp_corr_vx_int         ; carry propagates from frac
+    STA temp0                  ; corrected vx int
+
+    ; vz = (rel_z * cos - rel_x * sin) >> 7
+    LDA rel_z
+    STA math_a
+    LDA dp_cos
+    STA math_b
+    JSR smul8x8
+    PHA
+    LDA math_res_lo
+    PHA
+
+    LDA rel_x
+    STA math_a
+    LDA dp_sin
+    STA math_b
+    JSR smul8x8
+
+    PLA                        ; term1 lo
+    SEC
+    SBC math_res_lo
+    STA math_res_lo
+    PLA                        ; term1 hi
+    SBC math_res_hi
+
+    ASL math_res_lo
+    ROL A                      ; >>7 → A = vz int
+    STA temp1
+    ; Apply sub-pixel correction to vz (8.8 fixed-point)
+    LDA math_res_lo            ; raw vz frac
+    CLC
+    ADC dp_corr_vz_frac
+    STA vz_frac                ; corrected vz frac → for recip_lookup
+    LDA temp1                  ; raw vz int
+    ADC dp_corr_vz_int         ; carry propagates
+
+    ; === Visibility: skip if corrected vz < 1 ===
+    BMI @skip_particle
+    BEQ @skip_particle
+    STA temp1                  ; save corrected vz int
+    BRA @vz_visible
+@skip_particle:
+    JMP @next_particle
+@vz_visible:
+
+    ; === Reciprocal with fractional interpolation (recip_lookup) ===
+    CMP #33
+    BCC @vz_ok
+    LDA #32
+    STZ vz_frac                ; clamp: zero frac
+@vz_ok:
+    JSR recip_lookup           ; uses A=vz_int, vz_frac; sets recip_val
+
+    ; === Screen X: 128 + (vx * recip_val) + corrections ===
+
+    ; Main displacement: vx * recip_val
+    LDA temp0                  ; corrected vx int (signed)
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR smul8x8                ; math_res_hi:math_res_lo = vx * recip
+    CLC
+    LDA #128
+    ADC math_res_lo
+    STA x0
+    LDA #0
+    ADC math_res_hi
+    BEQ @x_main_ok
+    JMP @next_particle         ; off-screen (proj_x_hi != 0)
+@x_main_ok:
+
+    ; recip_lo correction: (vx * recip_lo_val) >> 7
+    LDA temp0                  ; vx (signed)
+    STA math_a
+    LDA recip_lo_val
+    STA math_b
+    JSR smul8x8                ; signed result
+    ASL math_res_lo
+    ROL math_res_hi            ; >>7 → math_res_hi = signed correction
+    LDA math_res_hi
+    BMI @rlx_neg
+    CLC
+    ADC x0
+    BCC @rlx_ok
+    JMP @next_particle         ; positive overflow
+@rlx_neg:
+    CLC
+    ADC x0
+    BCS @rlx_ok
+    JMP @next_particle         ; negative underflow
+@rlx_ok:
+    STA x0
+
+    ; vx_frac correction: ((vx_frac >> 1) * recip_val) >> 7
+    LDA dp_vx_frac
+    LSR A                      ; 0..127 (unsigned-safe)
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR smul8x8                ; always positive: (0-127)*(0-127)
+    ASL math_res_lo
+    ROL math_res_hi            ; >>7 → correction (0-126)
+    CLC
+    LDA x0
+    ADC math_res_hi
+    BCC @x_done
+    JMP @next_particle         ; overflow → off-screen
+@x_done:
+    STA x0
+
+    ; === Screen Y: 128 + 3 * recip_val + (3 * recip_lo_val) >> 7 ===
+
+    ; Compute (3 * recip_lo_val) >> 7 → result is -2..+1
+    ; 3 * rlo_val (low byte only), then check bit 7 vs sign of rlo_val
+    LDA recip_lo_val
+    ASL A                      ; 2 * rlo (low byte)
+    CLC
+    ADC recip_lo_val           ; 3 * rlo (low byte, may wrap)
+    ASL A                      ; bit 7 → carry
+    LDA recip_lo_val
+    BPL @y_corr_pos
+    ; Negative rlo: correction = carry ? -1 : -2
+    BCS @y_cm1
+    LDA #$FE                   ; -2
+    BRA @y_corr_done
+@y_cm1:
+    LDA #$FF                   ; -1
+    BRA @y_corr_done
+@y_corr_pos:
+    ; Positive rlo: correction = carry ? +1 : 0
+    BCS @y_cp1
+    LDA #0
+    BRA @y_corr_done
+@y_cp1:
+    LDA #1
+@y_corr_done:
+    STA temp2                  ; Y correction (-2..+1)
+
+    ; Main Y: 128 + 3 * recip_val
+    LDA recip_val
+    ASL A                      ; 2 * recip
+    CLC
+    ADC recip_val              ; 3 * recip
+    BCS @clamp_y
+    CLC
+    ADC #128
+    BCS @clamp_y
+    STA y0
+
+    ; Apply Y correction (signed, small)
+    LDA temp2
+    BEQ @y_ok                  ; 0 → no correction
+    BMI @y_sub
+    ; Positive (+1): increment y0
+    INC y0
+    BEQ @clamp_y               ; 255→0 wrapped
+    BRA @y_ok
+@y_sub:
+    ; Negative (-1 or -2): decrement y0 (y0 >= 128, always safe)
+    DEC y0
+    CMP #$FE                   ; was correction -2?
+    BNE @y_ok
+    DEC y0
+    BRA @y_ok
+@clamp_y:
+    LDA #255
+    STA y0
+@y_ok:
+
+    ; === Draw the point ===
+    JSR draw_point
+
+    ; === Store erase data for this buffer ===
+    ; After draw_point: base, mask_zp, Y (y0&7) are still valid
+    LDX dp_idx
+    LDA back_buf_idx
+    BNE @store_buf1
+
+    ; Store to buffer 0
+    LDA base
+    STA particle_blo_0,X
+    LDA base+1
+    STA particle_bhi_0,X
+    TYA
+    STA particle_yoff_0,X
+    LDA mask_zp
+    STA particle_mask_0,X
+    BRA @next_particle
+
+@store_buf1:
+    LDA base
+    STA particle_blo_1,X
+    LDA base+1
+    STA particle_bhi_1,X
+    TYA
+    STA particle_yoff_1,X
+    LDA mask_zp
+    STA particle_mask_1,X
+
+@next_particle:
+    LDX dp_idx
+    DEX
+    BMI @particles_done
+    JMP @particle_loop
+@particles_done:
+    RTS
 
 ; =====================================================================
 ; Lookup tables

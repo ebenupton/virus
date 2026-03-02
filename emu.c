@@ -190,7 +190,7 @@ static void write_ppm(FILE *f, uint32_t *pixels)
 
 /* ── Profiling ─────────────────────────────────────────────────────── */
 
-#define PROFILE_RANGE_LO 0x2000
+#define PROFILE_RANGE_LO 0x1800
 #define PROFILE_RANGE_HI 0x8000
 #define PROFILE_SIZE     (PROFILE_RANGE_HI - PROFILE_RANGE_LO)
 
@@ -390,7 +390,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     fseek(f, 0, SEEK_SET);
-    if ((long)fread(&memory[0x2000], 1, size, f) != size) {
+    if ((long)fread(&memory[0x1800], 1, size, f) != size) {
         perror("fread");
         fclose(f);
         return 1;
@@ -402,9 +402,9 @@ int main(int argc, char *argv[])
     memory[0xFFEE] = 0x60;  /* RTS */
     memory[0xFFF4] = 0x60;  /* RTS */
 
-    /* Set reset vector to $2000 */
+    /* Set reset vector to $1800 */
     memory[0xFFFC] = 0x00;
-    memory[0xFFFD] = 0x20;
+    memory[0xFFFD] = 0x18;
 
     /* Load label map if available (for profiling) */
     if (profile_mode) {

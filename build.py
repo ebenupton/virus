@@ -18,8 +18,8 @@ TRACKS = 40
 SECTORS_PER_TRACK = 10
 TOTAL_SECTORS = TRACKS * SECTORS_PER_TRACK   # 400
 
-DEMO_LOAD = 0x2000
-DEMO_EXEC = 0x2000
+DEMO_LOAD = 0x1800
+DEMO_EXEC = 0x1800
 
 
 def assemble(src, binfile, objfile=None, extra_flags=None):

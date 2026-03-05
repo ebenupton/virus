@@ -2,7 +2,10 @@
  * emu.c -- BBC Micro emulator for Battlezone-style game
  *
  * Uses w65c02s.h (65C02 CPU) + SDL2 (display/keyboard).
- * Loads a flat binary at $2000, sets reset vector to $2000.
+ * Loads a flat binary at $0800, sets reset vector to $0800.
+ *
+ * Video: MODE 2-like, 128x160 (4bpp), 512-byte stripes.
+ *   Screen buffers: $3000-$57FF (10K) and $5800-$7FFF (10K).
  *
  * Memory-mapped I/O:
  *   $FE00 write: CRTC register select
@@ -26,10 +29,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #define W65C02S_COARSE 1
 #define W65C02S_IMPL 1
 #include "w65c02s.h"
+
+/* ── Screen dimensions ───────────────────────────────────────────────── */
+
+#define SCREEN_W 128
+#define SCREEN_H 160
 
 /* ── Global state ──────────────────────────────────────────────────────── */
 
@@ -37,7 +46,7 @@ static uint8_t memory[65536];
 
 /* CRTC state */
 static uint8_t crtc_reg_select = 0;
-static uint8_t crtc_r12 = 0x08;    /* default: screen at $4000 */
+static uint8_t crtc_r12 = 0x06;    /* default: screen at $3000 */
 static uint8_t crtc_r13 = 0x00;
 
 /* System flags */
@@ -46,16 +55,45 @@ static uint8_t vsync_flag = 0;     /* bit 1 = vsync occurred */
 /* VIA state */
 static uint8_t via_ora = 0;       /* last value written to $FE4F */
 
+/* Cycle counter: write any value to $FE20 to latch current total_cycles,
+   read $FE20-$FE23 for 32-bit elapsed cycles since last latch */
+static uint64_t cycle_latch = 0;
+
 /* Keyboard state */
 static uint8_t key_state = 0;      /* bit0=Z, 1=X, 2=Return, 3=Space */
+
+/* ── Standard MODE 2 palette (logical colour → ARGB) ──────────────── */
+
+static const uint32_t mode2_palette[16] = {
+    0xFF000000,  /*  0 = black             */
+    0xFFFF0000,  /*  1 = red               */
+    0xFF00FF00,  /*  2 = green             */
+    0xFFFFFF00,  /*  3 = yellow            */
+    0xFF0000FF,  /*  4 = blue              */
+    0xFFFF00FF,  /*  5 = magenta           */
+    0xFF00FFFF,  /*  6 = cyan              */
+    0xFFFFFFFF,  /*  7 = white             */
+    0xFF000000,  /*  8 = black  (flash)    */
+    0xFFFF0000,  /*  9 = red    (flash)    */
+    0xFF00FF00,  /* 10 = green  (flash)    */
+    0xFFFFFF00,  /* 11 = yellow (flash)    */
+    0xFF0000FF,  /* 12 = blue   (flash)    */
+    0xFFFF00FF,  /* 13 = magenta(flash)    */
+    0xFF00FFFF,  /* 14 = cyan   (flash)    */
+    0xFFFFFFFF,  /* 15 = white  (flash)    */
+};
 
 /* ── Memory read/write with I/O ────────────────────────────────────── */
 
 static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
 {
-    (void)cpu;
-
     switch (addr) {
+    case 0xFE20: case 0xFE21: case 0xFE22: case 0xFE23: {
+        /* Read 32-bit elapsed cycles since last latch (little-endian) */
+        uint32_t elapsed = (uint32_t)(w65c02s_get_cycle_count(cpu) - cycle_latch);
+        return (elapsed >> ((addr - 0xFE20) * 8)) & 0xFF;
+    }
+
     case 0xFE4D:
         return vsync_flag;
 
@@ -84,9 +122,19 @@ static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
 
 static void mem_write(struct w65c02s_cpu *cpu, uint16_t addr, uint8_t val)
 {
-    (void)cpu;
-
     switch (addr) {
+    case 0xFE20:
+        /* Latch current cycle count */
+        cycle_latch = w65c02s_get_cycle_count(cpu);
+        break;
+    case 0xFE30:
+        /* Debug byte output */
+        fprintf(stderr, "%02X", val);
+        break;
+    case 0xFE31:
+        /* Debug newline */
+        fprintf(stderr, "\n");
+        break;
     case 0xFE00:
         crtc_reg_select = val;
         break;
@@ -122,51 +170,65 @@ static void mem_write(struct w65c02s_cpu *cpu, uint16_t addr, uint8_t val)
 /* ── Screen scanout ─────────────────────────────────────────────────── */
 
 /*
- * BBC Micro Mode 4 screen layout (1bpp, 256x256):
- *   Each character cell is 8 pixels wide x 8 rows, stored as 8 contiguous bytes.
- *   32 cells per row = 256 pixels wide, 32 character rows = 256 lines.
- *   Base address determined by CRTC R12:R13.
+ * MODE 2-like screen layout (4bpp, 128x160):
+ *   64 byte-columns × 20 character rows, each cell = 8 bytes.
+ *   512 bytes per character row ("stripe").
  *
- *   For R12=$08: base = $4000
- *   For R12=$0C: base = $6000 (actually MA bit 13 set, maps to +$2000)
+ *   Each byte holds 2 pixels at 4bpp, interleaved:
+ *     Pixel 0 (left):  bits 7,5,3,1
+ *     Pixel 1 (right): bits 6,4,2,0
+ *
+ *   For R12=$06: base = $3000
+ *   For R12=$0B: base = $5800
  *
  *   Pixel at (x, y):
- *     char_col = x / 8
- *     char_row = y / 8
- *     bit_pos  = x & 7  (MSB first: bit 7-x&7)
- *     byte_offset = char_row * 256 + char_col * 8 + (y & 7)
- *     addr = base + byte_offset
+ *     byte_col  = x / 2
+ *     char_row  = y / 8
+ *     sub_row   = y & 7
+ *     byte_addr = base + char_row*512 + byte_col*8 + sub_row
+ *     pixel_pos = x & 1  (0=left, 1=right)
  */
 
 static uint16_t get_screen_base(void)
 {
-    /* R12 holds the high 6 bits of the MA (memory address) start.
-     * In BBC Micro, the physical address mapping is:
-     *   R12=$08 → $4000, R12=$0C → $6000
-     * Simplified: base = (R12 & 0x3F) << 9 | R13, then multiply by 8
-     * But for our purposes: R12=$08→$4000, R12=$0C→$6000 */
-    if (crtc_r12 == 0x0C)
-        return 0x6000;
-    return 0x4000;
+    if (crtc_r12 == 0x0B)
+        return 0x5800;
+    return 0x3000;
+}
+
+/* Extract a 4-bit pixel from a byte */
+static inline uint8_t decode_pixel(uint8_t byte, int pos)
+{
+    if (pos == 0) {
+        /* Left pixel: bits 7,5,3,1 → colour bits 3,2,1,0 */
+        return ((byte >> 4) & 0x08) |
+               ((byte >> 3) & 0x04) |
+               ((byte >> 2) & 0x02) |
+               ((byte >> 1) & 0x01);
+    } else {
+        /* Right pixel: bits 6,4,2,0 → colour bits 3,2,1,0 */
+        return ((byte >> 3) & 0x08) |
+               ((byte >> 2) & 0x04) |
+               ((byte >> 1) & 0x02) |
+               ( byte       & 0x01);
+    }
 }
 
 static void scanout_to_argb(uint32_t *pixels, int pitch)
 {
     uint16_t base = get_screen_base();
 
-    for (int char_row = 0; char_row < 32; char_row++) {
-        for (int char_col = 0; char_col < 32; char_col++) {
-            uint16_t cell_addr = base + char_row * 256 + char_col * 8;
+    for (int char_row = 0; char_row < 20; char_row++) {
+        for (int byte_col = 0; byte_col < 64; byte_col++) {
+            uint16_t cell_addr = base + char_row * 512 + byte_col * 8;
             for (int row = 0; row < 8; row++) {
                 uint8_t byte = memory[cell_addr + row];
                 int screen_y = char_row * 8 + row;
-                int screen_x = char_col * 8;
-                for (int bit = 7; bit >= 0; bit--) {
-                    uint32_t color = (byte & (1 << bit))
-                        ? 0xFFFFFFFF   /* white */
-                        : 0xFF000000;  /* black */
-                    pixels[screen_y * (pitch / 4) + screen_x + (7 - bit)] = color;
-                }
+                int screen_x = byte_col * 2;
+                uint8_t left  = decode_pixel(byte, 0);
+                uint8_t right = decode_pixel(byte, 1);
+                pixels[screen_y * (pitch / 4) + screen_x]     = mode2_palette[left];
+                pixels[screen_y * (pitch / 4) + screen_x + 1] = mode2_palette[right];
             }
         }
     }
@@ -176,8 +238,8 @@ static void scanout_to_argb(uint32_t *pixels, int pitch)
 
 static void write_ppm(FILE *f, uint32_t *pixels)
 {
-    fprintf(f, "P6\n256 256\n255\n");
-    for (int i = 0; i < 256 * 256; i++) {
+    fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
         uint32_t c = pixels[i];
         uint8_t r = (c >> 16) & 0xFF;
         uint8_t g = (c >> 8) & 0xFF;
@@ -188,13 +250,113 @@ static void write_ppm(FILE *f, uint32_t *pixels)
     }
 }
 
+/* ── Frame dump (2x resolution, direct from BBC Micro VRAM) ────────── */
+
+static void dump_frame_2x(const char *dir, int frame_num)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/frame_%06d.ppm", dir, frame_num);
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return; }
+
+    uint16_t base = get_screen_base();
+    fprintf(f, "P6\n%d %d\n255\n", SCREEN_W * 2, SCREEN_H * 2);
+
+    for (int y = 0; y < SCREEN_H; y++) {
+        int char_row = y / 8;
+        int sub_row = y & 7;
+        uint8_t row_buf[SCREEN_W * 2 * 3];
+        int p = 0;
+        for (int byte_col = 0; byte_col < 64; byte_col++) {
+            uint16_t cell_addr = base + char_row * 512 + byte_col * 8;
+            uint8_t byte = memory[cell_addr + sub_row];
+            for (int px = 0; px < 2; px++) {
+                uint8_t col = decode_pixel(byte, px);
+                uint32_t argb = mode2_palette[col];
+                uint8_t r = (argb >> 16) & 0xFF;
+                uint8_t g = (argb >> 8) & 0xFF;
+                uint8_t b = argb & 0xFF;
+                /* 2x horizontal */
+                row_buf[p++] = r; row_buf[p++] = g; row_buf[p++] = b;
+                row_buf[p++] = r; row_buf[p++] = g; row_buf[p++] = b;
+            }
+        }
+        /* Write row twice (2x vertical) */
+        fwrite(row_buf, 1, sizeof(row_buf), f);
+        fwrite(row_buf, 1, sizeof(row_buf), f);
+    }
+    fclose(f);
+}
+
+/* ── Line statistics ───────────────────────────────────────────────── */
+
+/* ZP addresses from raster_zp.inc */
+#define ZP_X0 0x80
+#define ZP_Y0 0x81
+#define ZP_X1 0x82
+#define ZP_Y1 0x83
+
+static uint16_t draw_line_addr = 0;  /* set from labels */
+
+struct line_stats {
+    unsigned long count;        /* number of lines */
+    unsigned long total_pixels; /* total pixels drawn */
+};
+
+static struct line_stats ls_horiz = {0, 0};
+static struct line_stats ls_vert  = {0, 0};
+static struct line_stats ls_other = {0, 0};
+static int line_stats_mode = 0;
+
+static void print_line_stats(int num_frames)
+{
+    unsigned long total = ls_horiz.count + ls_vert.count + ls_other.count;
+    fprintf(stderr, "\n=== Line Statistics (%d frames, %lu total calls) ===\n", num_frames, total);
+    fprintf(stderr, "%-12s %6s %8s %10s %10s\n", "Type", "Count", "Pixels", "Avg px/ln", "Px/frame");
+    if (ls_horiz.count)
+        fprintf(stderr, "%-12s %6lu %8lu %10.1f %10.1f\n", "Horizontal",
+                ls_horiz.count, ls_horiz.total_pixels,
+                (double)ls_horiz.total_pixels / ls_horiz.count,
+                (double)ls_horiz.total_pixels / num_frames);
+    if (ls_vert.count)
+        fprintf(stderr, "%-12s %6lu %8lu %10.1f %10.1f\n", "Vertical",
+                ls_vert.count, ls_vert.total_pixels,
+                (double)ls_vert.total_pixels / ls_vert.count,
+                (double)ls_vert.total_pixels / num_frames);
+    fprintf(stderr, "%-12s %6lu %8lu %10.1f %10.1f\n", "Other",
+            ls_other.count, ls_other.total_pixels,
+            (double)ls_other.total_pixels / ls_other.count,
+            (double)ls_other.total_pixels / num_frames);
+    fprintf(stderr, "%-12s %6lu %8lu %10s %10.1f\n", "TOTAL",
+            total, ls_horiz.total_pixels + ls_vert.total_pixels + ls_other.total_pixels,
+            "",
+            (double)(ls_horiz.total_pixels + ls_vert.total_pixels + ls_other.total_pixels) / num_frames);
+
+    /* Cycle saving estimates */
+    fprintf(stderr, "\n--- Estimated cycle savings ---\n");
+    fprintf(stderr, "Horizontal: %.0f pixels/frame × 8 cycles saved = %.0f cycles/frame\n",
+            (double)ls_horiz.total_pixels / num_frames,
+            (double)ls_horiz.total_pixels / num_frames * 8);
+    fprintf(stderr, "Vertical:   %.0f pixels/frame × 12 cycles saved = %.0f cycles/frame\n",
+            (double)ls_vert.total_pixels / num_frames,
+            (double)ls_vert.total_pixels / num_frames * 12);
+    fprintf(stderr, "Total:      %.0f cycles/frame\n",
+            (double)ls_horiz.total_pixels / num_frames * 8 +
+            (double)ls_vert.total_pixels / num_frames * 12);
+}
+
 /* ── Profiling ─────────────────────────────────────────────────────── */
 
-#define PROFILE_RANGE_LO 0x1800
-#define PROFILE_RANGE_HI 0x8000
+#define PROFILE_RANGE_LO 0x0800
+#define PROFILE_RANGE_HI 0x3000
 #define PROFILE_SIZE     (PROFILE_RANGE_HI - PROFILE_RANGE_LO)
 
 static uint64_t profile_cycles[PROFILE_SIZE];
+
+/* Per-frame cycle tracking */
+#define MAX_FRAME_TRACK 100000
+static unsigned long frame_active_cycles[MAX_FRAME_TRACK];
+static int frame_track_count = 0;
 
 /* Label map for cross-referencing */
 #define MAX_LABELS 2048
@@ -343,6 +505,32 @@ static void print_profile(int num_frames)
     }
 
     free(indices);
+
+    /* Per-frame cycle summary */
+    if (frame_track_count > 0) {
+        const unsigned long cpf = 40000; /* 2 MHz / 50 Hz */
+        /* Skip first few frames (init) */
+        int skip = frame_track_count > 10 ? 5 : 0;
+        unsigned long min_c = ULONG_MAX, max_c = 0;
+        unsigned long long sum_c = 0;
+        int count = 0;
+        for (int i = skip; i < frame_track_count; i++) {
+            unsigned long c = frame_active_cycles[i];
+            if (c < min_c) min_c = c;
+            if (c > max_c) max_c = c;
+            sum_c += c;
+            count++;
+        }
+        fprintf(stderr, "\n--- Per-frame active cycles (excl. vsync wait) ---\n");
+        fprintf(stderr, "Frames: %d (skipped first %d init frames)\n", count, skip);
+        fprintf(stderr, "Min:    %lu / %lu (%.1f%%)\n", min_c, cpf,
+                100.0 * min_c / cpf);
+        fprintf(stderr, "Max:    %lu / %lu (%.1f%%)\n", max_c, cpf,
+                100.0 * max_c / cpf);
+        fprintf(stderr, "Avg:    %llu / %lu (%.1f%%)\n", sum_c / count, cpf,
+                100.0 * sum_c / count / cpf);
+        fprintf(stderr, "Budget: %lu cycles/frame @ 2MHz/50Hz\n", cpf);
+    }
 }
 
 /* ── Main ───────────────────────────────────────────────────────────── */
@@ -354,7 +542,7 @@ static void print_profile(int num_frames)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <binary> [--headless N] [--profile]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <binary> [--headless N] [--profile] [--dump-frames <dir>]\n", argv[0]);
         return 1;
     }
 
@@ -365,6 +553,7 @@ int main(int argc, char *argv[])
     int headless_keys = 0;   /* simulated key_state for headless mode */
     int log_mode = 0;        /* dump vertex coords to stderr each frame */
     int profile_mode = 0;
+    const char *dump_dir = NULL;  /* if set, dump each scanout frame as 2x PPM */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0 && i + 1 < argc) {
             headless = 1;
@@ -376,21 +565,26 @@ int main(int argc, char *argv[])
             log_mode = 1;
         } else if (strcmp(argv[i], "--profile") == 0) {
             profile_mode = 1;
+        } else if (strcmp(argv[i], "--line-stats") == 0) {
+            line_stats_mode = 1;
+            profile_mode = 1;  /* needs per-instruction stepping */
+        } else if (strcmp(argv[i], "--dump-frames") == 0 && i + 1 < argc) {
+            dump_dir = argv[++i];
         }
     }
 
-    /* Load binary at $2000 */
+    /* Load binary at $0800 */
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    if (size > 0x6000) {
-        fprintf(stderr, "binary too large (%ld bytes, max $6000)\n", size);
+    if (size > 0x2800) {
+        fprintf(stderr, "binary too large (%ld bytes, max $2800)\n", size);
         fclose(f);
         return 1;
     }
     fseek(f, 0, SEEK_SET);
-    if ((long)fread(&memory[0x1800], 1, size, f) != size) {
+    if ((long)fread(&memory[0x0800], 1, size, f) != size) {
         perror("fread");
         fclose(f);
         return 1;
@@ -402,9 +596,9 @@ int main(int argc, char *argv[])
     memory[0xFFEE] = 0x60;  /* RTS */
     memory[0xFFF4] = 0x60;  /* RTS */
 
-    /* Set reset vector to $1800 */
+    /* Set reset vector to $0800 */
     memory[0xFFFC] = 0x00;
-    memory[0xFFFD] = 0x18;
+    memory[0xFFFD] = 0x08;
 
     /* Load label map if available (for profiling) */
     if (profile_mode) {
@@ -416,6 +610,17 @@ int main(int argc, char *argv[])
         load_labels(lblpath);
         fprintf(stderr, "Loaded %d labels from %s\n", num_labels, lblpath);
         memset(profile_cycles, 0, sizeof(profile_cycles));
+
+        /* Find draw_line address for line stats */
+        if (line_stats_mode) {
+            for (int i = 0; i < num_labels; i++) {
+                if (strcmp(labels[i].name, "draw_line") == 0) {
+                    draw_line_addr = labels[i].addr;
+                    fprintf(stderr, "draw_line at $%04X\n", draw_line_addr);
+                    break;
+                }
+            }
+        }
     }
 
     /* Initialize CPU */
@@ -428,25 +633,57 @@ int main(int argc, char *argv[])
 
     if (headless) {
         /* ── Headless mode ──────────────────────────────────────────── */
-        uint32_t *pixels = calloc(256 * 256, sizeof(uint32_t));
+        uint32_t *pixels = calloc(SCREEN_W * SCREEN_H, sizeof(uint32_t));
         if (!pixels) { perror("calloc"); free(cpu); return 1; }
 
         key_state = headless_keys;
+        int dump_num = 0;
         for (int frame = 0; frame < headless_frames; frame++) {
             if (profile_mode) {
                 /* Step instruction-by-instruction, recording cycles per PC */
                 unsigned long frame_cycles = 0;
+                unsigned long frame_vsync_cycles = 0;
                 while (frame_cycles < CYCLES_PER_FRAME) {
                     uint16_t pc = w65c02s_reg_get_pc(cpu);
                     unsigned long c = w65c02s_step_instruction(cpu);
                     frame_cycles += c;
                     if (pc >= PROFILE_RANGE_LO && pc < PROFILE_RANGE_HI)
                         profile_cycles[pc - PROFILE_RANGE_LO] += c;
+                    /* Line statistics */
+                    if (line_stats_mode && draw_line_addr && pc == draw_line_addr) {
+                        uint8_t lx0 = memory[ZP_X0], ly0 = memory[ZP_Y0];
+                        uint8_t lx1 = memory[ZP_X1], ly1 = memory[ZP_Y1];
+                        int dx = (int)lx1 - (int)lx0;
+                        int dy = (int)ly1 - (int)ly0;
+                        int adx = dx < 0 ? -dx : dx;
+                        int ady = dy < 0 ? -dy : dy;
+                        int pixels = adx > ady ? adx : ady;
+                        if (dy == 0 && dx != 0) {
+                            ls_horiz.count++;
+                            ls_horiz.total_pixels += pixels;
+                        } else if (dx == 0 && dy != 0) {
+                            ls_vert.count++;
+                            ls_vert.total_pixels += pixels;
+                        } else if (pixels > 0) {
+                            ls_other.count++;
+                            ls_other.total_pixels += pixels;
+                        }
+                    }
+                    /* Track vsync wait idle cycles */
+                    int off;
+                    const char *lbl = find_label(pc, &off);
+                    if (lbl && strcmp(lbl, "@vs_loop") == 0)
+                        frame_vsync_cycles += c;
                 }
+                if (frame_track_count < MAX_FRAME_TRACK)
+                    frame_active_cycles[frame_track_count++] = frame_cycles - frame_vsync_cycles;
             } else {
                 w65c02s_run_cycles(cpu, CYCLES_PER_FRAME);
             }
             vsync_flag |= 0x02;  /* set vsync bit */
+
+            if (dump_dir)
+                dump_frame_2x(dump_dir, dump_num++);
 
             if (log_mode) {
                 /* Dump state after each frame */
@@ -483,12 +720,15 @@ int main(int argc, char *argv[])
         }
 
         /* Scanout final frame */
-        scanout_to_argb(pixels, 256 * 4);
+        scanout_to_argb(pixels, SCREEN_W * 4);
         if (!profile_mode)
             write_ppm(stdout, pixels);
 
         if (profile_mode)
             print_profile(headless_frames);
+
+        if (line_stats_mode)
+            print_line_stats(headless_frames);
 
         free(pixels);
         free(cpu);
@@ -506,7 +746,7 @@ int main(int argc, char *argv[])
     SDL_Window *window = SDL_CreateWindow(
         "BBC Micro - Battlezone",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        512, 512, 0);
+        SCREEN_W * 4, SCREEN_H * 2, 0);
     if (!window) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
@@ -526,7 +766,7 @@ int main(int argc, char *argv[])
 
     SDL_Texture *texture = SDL_CreateTexture(renderer,
         SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-        256, 256);
+        SCREEN_W, SCREEN_H);
     if (!texture) {
         fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
         SDL_DestroyRenderer(renderer);
@@ -537,6 +777,7 @@ int main(int argc, char *argv[])
     }
 
     int running = 1;
+    int sdl_dump_num = 0;
     while (running) {
         /* Poll keyboard */
         SDL_Event event;
@@ -562,6 +803,10 @@ int main(int argc, char *argv[])
 
         /* Set vsync flag */
         vsync_flag |= 0x02;
+
+        /* Dump frame if requested */
+        if (dump_dir)
+            dump_frame_2x(dump_dir, sdl_dump_num++);
 
         /* Scanout to texture */
         uint32_t *pixels;

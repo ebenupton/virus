@@ -28,7 +28,10 @@ SYS_VIA_ORA  = $FE4F
 
 ; === Zero page: state ===
 back_buf_idx    = $8A       ; 0 or 1
+obj_rot_angle   = $8B       ; Y-axis rotation angle (0-255 = full circle)
 frame_count     = $8C
+obj_sin_val     = $91       ; precomputed sin(angle) for current frame
+obj_cos_val     = $92       ; precomputed cos(angle) for current frame
 lfsr_state      = $9C       ; 8-bit LFSR for random colours
 
 ; === Zero page: camera state ===
@@ -76,6 +79,15 @@ v_stride        = $AF       ; bytes per vertical chain (n_rows * 3)
 clamp_near_sy   = $B0       ; screen-y of near grid edge (large = bottom of screen)
 clamp_far_sy    = $B1       ; screen-y of far grid edge (small = toward horizon)
 
+; === Zero page: object renderer (reuse grid-projection temporaries) ===
+obj_ptr         = v_ptr       ; $78, 2 bytes — pointer into object type data
+obj_view_x      = z_cam_lo    ; $7E, 2 bytes — view-space X (lo/hi)
+obj_view_y      = step_lo     ; $A2, 2 bytes — view-space Y (lo/hi)
+obj_view_z      = run_lo      ; $A5, 2 bytes — view-space Z (lo/hi)
+obj_n_vtx       = proj_col    ; $7C — vertex/edge counter (reused across phases)
+obj_edge_idx    = hmap_col    ; $7D — running edge ID during chain draw
+obj_data_off    = chain_segs  ; $A9 — byte offset into face/chain data
+
 ; === Constants ===
 SCREEN_W    = 128            ; pixels wide (4bpp, 2 pixels per byte)
 SCREEN_H    = 160            ; pixels tall (20 character rows)
@@ -111,6 +123,13 @@ CAM_SPEED   = $08            ; ~0.03 units/frame in 8.8 (quarter-scale grid)
 .segment "BUFFERS"
 h_buf: .res GRID_VTX_Z * H_CHAIN_BYTES   ; horizontal chains, row-major
 v_buf: .res GRID_VTX_X * V_CHAIN_BYTES   ; vertical chains, column-major
+
+; Object renderer workspace
+MAX_OBJ_VERTICES = 24
+MAX_OBJ_EDGES    = 32
+obj_proj_sx:  .res MAX_OBJ_VERTICES   ; projected screen X (0..127)
+obj_proj_sy:  .res MAX_OBJ_VERTICES   ; projected screen Y (0..159)
+obj_edge_vis: .res 4                   ; 32-bit visibility bitmap (bit N → edge N)
 .segment "CODE"
 
 ; =====================================================================
@@ -158,6 +177,9 @@ entry:
     LDA #1
     STA back_buf_idx
 
+    ; Initialize rotation angle
+    STZ obj_rot_angle
+
     ; Initialize camera: x=0, z=-2.25 (8.8 fixed-point)
     STZ cam_x_lo
     STZ cam_x_hi
@@ -175,6 +197,18 @@ main_loop:
     JSR clear_screen
     JSR project_grid
     JSR draw_grid
+    ; Advance object rotation angle
+    LDA obj_rot_angle
+    CLC
+    ADC #4
+    STA obj_rot_angle
+
+    ; Draw test object (pyramid at fixed world position)
+    LDA #<obj_pyramid
+    STA obj_ptr
+    LDA #>obj_pyramid
+    STA obj_ptr+1
+    JSR draw_object
     JSR wait_vsync
     JSR flip_buffers
     JMP main_loop
@@ -1087,10 +1121,673 @@ draw_chains:
     BNE @chain_loop
     RTS
 
+; =====================================================================
+; draw_object — Project and render a 3D wireframe object
+; =====================================================================
+;
+; Inputs:
+;   obj_ptr ($78) = pointer to object type data (ROM)
+;   obj_world_x/y/z_lo/hi = 8.8 world position
+;
+; Phase 2 (projection) temps: $94/$95 = view coord 16-bit,
+;   $96 = vertex index, $97/$98/$99 = lx/ly/lz
+; Phase 3 (backface) temps: $94 = dx1, $95 = dy1, $96 = dx2,
+;   $97 = dy2, $98/$99 = cross lo/hi.  face_off in $A9.
+; Phase 4 (chain draw) temps: $94 = chain count, $95 = edge count,
+;   $96 = cur_vtx, $97 = chaining flag, $98 = next_vtx,
+;   $99 = edge colour, $9A = saved Y.  chain_off in $A9.
+
+CAM_HEIGHT_LO = $80             ; camera height 1.5 in 8.8 = $0180
+CAM_HEIGHT_HI = $01
+
+draw_object:
+    ; ── Step 1: Compute view-space centre ──
+    LDA obj_world_x_lo
+    SEC
+    SBC cam_x_lo
+    STA obj_view_x
+    LDA obj_world_x_hi
+    SBC cam_x_hi
+    STA obj_view_x+1
+
+    LDA #CAM_HEIGHT_LO
+    SEC
+    SBC obj_world_y_lo
+    STA obj_view_y
+    LDA #CAM_HEIGHT_HI
+    SBC obj_world_y_hi
+    STA obj_view_y+1
+
+    LDA obj_world_z_lo
+    SEC
+    SBC cam_z_lo
+    STA obj_view_z
+    LDA obj_world_z_hi
+    SBC cam_z_hi
+    STA obj_view_z+1
+    BMI @obj_rts
+    ORA obj_view_z
+    BNE @step2
+@obj_rts:
+    RTS
+
+@step2:
+    ; ── Step 2: Project vertices ──
+    ; Precompute sin/cos for Y-axis rotation
+    LDX obj_rot_angle
+    LDA sin_table,X
+    STA obj_sin_val
+    LDA cos_table,X
+    STA obj_cos_val
+
+    LDY #0
+    LDA (obj_ptr),Y
+    STA obj_n_vtx               ; vertex count from header
+    STZ $96                     ; vtx_idx = 0
+
+@proj_loop:
+    LDA $96
+    CMP obj_n_vtx
+    BCC @proj_vtx
+    JMP @proj_done
+
+@proj_vtx:
+    ; Y offset = 4 + vtx_idx * 3
+    ASL A
+    CLC
+    ADC $96
+    CLC
+    ADC #4
+    TAY
+
+    ; Load signed local coords
+    LDA (obj_ptr),Y
+    STA $97                     ; lx
+    INY
+    LDA (obj_ptr),Y
+    STA $98                     ; ly
+    INY
+    LDA (obj_ptr),Y
+    STA $99                     ; lz
+
+    ; Rotate (lx, lz) around Y axis
+    JSR rotate_y                ; transforms $97 (lx) and $99 (lz) in-place
+
+    ; -- view_z = obj_view_z + sign_extend(lz) --
+    LDA $99
+    BPL @lz_pos
+    CLC
+    ADC obj_view_z
+    STA $94
+    LDA obj_view_z+1
+    ADC #$FF
+    BRA @vz_hi
+@lz_pos:
+    CLC
+    ADC obj_view_z
+    STA $94
+    LDA obj_view_z+1
+    ADC #0
+@vz_hi:
+    STA $95
+
+    ; Skip vertex if vz <= 0
+    BPL @vz_ok
+    JMP @vtx_clamp
+@vz_ok:
+    ORA $94
+    BNE @vz_nz
+    JMP @vtx_clamp
+@vz_nz:
+
+    ; recip = urecip15(vz << 2)
+    LDA $94
+    ASL A
+    STA math_b
+    LDA $95
+    ROL A
+    ASL math_b
+    ROL A
+    STA math_a
+    JSR urecip15
+    LDA math_res_lo
+    STA recip_val
+
+    ; -- view_x = obj_view_x + sign_extend(lx) --
+    LDA $97
+    BPL @lx_pos
+    CLC
+    ADC obj_view_x
+    STA $94
+    LDA obj_view_x+1
+    ADC #$FF
+    BRA @vx_hi
+@lx_pos:
+    CLC
+    ADC obj_view_x
+    STA $94
+    LDA obj_view_x+1
+    ADC #0
+@vx_hi:
+    STA $95
+
+    ; offset_x = hi16(view_x * recip)
+    ;   = lo(smul8x8(vx_hi, recip)) + hi(umul8x8(vx_lo, recip))
+    LDA $94                     ; vx_lo
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR umul8x8
+    LDA math_res_hi
+    PHA                         ; save hi(vx_lo * recip)
+
+    LDA $95                     ; vx_hi (signed)
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR smul8x8
+    STA $95                     ; offset_hi = smul_res_hi
+    PLA
+    CLC
+    ADC math_res_lo             ; + lo(smul)
+    STA $94                     ; offset_lo
+    BCC @no_cx
+    INC $95
+@no_cx:
+
+    ; sx = clamp(64 + offset, 0, 127)
+    LDA $95                     ; offset_hi
+    BEQ @sx_pos
+    CMP #$FF
+    BEQ @sx_neg
+    BMI @sx_zero                ; way off screen left
+    LDA #127
+    BRA @sx_st
+@sx_pos:
+    LDA $94
+    CLC
+    ADC #64
+    BCS @sx_max                 ; wrapped > 255
+    CMP #128
+    BCC @sx_st                  ; 0..127 valid
+@sx_max:
+    LDA #127
+    BRA @sx_st
+@sx_neg:
+    LDA $94
+    CLC
+    ADC #64
+    BCS @sx_st                  ; carry → valid 0..63
+@sx_zero:
+    LDA #0
+@sx_st:
+    LDX $96
+    STA obj_proj_sx,X
+
+    ; -- view_y = obj_view_y - sign_extend(ly) --
+    LDA obj_view_y
+    SEC
+    SBC $98                     ; ly
+    STA $94
+    LDA obj_view_y+1
+    LDX $98
+    BPL @ly_pos
+    SBC #$FF
+    BRA @vy_hi
+@ly_pos:
+    SBC #0
+@vy_hi:
+    STA $95
+
+    ; offset_y = hi16(view_y * recip)
+    LDA $94                     ; vy_lo
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR umul8x8
+    LDA math_res_hi
+    PHA
+
+    LDA $95                     ; vy_hi (signed)
+    STA math_a
+    LDA recip_val
+    STA math_b
+    JSR smul8x8
+    STA $95                     ; offset_hi
+    PLA
+    CLC
+    ADC math_res_lo
+    STA $94                     ; offset_lo
+    BCC @no_cy
+    INC $95
+@no_cy:
+
+    ; sy = clamp(80 + offset, 0, 159)
+    LDA $95
+    BEQ @sy_pos
+    CMP #$FF
+    BEQ @sy_neg
+    BMI @sy_zero
+    LDA #159
+    BRA @sy_st
+@sy_pos:
+    LDA $94
+    CLC
+    ADC #80
+    BCS @sy_max
+    CMP #160
+    BCC @sy_st
+@sy_max:
+    LDA #159
+    BRA @sy_st
+@sy_neg:
+    LDA $94
+    CLC
+    ADC #80
+    BCS @sy_st                  ; carry → valid
+@sy_zero:
+    LDA #0
+@sy_st:
+    LDX $96
+    STA obj_proj_sy,X
+
+    INC $96
+    JMP @proj_loop
+
+@vtx_clamp:
+    ; Vertex behind camera: project to screen centre
+    LDX $96
+    LDA #64
+    STA obj_proj_sx,X
+    LDA #80
+    STA obj_proj_sy,X
+    INC $96
+    JMP @proj_loop
+
+@proj_done:
+    ; ── Step 3: Backface cull → edge visibility ──
+    STZ obj_edge_vis
+    STZ obj_edge_vis+1
+    STZ obj_edge_vis+2
+    STZ obj_edge_vis+3
+
+    ; Face table offset = 4 + n_vertices * 3
+    LDY #0
+    LDA (obj_ptr),Y             ; n_vertices
+    STA $94
+    ASL A
+    CLC
+    ADC $94
+    CLC
+    ADC #4
+    STA obj_data_off            ; face_off ($A9)
+
+@face_loop:
+    LDY obj_data_off
+    LDA (obj_ptr),Y
+    CMP #$FF
+    BNE @face_not_done
+    JMP @faces_done
+@face_not_done:
+
+    TAX                         ; X = v_a
+    INY
+    LDA (obj_ptr),Y             ; v_b
+    STA $96                     ; temp v_b
+    INY
+    LDA (obj_ptr),Y             ; v_c
+    STA $97                     ; temp v_c
+    INY
+    STY obj_data_off            ; now points to n_face_edges
+
+    ; dx1 = sx[v_b] - sx[v_a]
+    LDY $96                     ; v_b
+    LDA obj_proj_sx,Y
+    SEC
+    SBC obj_proj_sx,X
+    STA $94                     ; dx1
+
+    ; dy1 = (sy[v_b] - sy[v_a]) >> 1 (arithmetic shift right)
+    LDA obj_proj_sy,Y
+    SEC
+    SBC obj_proj_sy,X
+    STA $95
+    LDA #0
+    SBC #0                      ; sign-extend: $00 or $FF
+    CMP #$80                    ; carry = sign bit
+    ROR $95                     ; ASR → dy1
+
+    ; dx2 = sx[v_c] - sx[v_a]
+    LDY $97                     ; v_c
+    LDA obj_proj_sx,Y
+    SEC
+    SBC obj_proj_sx,X
+    STA $96                     ; dx2
+
+    ; dy2 = (sy[v_c] - sy[v_a]) >> 1
+    LDA obj_proj_sy,Y
+    SEC
+    SBC obj_proj_sy,X
+    STA $97
+    LDA #0
+    SBC #0
+    CMP #$80
+    ROR $97                     ; ASR → dy2
+
+    ; cross = dx1*dy2 - dy1*dx2
+    ; Term 1: smul8x8(dx1, dy2)
+    LDA $94                     ; dx1
+    STA math_a
+    LDA $97                     ; dy2
+    STA math_b
+    JSR smul8x8
+    LDA math_res_lo
+    STA $98                     ; cross_lo
+    LDA math_res_hi
+    STA $99                     ; cross_hi
+
+    ; Term 2: smul8x8(dy1, dx2)
+    LDA $95                     ; dy1
+    STA math_a
+    LDA $96                     ; dx2
+    STA math_b
+    JSR smul8x8
+
+    ; cross = term1 - term2
+    LDA $98
+    SEC
+    SBC math_res_lo
+    STA $98
+    LDA $99
+    SBC math_res_hi
+    ; A = cross_hi; front-facing when cross < 0 (CCW winding, Y-up local coords)
+    BPL @skip_face
+
+    ; Front-facing: mark edges visible
+    LDY obj_data_off            ; → n_face_edges
+    LDA (obj_ptr),Y
+    STA obj_n_vtx               ; reuse as edge counter
+    INY
+
+@mark_edge:
+    LDA (obj_ptr),Y
+    INY
+    STY obj_data_off            ; save updated position
+    ; Set bit: edge_id in A
+    TAX
+    AND #$07
+    TAY
+    LDA bit_mask_table,Y
+    STA $94                     ; bit mask
+    TXA
+    LSR A
+    LSR A
+    LSR A                       ; byte index
+    TAX
+    LDA obj_edge_vis,X
+    ORA $94
+    STA obj_edge_vis,X
+    LDY obj_data_off
+    DEC obj_n_vtx
+    BNE @mark_edge
+    JMP @face_loop
+
+@skip_face:
+    ; Back-facing: advance past n_face_edges + edge IDs
+    LDY obj_data_off
+    LDA (obj_ptr),Y             ; n_face_edges
+    SEC                         ; +1 to skip the count byte too
+    ADC obj_data_off            ; A + face_off + 1
+    STA obj_data_off
+    JMP @face_loop
+
+@faces_done:
+    ; ── Step 4: Draw visible edge chains ──
+    ; Skip past $FF sentinel → chain data
+    INC obj_data_off
+
+    ; Read n_chains from header
+    LDY #2
+    LDA (obj_ptr),Y
+    STA $94                     ; chain_cnt
+
+    STZ obj_edge_idx            ; global edge counter = 0
+
+@chain_top:
+    LDY obj_data_off
+    LDA (obj_ptr),Y             ; start_vtx
+    STA $96                     ; cur_vtx
+    INY
+    LDA (obj_ptr),Y             ; n_chain_edges
+    STA $95                     ; edge_cnt
+    INY
+    STY obj_data_off
+
+    STZ $97                     ; chaining_flg = 0
+
+@edge_loop:
+    STY $9A                     ; save Y (sub-row from draw_line, or don't-care)
+
+    ; Read edge data
+    LDY obj_data_off
+    LDA (obj_ptr),Y             ; next_vtx
+    STA $98
+    INY
+    LDA (obj_ptr),Y             ; colour
+    STA $99
+    INY
+    STY obj_data_off
+
+    ; Test edge visibility
+    LDA obj_edge_idx
+    LSR A
+    LSR A
+    LSR A
+    TAX                         ; byte index
+    LDA obj_edge_idx
+    AND #$07
+    TAY
+    LDA obj_edge_vis,X
+    AND bit_mask_table,Y
+    BEQ @edge_hidden
+
+    ; Edge visible
+    LDA $97                     ; chaining_flg
+    BNE @chain_cont
+
+    ; Not chaining: init_base from cur_vtx
+    LDX $96
+    LDA obj_proj_sx,X
+    STA x0
+    LDA obj_proj_sy,X
+    STA y0
+    JSR init_base               ; Y = sub-row at (x0, y0)
+    BRA @draw_edge
+
+@chain_cont:
+    ; Chain from previous endpoint; restore sub-row Y
+    LDY $9A
+    LDA x1
+    STA x0
+    LDA y1
+    STA y0
+
+@draw_edge:
+    LDX $98                     ; next_vtx
+    LDA obj_proj_sx,X
+    STA x1
+    LDA obj_proj_sy,X
+    STA y1
+    LDA $99                     ; colour
+    JSR draw_line               ; Y = sub-row at (x1, y1)
+    LDA #$FF
+    STA $97                     ; chaining_flg = true
+    BRA @edge_advance
+
+@edge_hidden:
+    STZ $97                     ; break chain
+
+@edge_advance:
+    LDA $98
+    STA $96                     ; next_vtx → cur_vtx
+    INC obj_edge_idx
+    DEC $95                     ; edge_cnt
+    BNE @edge_loop
+
+    ; End of chain: plot final pixel if chaining
+    LDA $97
+    BEQ @next_chain
+
+    ; Plot final pixel at (x1,y1) — base/Y from draw_line
+    LDA x1
+    LSR A                       ; bit 0 → carry
+    LDA (base),Y
+    BCS @rf_obj
+    AND #$D5
+    ORA color_left
+    BRA @sf_obj
+@rf_obj:
+    AND #$EA
+    ORA color_right
+@sf_obj:
+    STA (base),Y
+
+@next_chain:
+    DEC $94                     ; chain_cnt
+    BEQ @chains_rts
+    JMP @chain_top
+@chains_rts:
+    RTS
+
+; =====================================================================
+; rotate_y — Rotate (lx, lz) around Y axis by obj_rot_angle
+; =====================================================================
+; Inputs:  $97 = lx (signed), $99 = lz (signed)
+;          obj_sin_val, obj_cos_val precomputed
+; Outputs: $97 = lx' = (cos*lx + sin*lz) >> 7
+;          $99 = lz' = (cos*lz - sin*lx) >> 7
+; Trashes: math_a, math_b, math_res_lo/hi, A, X, Y
+;          Uses stack for intermediate 16-bit value
+
+rotate_y:
+    ; ── 1. sin * lx → push 16-bit result ──
+    LDA obj_sin_val
+    STA math_a
+    LDA $97                     ; lx
+    STA math_b
+    JSR smul8x8
+    ; Result: A = res_hi, math_res_lo = res_lo
+    PHA                         ; push sin*lx hi
+    LDA math_res_lo
+    PHA                         ; push sin*lx lo
+
+    ; ── 2. cos * lx → save in $94/$95 ──
+    LDA obj_cos_val
+    STA math_a
+    LDA $97                     ; lx
+    STA math_b
+    JSR smul8x8
+    LDA math_res_lo
+    STA $94                     ; cos*lx lo
+    LDA math_res_hi
+    STA $95                     ; cos*lx hi
+
+    ; ── 3. sin * lz → add to cos*lx, shift >>7 → lx' ──
+    LDA obj_sin_val
+    STA math_a
+    LDA $99                     ; lz
+    STA math_b
+    JSR smul8x8
+    ; lx' = (cos*lx + sin*lz) >> 7
+    LDA $94                     ; cos*lx lo
+    CLC
+    ADC math_res_lo             ; + sin*lz lo
+    STA $94
+    LDA $95                     ; cos*lx hi
+    ADC math_res_hi             ; + sin*lz hi
+    ; Shift 16-bit ($94:A) left by 1, take high byte = >>7
+    ASL $94
+    ROL A
+    STA $97                     ; lx'
+
+    ; ── 4. cos * lz → subtract stacked sin*lx, shift >>7 → lz' ──
+    LDA obj_cos_val
+    STA math_a
+    LDA $99                     ; lz
+    STA math_b
+    JSR smul8x8
+    ; lz' = (cos*lz - sin*lx) >> 7
+    ; Pull sin*lx from stack (lo first, then hi)
+    PLA                         ; sin*lx lo
+    STA $94
+    PLA                         ; sin*lx hi
+    STA $95
+    LDA math_res_lo
+    SEC
+    SBC $94                     ; cos*lz lo - sin*lx lo
+    STA $94
+    LDA math_res_hi
+    SBC $95                     ; cos*lz hi - sin*lx hi
+    ; Shift 16-bit ($94:A) left by 1, take high byte = >>7
+    ASL $94
+    ROL A
+    STA $99                     ; lz'
+    RTS
+
 ; ── Colour unpack table: 3-bit packed → MODE 2 right-pixel (bits 4,2,0) ──
 ; 0=black, 1=blue, 2=cyan, 3=green, 4=yellow, 5=red, 6=magenta, 7=white
 color_unpack:
     .byte $00, $10, $14, $04, $05, $01, $11, $15
+
+; ── Bit mask table for edge visibility testing ──
+bit_mask_table:
+    .byte $01, $02, $04, $08, $10, $20, $40, $80
+
+; ── Test object world position (8.8 fixed-point) ──
+obj_world_x_lo: .byte $00
+obj_world_x_hi: .byte $01       ; X = 1.0
+obj_world_y_lo: .byte $80
+obj_world_y_hi: .byte $00       ; Y = 0.5 (raised above ground)
+obj_world_z_lo: .byte $00
+obj_world_z_hi: .byte $00       ; Z = 0.0
+
+; ── Example object: Pyramid (5 vertices, 4 faces, 4 chains, 8 edges) ──
+obj_pyramid:
+    ; Header
+    .byte 5, 4, 4, 8
+
+    ; Vertices (x, y, z) — signed bytes, object-local coords (2x scale)
+    ; +Y = up (away from ground), projection subtracts ly so +ly → higher on screen
+    .byte   0,  80,   0            ; v0: apex (top)
+    .byte <(-60), <(-40), <(-40)   ; v1: front-left base
+    .byte  60, <(-40), <(-40)      ; v2: front-right base
+    .byte  60, <(-40),  40         ; v3: back-right base
+    .byte <(-60), <(-40),  40      ; v4: back-left base
+
+    ; Faces (CW winding when front-facing, then edge list)
+    .byte 0, 1, 2,   3, 0, 1, 2   ; front:  v0-v1-v2, edges 0,1,2
+    .byte 0, 2, 3,   3, 2, 6, 3   ; right:  v0-v2-v3, edges 2,6,3
+    .byte 0, 3, 4,   3, 3, 4, 5   ; back:   v0-v3-v4, edges 3,4,5
+    .byte 0, 4, 1,   3, 5, 7, 0   ; left:   v0-v4-v1, edges 5,7,0
+    .byte $FF                      ; sentinel
+
+    ; Edge chains (edge IDs assigned sequentially)
+    ; Chain 0: v0 → v1 → v2 → v0 (front triangle, edges 0,1,2)
+    .byte 0, 3                     ; start=v0, 3 edges
+    .byte 1, $15                   ; e0: v0→v1, white
+    .byte 2, $15                   ; e1: v1→v2, white
+    .byte 0, $15                   ; e2: v2→v0, white
+    ; Chain 1: v0 → v3 → v4 → v0 (back triangle, edges 3,4,5)
+    .byte 0, 3                     ; start=v0, 3 edges
+    .byte 3, $15                   ; e3: v0→v3, white
+    .byte 4, $15                   ; e4: v3→v4, white
+    .byte 0, $15                   ; e5: v4→v0, white
+    ; Chain 2: v2 → v3 (right base edge, edge 6)
+    .byte 2, 1
+    .byte 3, $15                   ; e6: v2→v3, white
+    ; Chain 3: v4 → v1 (left base edge, edge 7)
+    .byte 4, 1
+    .byte 1, $15                   ; e7: v4→v1, white
 
 ; =====================================================================
 ; Lookup tables and shared modules

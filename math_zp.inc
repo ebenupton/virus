@@ -1,7 +1,7 @@
 ; math_zp.inc — Zero-page allocations for math routines
 ;
 ; Include-guarded: safe to .include from multiple files.
-; All addresses live in $8D-$90, $93, $9B, $AD.
+; All addresses live in $8D-$90, $93, $9B.
 ; No overlap with raster_zp.inc ($70-$77, $80-$84).
 
 .ifndef MATH_ZP_INC

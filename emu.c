@@ -554,6 +554,7 @@ int main(int argc, char *argv[])
     int log_mode = 0;        /* dump vertex coords to stderr each frame */
     int profile_mode = 0;
     const char *dump_dir = NULL;  /* if set, dump each scanout frame as 2x PPM */
+    uint16_t dump_mem_lo = 0, dump_mem_hi = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0 && i + 1 < argc) {
             headless = 1;
@@ -570,6 +571,9 @@ int main(int argc, char *argv[])
             profile_mode = 1;  /* needs per-instruction stepping */
         } else if (strcmp(argv[i], "--dump-frames") == 0 && i + 1 < argc) {
             dump_dir = argv[++i];
+        } else if (strcmp(argv[i], "--dump-mem") == 0 && i + 2 < argc) {
+            dump_mem_lo = (uint16_t)strtol(argv[++i], NULL, 0);
+            dump_mem_hi = (uint16_t)strtol(argv[++i], NULL, 0);
         }
     }
 
@@ -658,6 +662,10 @@ int main(int argc, char *argv[])
                         int adx = dx < 0 ? -dx : dx;
                         int ady = dy < 0 ? -dy : dy;
                         int pixels = adx > ady ? adx : ady;
+                        if (adx > 50) {
+                            fprintf(stderr, "LONG LINE frame=%d: (%d,%d)->(%d,%d) dx=%d dy=%d\n",
+                                    frame, lx0, ly0, lx1, ly1, dx, dy);
+                        }
                         if (dy == 0 && dx != 0) {
                             ls_horiz.count++;
                             ls_horiz.total_pixels += pixels;
@@ -729,6 +737,17 @@ int main(int argc, char *argv[])
 
         if (line_stats_mode)
             print_line_stats(headless_frames);
+
+        /* Dump memory range if requested */
+        if (dump_mem_lo < dump_mem_hi) {
+            fprintf(stderr, "\n=== Memory dump $%04X-$%04X ===\n", dump_mem_lo, dump_mem_hi);
+            for (uint16_t a = dump_mem_lo; a < dump_mem_hi; a += 16) {
+                fprintf(stderr, "$%04X:", a);
+                for (int j = 0; j < 16 && a + j < dump_mem_hi; j++)
+                    fprintf(stderr, " %02X", memory[a + j]);
+                fprintf(stderr, "\n");
+            }
+        }
 
         free(pixels);
         free(cpu);

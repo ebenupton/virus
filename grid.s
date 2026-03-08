@@ -1,6 +1,6 @@
 ; grid.s — Perspective grid projection and rendering for BBC Micro
 ;
-; Provides: project_grid, draw_grid
+; Provides: draw_grid
 ; Requires: raster_zp.inc, math_zp.inc, grid_zp.inc
 ; Ext refs: cam_x_lo/hi, cam_z_lo/hi, height_map, urecip15, umul8x8,
 ;           init_base, draw_line
@@ -11,7 +11,7 @@
 
 ; ── Grid workspace ($90-$B2, 3 blocks) ─────────────────────────────
 ; Projection
-grid_ptr        = $90       ; 2 bytes — h_ptr in projection, grid_ptr in draw
+grid_ptr        = $90       ; 2 bytes — grid_ptr in draw; sx/h_color temp during projection
 hmap_ptr        = $92       ; 2 bytes — heightmap row pointer
 proj_col        = $94       ; inner loop counter (vertices remaining)
 hmap_col        = $95       ; current heightmap column index (0..31)
@@ -33,14 +33,15 @@ chain_count     = $A4       ; chains remaining
 seg_count       = $A5       ; segments remaining in current chain
 chain_idx       = $A6       ; byte offset within current chain
 saved_y         = $A7       ; saved sub-row Y during chain iteration
-saved_color     = $A8       ; colour for current chain (draw_chains)
-clamp_left      = $A9       ; left edge screen x clamp (project_grid)
+saved_color     = $A8       ; colour for current segment (draw_chains) / prev_h_color
+prev_h_color    = $A8       ; h-chain start colour during projection (shares saved_color)
+clamp_left      = $A9       ; left edge screen x clamp (draw_grid)
 chain_segs      = $AA       ; segments per chain (for draw_chains)
 chain_stride    = $AB       ; bytes per chain (for draw_chains)
 clamp_right     = $AC       ; right edge screen x clamp
 ; Shared (set in project, read in draw)
 n_vtx           = $AD       ; vertices per row this frame
-h_stride        = $AE       ; bytes per horizontal chain (n_vtx * 3)
+chain_y         = $AE       ; inline h-chain: saved sub-row Y during projection
 n_rows          = $AF       ; vertex rows this frame
 v_stride        = $B0       ; bytes per vertical chain (n_rows * 3)
 clamp_near_sy   = $B1       ; screen-y of near grid edge
@@ -53,10 +54,10 @@ interp_offset_far  = $B8    ; far-row Z interpolation offset (0..64, 64=skip)
 z_interp_offset    = $B9    ; current row's Z offset (0 = no Z interp)
 interp_z_ptr       = $BA    ; 2 bytes — inner row heightmap pointer for Z interp
 prev_hmap_ptr      = $BC    ; 2 bytes — previous row's hmap_ptr (for far row)
+; grid_min_sy = $BE declared in grid_zp.inc
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"
-h_buf: .res GRID_VTX_Z * H_CHAIN_BYTES   ; horizontal chains, row-major
 v_buf: .res GRID_VTX_X * V_CHAIN_BYTES   ; vertical chains, column-major
 .segment "CODE"
 
@@ -72,7 +73,7 @@ grid_edge_lut:
     .byte $05, $04, $14, $10
 
 ; =====================================================================
-; project_grid — Perspective projection of GRID_VTX_X × GRID_VTX_Z grid
+; draw_grid — Project grid + draw h-chains inline + draw v-chains
 ; =====================================================================
 ;
 ; Grid: GRID_COLS × GRID_ROWS cells, 0.25-unit spacing, centred on camera.
@@ -85,7 +86,10 @@ grid_edge_lut:
 ; Per-vertex height modulation: Δsy = h*recip/32 via umul8x8(h*8, recip).hi.
 ; sx advances by a constant step = recip·0.25 per vertex (16-bit add).
 
-project_grid:
+draw_grid:
+    LDA #160
+    STA grid_min_sy
+
     ; === Compute z_cam for row 0 ===
     LDA cam_z_lo
     AND #$3F                  ; sub_z (0..63)
@@ -164,7 +168,7 @@ project_grid:
     INC base_z
 @bz_done:
 
-    ; === Determine n_vtx and h_stride based on sub_x ===
+    ; === Determine n_vtx based on sub_x ===
     LDA cam_x_lo
     AND #$3F
     CMP #$20
@@ -172,14 +176,10 @@ project_grid:
     ; sub_x == $20: omit rightmost column
     LDA #(GRID_VTX_X - 1)
     STA n_vtx
-    LDA #((GRID_VTX_X - 1) * 3)
-    STA h_stride
     BRA @grid_size_done
 @full_grid:
     LDA #GRID_VTX_X
     STA n_vtx
-    LDA #H_CHAIN_BYTES
-    STA h_stride
 @grid_size_done:
 
     ; === Determine n_rows and v_stride based on sub_z ===
@@ -282,12 +282,6 @@ project_grid:
     CLC
     ADC #80                   ; sy (can't overflow for far boundary)
     STA clamp_far_sy
-
-    ; === Initialize grid_ptr (h_ptr during projection) ===
-    LDA #<h_buf
-    STA grid_ptr
-    LDA #>h_buf
-    STA grid_ptr+1
 
     ; === Row loop: j = 0..GRID_VTX_Z-1 ===
     STZ proj_row
@@ -653,15 +647,19 @@ project_grid:
     JSR interp_height
     LDA clamp_right
 @sx_done:
-    ; Store (sx, sy, color) to h_buf and v_buf
+    ; A = final sx for this vertex
+    STA grid_ptr              ; save sx (grid_ptr free during projection)
+    ; Store (sx, sy) to v_buf
     LDY #0
-    STA (grid_ptr),Y
     STA (v_ptr),Y
     INY
-    LDA offset_tmp+1
-    STA (grid_ptr),Y
+    LDA offset_tmp+1          ; final sy for this vertex
+    CMP grid_min_sy
+    BCS @no_dirty_upd
+    STA grid_min_sy
+@no_dirty_upd:
     STA (v_ptr),Y
-    ; --- Horizontal edge colour (→ h_buf) ---
+    ; --- Horizontal edge colour ---
     LDX #0                    ; assume land
     LDA offset_tmp
     AND #$1F                  ; current height
@@ -682,8 +680,7 @@ project_grid:
     INX
 @h_bit_done:
     LDA grid_edge_lut,X
-    LDY #2
-    STA (grid_ptr),Y
+    STA grid_ptr+1            ; save h_color (grid_ptr+1 free during projection)
 
     ; --- Vertical edge colour (→ v_buf) ---
     LDX #0                    ; assume land
@@ -706,20 +703,69 @@ project_grid:
     LDY #2
     STA (v_ptr),Y
 
+    ; --- Inline horizontal chain drawing ---
+    LDX proj_col
+    CPX n_vtx
+    BEQ @first_h_vertex
+
+    ; --- Middle or last vertex: draw segment from prev to current ---
+    LDA grid_ptr              ; saved sx
+    STA raster_x1
+    LDA offset_tmp+1          ; sy
+    STA raster_y1
+    LDY chain_y
+    LDA prev_h_color
+    JSR draw_line
+    ; Endpoint becomes startpoint
+    LDA raster_x1
+    STA raster_x0
+    LDA raster_y1
+    STA raster_y0
+    ; Check if last vertex (Y still valid from draw_line)
+    LDX proj_col
+    CPX #1
+    BEQ @last_h_vertex
+    ; Not last: save chain state
+    STY chain_y
+    LDA grid_ptr+1            ; current vertex's h_color
+    STA prev_h_color
+    BRA @h_chain_cont
+
+@first_h_vertex:
+    ; First vertex: initialize chain
+    LDA grid_ptr              ; sx
+    STA raster_x0
+    LDA offset_tmp+1          ; sy
+    STA raster_y0
+    JSR init_base
+    STY chain_y
+    LDA grid_ptr+1            ; h_color
+    STA prev_h_color
+    BRA @h_chain_cont
+
+@last_h_vertex:
+    ; Draw final pixel of chain (Y = sub-row from draw_line)
+    LDA raster_x0
+    LSR A                     ; bit 0 → carry
+    LDA (raster_base),Y
+    BCS @right_final_h
+    AND #$D5
+    ORA raster_color_left
+    BRA @store_final_h
+@right_final_h:
+    AND #$EA
+    ORA raster_color_right
+@store_final_h:
+    STA (raster_base),Y
+
+@h_chain_cont:
     ; Advance heightmap column
     LDA hmap_col
     INC A
     AND #$1F
     STA hmap_col
 
-    ; Advance: grid_ptr += 3, v_ptr += v_stride
-    LDA grid_ptr
-    CLC
-    ADC #3
-    STA grid_ptr
-    BCC @no_hpc
-    INC grid_ptr+1
-@no_hpc:
+    ; Advance v_ptr += v_stride (no grid_ptr advance needed)
     LDA v_ptr
     CLC
     ADC v_stride
@@ -764,29 +810,8 @@ project_grid:
     BRA @next_row
 
 @skip_row:
-    ; Fill n_vtx vertices at (64, 159, black) for behind-camera rows
-    LDY #0
-    LDX n_vtx
-@skip_h:
-    LDA #64
-    STA (grid_ptr),Y
-    INY
-    LDA #159
-    STA (grid_ptr),Y
-    INY
-    LDA #0                    ; black colour
-    STA (grid_ptr),Y
-    INY
-    DEX
-    BNE @skip_h
-    ; Advance grid_ptr past this row
-    LDA grid_ptr
-    CLC
-    ADC h_stride
-    STA grid_ptr
-    BCC @no_skip_hpc
-    INC grid_ptr+1
-@no_skip_hpc:
+    ; Fill n_vtx vertices at (64, 159, black) in v_buf for behind-camera rows
+    ; (horizontal chains drawn inline — nothing to fill)
 
     ; v_buf: stride v_stride per column (forward row order)
     LDA proj_row
@@ -837,7 +862,19 @@ project_grid:
     BCS @proj_done
     JMP @row_loop
 @proj_done:
-    RTS
+    LDA #<v_buf
+    STA grid_ptr
+    LDA #>v_buf
+    STA grid_ptr+1
+    LDA n_vtx
+    STA chain_count
+    LDA n_rows
+    SEC
+    SBC #1
+    STA chain_segs
+    LDA v_stride
+    STA chain_stride
+    JMP draw_chains
 
 ; =====================================================================
 ; lut_lookup — Look up interpolation LUT value
@@ -982,41 +1019,6 @@ interp_height:
     LDA sy_val
     STA offset_tmp+1
     RTS
-
-; =====================================================================
-; draw_grid — Draw horizontal + vertical chains
-; =====================================================================
-
-draw_grid:
-    ; Horizontal chains: n_rows chains, n_vtx-1 segments, h_stride bytes each
-    LDA #<h_buf
-    STA grid_ptr
-    LDA #>h_buf
-    STA grid_ptr+1
-    LDA n_rows
-    STA chain_count
-    LDA n_vtx
-    SEC
-    SBC #1
-    STA chain_segs            ; n_vtx - 1 segments
-    LDA h_stride
-    STA chain_stride
-    JSR draw_chains
-
-    ; Vertical chains: n_vtx chains, n_rows-1 segments, v_stride bytes each
-    LDA #<v_buf
-    STA grid_ptr
-    LDA #>v_buf
-    STA grid_ptr+1
-    LDA n_vtx
-    STA chain_count
-    LDA n_rows
-    SEC
-    SBC #1
-    STA chain_segs
-    LDA v_stride
-    STA chain_stride
-    JMP draw_chains            ; tail call
 
 draw_chains:
 @chain_loop:

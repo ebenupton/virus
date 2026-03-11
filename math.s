@@ -44,9 +44,9 @@
 ; Register and ZP conventions
 ; =====================================================================
 ;
-;   Zero page:  math_a, math_b (inputs), math_res_lo/hi (outputs),
-;               temp2, div_tmp1 (scratch)
-;               — all defined in math_zp.inc.
+;   Zero page:  math_a, math_b (inputs), math_res_lo/hi (outputs)
+;               — defined in math_zp.inc.
+;               norm_k, delta_val (scratch) — workspace, declared below.
 ;
 ;   Y register: preserved by smul8x8 and umul8x8 (PHY/PLY around body).
 ;               NOT preserved by urecip15.
@@ -54,6 +54,10 @@
 ; =====================================================================
 
 .include "math_zp.inc"
+
+; ── Math workspace ($60-$61) ────────────────────────────────────────
+norm_k          = $60       ; normalisation shift count (used by urecip15)
+delta_val       = $61       ; interpolation delta (used by urecip15)
 
 ; =====================================================================
 ; umul8x8 — Unsigned 8x8 -> 16-bit multiply (quarter-square)
@@ -180,7 +184,7 @@ smul8x8:
 ;           math_b = z low byte
 ;           z = math_a:math_b, unsigned 15-bit, must be in [3, 32767]
 ; Output:   math_res_hi:math_res_lo = floor(65536 / z), range [2, 21845]
-; Clobbers: A, X, Y, math_a, math_b, temp2, div_tmp1
+; Clobbers: A, X, Y, math_a, math_b, norm_k, delta_val
 ;
 ; Algorithm — linear interpolation with one u8 x u8 multiply
 ; -----------------------------------------------------------
@@ -283,7 +287,7 @@ urecip15:
 @not_pow2:
     ; -- Linear interpolation --
     ; A = m = Z_hi in [128, 255], X = k, math_b = Z_lo = f
-    STX temp2               ; save k
+    STX norm_k               ; save k
     AND #$7F                ; i = m - 128
     TAY                     ; Y = i
 
@@ -292,18 +296,18 @@ urecip15:
     STA math_res_lo
     SEC
     SBC lerp_recip_lo+1,Y
-    STA div_tmp1            ; D = T[i].lo - T[i+1].lo
+    STA delta_val            ; D = T[i].lo - T[i+1].lo
     LDA lerp_recip_hi,Y
     STA math_res_hi
 
     ; -- Multiply: hi(f * D) via inlined quarter-square --
-    ; f = math_b, D = div_tmp1
+    ; f = math_b, D = delta_val
     ; We need only the high byte of the product.
 
     ; |f - D|
     LDA math_b
     SEC
-    SBC div_tmp1
+    SBC delta_val
     BCS @l_diff_pos
     EOR #$FF
     INC A
@@ -313,7 +317,7 @@ urecip15:
     ; (f + D) mod 256
     LDA math_b
     CLC
-    ADC div_tmp1
+    ADC delta_val
     TAY                     ; Y = sum
     BCS @l_sum_ovf
 
@@ -362,7 +366,7 @@ urecip15:
     ;   s=1: 37   s=6: 60   s=9:  37   s=13: 56
     ;   s=4: 82   s=7: 46   s=10: 43
 
-    LDX temp2               ; k in [1, 14]
+    LDX norm_k               ; k in [1, 14]
     DEX                     ; s = k - 1
     BEQ @l_shift_done
     CPX #8

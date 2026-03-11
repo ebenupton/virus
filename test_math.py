@@ -18,12 +18,12 @@ BASE = 0x0800  # load address
 
 # Table addresses from listing (BASE + relocatable offset)
 ADDRS = {
-    "sqr_lo":   0x0800 + 0x0C5D,
-    "sqr_hi":   0x0800 + 0x0D5D,
-    "sqr2_lo":  0x0800 + 0x0E5D,
-    "sqr2_hi":  0x0800 + 0x0F5D,
-    "lerp_lo":  0x0800 + 0x0B5B,
-    "lerp_hi":  0x0800 + 0x0BDC,
+    "sqr_lo":   0x1B22,
+    "sqr_hi":   0x1C22,
+    "sqr2_lo":  0x1D22,
+    "sqr2_hi":  0x1E22,
+    "lerp_lo":  0x1A20,
+    "lerp_hi":  0x1AA1,
 }
 
 

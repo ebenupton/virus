@@ -1,8 +1,15 @@
 ; raster.s — Bresenham line rasterizer for BBC Micro MODE 2
 ;
 ; Provides: draw_line, init_base
-; Requires: raster_zp.inc zero-page variables, screen_page set by caller
+; Requires: raster_zp.inc zero-page variables, raster_page set by caller
 ;
+.include "raster_zp.inc"
+
+; ── Workspace (not shared) ──────────────────────────────────────────
+delta_minor = $40
+delta_major = $41
+pixel_count = $42
+
 ; ── MODE 2 screen layout ──────────────────────────────────────────────
 ; 128×160 pixels, 4bpp (2 pixels per byte), 64 byte-columns.
 ; Memory is organised in character rows of 512 bytes (64 cols × 8 rows).
@@ -21,13 +28,13 @@
 ; X: 0..127 (left to right)   Y: 0..159 (top to bottom)
 ;
 ; ── Chaining model ────────────────────────────────────────────────────
-; draw_line draws pixels from (x0,y0) up to but NOT including (x1,y1).
-; On return, base/Y are positioned at (x1,y1), ready for the next
+; draw_line draws pixels from (raster_x0,raster_y0) up to but NOT including (raster_x1,raster_y1).
+; On return, raster_base/Y are positioned at (raster_x1,raster_y1), ready for the next
 ; segment or a final pixel plot.  Caller must:
 ;   1. JSR init_base for the first point of a chain
 ;   2. JSR draw_line for each segment (Y preserved through setup)
-;   3. Copy x1→x0, y1→y0 between segments
-;   4. Plot the final pixel of the chain using (base),Y
+;   3. Copy raster_x1→raster_x0, raster_y1→raster_y0 between segments
+;   4. Plot the final pixel of the chain using (raster_base),Y
 ;
 ; ── Architectural overview ────────────────────────────────────────────
 ;
@@ -62,9 +69,9 @@
 ; STEEP VS SHALLOW
 ;   Lines are classified by slope:
 ;   - Steep (|dy| > |dx|): major axis is Y, one pixel per iteration.
-;     8 variants indexed by {x0_parity, x_direction, y_direction}.
+;     8 variants indexed by {raster_x0_parity, x_direction, y_direction}.
 ;   - Shallow (|dx| >= |dy|): major axis is X, process pixel PAIRS.
-;     16 variants indexed by {x0_parity, ~count_parity, x_dir, y_dir}.
+;     16 variants indexed by {raster_x0_parity, ~count_parity, x_dir, y_dir}.
 ;
 ; TWO-PIXEL PAIRING (shallow only)
 ;   Because MODE 2 packs two pixels per byte, shallow lines process
@@ -72,20 +79,20 @@
 ;   address.  Three sub-cases per pair, based on Bresenham error:
 ;
 ;   - Fast-fast (ff): neither pixel Y-steps.  Both pixels occupy the
-;     same byte, so we write color_both in a single STA — no
+;     same byte, so we write raster_color_both in a single STA — no
 ;     read-modify-write needed.  This is the fastest path.
 ;   - Slow: the first pixel Y-steps (moves to a new scan-line before
 ;     drawing).  Both pixels require read-modify-write.
 ;   - Fast-slow: the first pixel is fast, the second Y-steps.  We
-;     write color_both for the first pixel's byte, then the second
+;     write raster_color_both for the first pixel's byte, then the second
 ;     pixel is read-modify-write on the next row.
 ;
-;   Each pair also includes a column advance (base ±= 8) and a
+;   Each pair also includes a column advance (raster_base ±= 8) and a
 ;   pixel_count decrement.  The DEC+BNE/BEQ test can be placed either
 ;   between the two pixels ("mid") or after the column advance ("end").
 ;   Whichever position is chosen, the other position's 5-cycle
 ;   DEC+branch is eliminated entirely.  The dispatch table selects
-;   end vs mid based on x0_parity XOR ~count_parity, ensuring the
+;   end vs mid based on raster_x0_parity XOR ~count_parity, ensuring the
 ;   pixel count comes out exactly right for each entry point (_l or _r).
 ;
 ; BRANCH OPTIMISATION
@@ -99,9 +106,9 @@
 ;   and Bresenham Y-step (BCC, workload-dependent but typically <50%).
 ;
 ; PAGE/ROW CROSSING
-;   Row cross: every 8 Y-steps, base changes by ±512 (two INC/DEC of
-;   base+1) and Y wraps (0↔7).  Occurs on 1/8 of Y-steps.
-;   Page cross: every 32 column steps, base+1 changes by ±1.  Occurs
+;   Row cross: every 8 Y-steps, raster_base changes by ±512 (two INC/DEC of
+;   raster_base+1) and Y wraps (0↔7).  Occurs on 1/8 of Y-steps.
+;   Page cross: every 32 column steps, raster_base+1 changes by ±1.  Occurs
 ;   on ~1/32 of column steps.  Handlers are outlined (rare path taken).
 ;
 ;   Right-moving page handlers that share the DEC pixel_count + BNE +
@@ -128,10 +135,10 @@
 ;   Inside loops:  X = Bresenham error accumulator
 ;                  Y = sub-row within current character cell (0..7)
 ;                  A = scratch (pixel AND/ORA, error arithmetic)
-;   Zero page:     base    = screen pointer (2 bytes)
+;   Zero page:     raster_base    = screen pointer (2 bytes)
 ;                  delta_minor, delta_major = Bresenham axis deltas
 ;                  pixel_count = pixels (steep) or pairs (shallow)
-;                  color_left, color_right, color_both = colour masks
+;                  raster_color_left, raster_color_right, raster_color_both = colour masks
 ;
 ; LABEL CONVENTIONS
 ;   Public entry points and all rasterizer loop labels are global.
@@ -148,13 +155,11 @@
 ;
 ; =====================================================================
 
-.include "raster_zp.inc"
-
 ; =====================================================================
 ; Dispatch tables
 ; =====================================================================
 
-; steep_tbl — 8 entries, indexed by {x0_par, x_left, y_up}
+; steep_tbl — 8 entries, indexed by {raster_x0_par, x_left, y_up}
 ; Entry point receives A = initial error, C=1, Y = sub-row.
 steep_tbl:
     .word tdr_l              ;  0: left-pixel,  right-moving, down
@@ -166,10 +171,10 @@ steep_tbl:
     .word tdl_r              ;  6: right-pixel, left-moving,  down
     .word tul_r              ;  7: right-pixel, left-moving,  up
 
-; shallow_tbl — 16 entries, indexed by {x0_par, ~count_par, x_left, y_up}
+; shallow_tbl — 16 entries, indexed by {raster_x0_par, ~count_par, x_left, y_up}
 ; The end/mid selection ensures pixel counts align with entry parity:
-;   Right-moving: XOR(x0_par, ~count_par) = 1 → end, 0 → mid
-;   Left-moving:  XOR(x0_par, ~count_par) = 0 → end, 1 → mid
+;   Right-moving: XOR(raster_x0_par, ~count_par) = 1 → end, 0 → mid
+;   Left-moving:  XOR(raster_x0_par, ~count_par) = 0 → end, 1 → mid
 shallow_tbl:
     .word sdr_mid_l          ;  0: par=0, ~cp=0, right, down  XOR=0→mid
     .word sur_mid_l          ;  1: par=0, ~cp=0, right, up    XOR=0→mid
@@ -189,38 +194,38 @@ shallow_tbl:
     .word sul_end_r          ; 15: par=1, ~cp=1, left,  up    XOR=0→end
 
 ; =====================================================================
-; draw_line — Draw a Bresenham line from (x0,y0) towards (x1,y1)
+; draw_line — Draw a Bresenham line from (raster_x0,raster_y0) towards (raster_x1,raster_y1)
 ;
 ; Inputs:   A            right-pixel colour mask (bits 4,2,0)
-;           x0, y0       start pixel (screen state must match via
+;           raster_x0, raster_y0       start pixel (screen state must match via
 ;                         init_base or previous draw_line)
-;           x1, y1       end pixel (not plotted — chaining endpoint)
-;           base          screen cell pointer (from init_base / prior call)
+;           raster_x1, raster_y1       end pixel (not plotted — chaining endpoint)
+;           raster_base          screen cell pointer (from init_base / prior call)
 ;           Y             sub-row (0..7) within current cell
 ;
-; Outputs:  base, Y positioned at (x1, y1) for chaining
+; Outputs:  raster_base, Y positioned at (raster_x1, raster_y1) for chaining
 ;
 ; Clobbers: A, X
 ;
 ; Notes:    Skips the endpoint pixel — caller chains or plots it.
 ;           Setup uses X for |dx| so Y (sub-row) is never disturbed.
-;           Zero-length lines (x0==x1 && y0==y1) return immediately.
+;           Zero-length lines (raster_x0==raster_x1 && raster_y0==raster_y1) return immediately.
 ; =====================================================================
 
 draw_line:
     ; --- Derive all three colour masks from the right-pixel mask ---
-    ; color_left = color_right << 1 (shifts bits 4,2,0 to bits 5,3,1)
-    ; color_both = color_left | color_right (both pixels in one byte)
-    STA color_right
+    ; raster_color_left = raster_color_right << 1 (shifts bits 4,2,0 to bits 5,3,1)
+    ; raster_color_both = raster_color_left | raster_color_right (both pixels in one byte)
+    STA raster_color_right
     ASL A
-    STA color_left
-    ORA color_right
-    STA color_both
+    STA raster_color_left
+    ORA raster_color_right
+    STA raster_color_both
 
     ; --- Compute |dx|, hold in X (Y untouched throughout setup) ---
-    LDA x1
+    LDA raster_x1
     SEC
-    SBC x0
+    SBC raster_x0
     BCS @dx_pos
     EOR #$FF                ; negate: complement...
     INC A                   ; ...and increment
@@ -229,8 +234,8 @@ draw_line:
     TAX                     ; X = |dx|, C=1
 
     ; --- Compute |dy| (C=1 from above, either path) ---
-    LDA y0
-    SBC y1                  ; C=1 from SEC or BCS path
+    LDA raster_y0
+    SBC raster_y1                  ; C=1 from SEC or BCS path
     BCS @dy_pos
     EOR #$FF
     INC A                   ; INC A does not affect carry
@@ -252,14 +257,14 @@ draw_line:
     STA pixel_count         ; one pixel per Y-step
     STA delta_major
 
-    ; Build 3-bit index: {x0_par, x_left, y_up}
-    LDA x0
+    ; Build 3-bit index: {raster_x0_par, x_left, y_up}
+    LDA raster_x0
     TAX
     AND #$01                ; bit 0: starting pixel parity
-    CPX x1                  ; C=1 if x0 >= x1 (moving left)
+    CPX raster_x1                  ; C=1 if raster_x0 >= raster_x1 (moving left)
     ROL A                   ; shift in x_left flag
-    LDX y0
-    CPX y1                  ; C=1 if y0 >= y1 (moving up)
+    LDX raster_y0
+    CPX raster_y1                  ; C=1 if raster_y0 >= raster_y1 (moving up)
     ROL A                   ; shift in y_up flag
     ASL A                   ; ×2 for word-sized table entries
     TAX
@@ -280,16 +285,16 @@ draw_line:
     LSR A                   ; A = (|dx|+1)/2, C = (|dx|+1) bit 0
     STA pixel_count         ; C = ~count_parity (preserved below)
 
-    ; Build 4-bit index: {x0_par, ~count_par, x_left, y_up}
+    ; Build 4-bit index: {raster_x0_par, ~count_par, x_left, y_up}
     ; C = ~count_parity, preserved through LDA/TAX/AND (none affect C)
-    LDA x0
+    LDA raster_x0
     TAX
     AND #$01                ; bit 0: starting pixel parity
     ROL A                   ; shift in ~count_par from C; C←0
-    CPX x1                  ; C=1 if moving left
+    CPX raster_x1                  ; C=1 if moving left
     ROL A                   ; shift in x_left
-    LDX y0
-    CPX y1                  ; C=1 if moving up
+    LDX raster_y0
+    CPX raster_y1                  ; C=1 if moving up
     ROL A                   ; shift in y_up
     ASL A                   ; ×2 for word-sized table entries
     TAX
@@ -313,10 +318,10 @@ draw_line:
 ; The first SBC delta_minor consumes this carry.
 ;
 ; Column advance/retreat arithmetic:
-;   Right-moving with C=1: SBC #$F8 = base + 8  (since -(-8) = +8)
-;   Right-moving with C=0: ADC #$08 = base + 8
-;   Left-moving  with C=1: SBC #$08 = base - 8
-;   Left-moving  with C=0: ADC #$F8 = base - 8  (since +(-8) = -8)
+;   Right-moving with C=1: SBC #$F8 = raster_base + 8  (since -(-8) = +8)
+;   Right-moving with C=0: ADC #$08 = raster_base + 8
+;   Left-moving  with C=1: SBC #$08 = raster_base - 8
+;   Left-moving  with C=0: ADC #$F8 = raster_base - 8  (since +(-8) = -8)
 ; =====================================================================
 
 ; === sdr: shallow, Y-down, X-right — exits at end =====================
@@ -332,15 +337,15 @@ sdr_end_sbc1:
     BCC sdr_end_fastslow            ; borrow → second pixel Y-steps
 
     ; --- Fast-fast: neither pixel Y-steps ---
-    ; Both pixels share the same byte, so write color_both directly
+    ; Both pixels share the same byte, so write raster_color_both directly
     ; (no read-modify-write needed).  C=1 from second SBC.
     TAX
-    LDA color_both
-    STA (base),Y
-    ; Column advance: base += 8.  SBC #$F8 with C=1 = add 8.
-    LDA base
+    LDA raster_color_both
+    STA (raster_base),Y
+    ; Column advance: raster_base += 8.  SBC #$F8 with C=1 = add 8.
+    LDA raster_base
     SBC #$F8                        ; C=1 from SBC chain
-    STA base
+    STA raster_base
     BCS sdr_end_ff_page             ; C=1 after SBC → page cross (rare)
     SEC                             ; restore C=1 (was C=0, no page cross)
 sdr_end_ff_dec:
@@ -348,15 +353,15 @@ sdr_end_ff_dec:
     BNE sdr_end_loop
     RTS
 sdr_end_ff_page:
-    INC base+1                      ; C=1 preserved (INC doesn't touch C)
+    INC raster_base+1                      ; C=1 preserved (INC doesn't touch C)
     BRA sdr_end_ff_dec
 
 sdr_end_r:
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA                        ; clear right-pixel bits
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     BRA sdr_end_sbc2
 
@@ -366,9 +371,9 @@ sdr_end_sbc2:
     BCC sdr_end_sbc2_ystep          ; borrow → Y-step on second pixel
     ; No Y-step.  Column advance via SBC (C=1).
     TAX
-    LDA base
+    LDA raster_base
     SBC #$F8                        ; C=1 from SBC no-borrow
-    STA base
+    STA raster_base
     BCS sdr_end_sbc2_page           ; page cross (rare)
 sdr_end_sbc2_sec:
     SEC                             ; restore C=1 for next iteration
@@ -377,7 +382,7 @@ sdr_end_sbc2_dec:
     BNE sdr_end_loop
     RTS
 sdr_end_sbc2_page:
-    INC base+1                      ; C=1 preserved
+    INC raster_base+1                      ; C=1 preserved
     BRA sdr_end_sbc2_dec
 
     ; --- Second pixel, Y-step (C=0 from SBC borrow) ---
@@ -389,14 +394,14 @@ sdr_end_sbc2_ystep:
 sdr_end_sbc2_norow:
     ; Column advance via ADC (C=0 from CPY with Y<8).
     TAX
-    LDA base
+    LDA raster_base
     ADC #$08                        ; C=0 from CPY
-    STA base
+    STA raster_base
     BCS sdr_end_sbc2_page           ; page cross → share handler
     BRA sdr_end_sbc2_sec            ; no page → restore C=1
 sdr_end_sbc2_row:
-    INC base+1
-    INC base+1                      ; base += 512 (next character row)
+    INC raster_base+1
+    INC raster_base+1                      ; raster_base += 512 (next character row)
     LDY #0                          ; wrap sub-row
     CLC                             ; C=1 from CPY #8 match → clear for ADC
     BRA sdr_end_sbc2_norow
@@ -405,24 +410,24 @@ sdr_end_sbc2_row:
 sdr_end_fastslow:
     ADC delta_major                 ; C=0 in; C=1 out (always)
     TAX
-    LDA color_both                  ; first pixel was fast → write both
-    STA (base),Y
+    LDA raster_color_both                  ; first pixel was fast → write both
+    STA (raster_base),Y
     INY                             ; Y-step down for second pixel
     CPY #8                          ; C=0 if Y<8
     BEQ sdr_end_fs_row              ; row cross (rare)
 sdr_end_fs_norow:
     ; Column advance via ADC (C=0 from CPY with Y<8).
-    LDA base
+    LDA raster_base
     ADC #$08                        ; C=0 from CPY
-    STA base
+    STA raster_base
     BCS sdr_end_fs_page             ; page cross (rare)
     BRA sdr_end_sbc2_sec            ; → SEC, DEC, loop
 sdr_end_fs_page:
-    INC base+1
+    INC raster_base+1
     BRA sdr_end_sbc2_sec
 sdr_end_fs_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdr_end_fs_norow
@@ -432,10 +437,10 @@ sdr_end_slow:
     ADC delta_major                 ; C=0 in; C=1 out (always)
     TAX
     ; Draw left pixel at current position (first pixel of pair)
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5                        ; clear left-pixel bits
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     ; Y-step down
     INY
     CPY #8                          ; C=0 if Y<8, C=1 if Y=8
@@ -443,15 +448,15 @@ sdr_end_slow:
     SEC                             ; restore C=1 for second pixel's SBC
 sdr_end_slow_norow:
     ; Draw right pixel at new Y position (same byte column)
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA                             ; restore error; C=1 from SEC or CPY
     BRA sdr_end_sbc2                ; → second pixel SBC, column advance
 sdr_end_slow_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA sdr_end_slow_norow          ; C=1 from CPY #8 match
 
@@ -465,10 +470,10 @@ sdr_mid_l:
     JSR sdr_end_sbc1                ; enter mid-loop (A=error, skip TAX/TXA)
 sdr_trail:
     ; Draw trailing left pixel
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     ; One final Bresenham step to position at endpoint
     TXA
     SBC delta_minor                 ; C=1 from _end loop exit or dispatch
@@ -477,8 +482,8 @@ sdr_trail:
     INY
     CPY #8
     BNE sdr_trail_done              ; no row cross → done
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
 sdr_trail_done:
     RTS
@@ -501,28 +506,28 @@ sdl_end_sbc1:
 
     ; --- Fast-fast: C=1, column retreat ---
     TAX
-    LDA color_both
-    STA (base),Y
-    ; Column retreat: base -= 8.  SBC #$08 with C=1.
-    LDA base
+    LDA raster_color_both
+    STA (raster_base),Y
+    ; Column retreat: raster_base -= 8.  SBC #$08 with C=1.
+    LDA raster_base
     SBC #$08                        ; C=1 from SBC chain
-    STA base
+    STA raster_base
     BCC sdl_end_ff_borrow           ; C=0 → page borrow (rare)
 sdl_end_ff_nopg:
     DEC pixel_count
     BNE sdl_end_loop
     RTS
 sdl_end_ff_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC                             ; restore C=1 after borrow
     BRA sdl_end_ff_nopg
 
 sdl_end_l:
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     BRA sdl_end_sbc2
 
@@ -531,16 +536,16 @@ sdl_end_sbc2:
     SBC delta_minor
     BCC sdl_end_sbc2_ystep
     TAX
-    LDA base
+    LDA raster_base
     SBC #$08                        ; C=1 from SBC no-borrow
-    STA base
+    STA raster_base
     BCC sdl_end_sbc2_borrow         ; page borrow (rare)
 sdl_end_sbc2_nopg:
     DEC pixel_count
     BNE sdl_end_loop
     RTS
 sdl_end_sbc2_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC
     BRA sdl_end_sbc2_nopg
 
@@ -551,16 +556,16 @@ sdl_end_sbc2_ystep:
     CPY #8                          ; C=0 if Y<8
     BEQ sdl_end_sbc2_row
 sdl_end_sbc2_norow:
-    ; Column retreat via ADC #$F8 (C=0 from CPY): base + $F8 = base - 8
+    ; Column retreat via ADC #$F8 (C=0 from CPY): raster_base + $F8 = raster_base - 8
     TAX
-    LDA base
+    LDA raster_base
     ADC #$F8                        ; C=0 from CPY
-    STA base
+    STA raster_base
     BCS sdl_end_sbc2_nopg           ; C=1 → no borrow (common)
     BRA sdl_end_sbc2_borrow         ; C=0 → borrow (rare)
 sdl_end_sbc2_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdl_end_sbc2_norow
@@ -569,23 +574,23 @@ sdl_end_sbc2_row:
 sdl_end_fastslow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    LDA color_both
-    STA (base),Y
+    LDA raster_color_both
+    STA (raster_base),Y
     INY
     CPY #8                          ; C=0 if Y<8
     BEQ sdl_end_fs_row
 sdl_end_fs_norow:
     ; Column retreat via ADC #$F8 (C=0 from CPY).
-    LDA base
+    LDA raster_base
     ADC #$F8                        ; C=0 from CPY
-    STA base
+    STA raster_base
     BCC sdl_end_fs_borrow           ; page borrow (rare)
 sdl_end_fs_nopg:
     DEC pixel_count
     BNE sdl_end_loop
     RTS
 sdl_end_fs_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC
     BRA sdl_end_fs_nopg
 
@@ -594,29 +599,29 @@ sdl_end_slow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
     ; Left-moving: first pixel is right, second is left
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     INY
     CPY #8
     BEQ sdl_end_slow_row
     SEC                             ; restore C=1 for second pixel SBC
 sdl_end_slow_norow:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA                             ; C=1 from SEC or CPY
     BRA sdl_end_sbc2
 sdl_end_slow_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA sdl_end_slow_norow          ; C=1 from CPY #8 match
 sdl_end_fs_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdl_end_fs_norow
@@ -630,10 +635,10 @@ sdl_mid_r:
     BEQ sdl_trail
     JSR sdl_end_sbc1
 sdl_trail:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     ; Final Bresenham step to position at endpoint
     TXA
     SBC delta_minor                 ; C=1 from _end exit or dispatch
@@ -642,8 +647,8 @@ sdl_trail:
     INY
     CPY #8
     BNE sdl_trail_done
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
 sdl_trail_done:
     RTS
@@ -668,11 +673,11 @@ sur_end_sbc1:
 
     ; --- Fast-fast: C=1, column advance ---
     TAX
-    LDA color_both
-    STA (base),Y
-    LDA base
-    SBC #$F8                        ; C=1: base += 8
-    STA base
+    LDA raster_color_both
+    STA (raster_base),Y
+    LDA raster_base
+    SBC #$F8                        ; C=1: raster_base += 8
+    STA raster_base
     BCS sur_end_ff_page             ; page cross (rare)
     SEC
 sur_end_ff_dec:
@@ -680,15 +685,15 @@ sur_end_ff_dec:
     BNE sur_end_loop
     RTS
 sur_end_ff_page:
-    INC base+1                      ; C=1 preserved
+    INC raster_base+1                      ; C=1 preserved
     BRA sur_end_ff_dec
 
 sur_end_r:
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     BRA sur_end_sbc2
 
@@ -697,9 +702,9 @@ sur_end_sbc2:
     SBC delta_minor
     BCC sur_end_sbc2_ystep
     TAX
-    LDA base
-    SBC #$F8                        ; C=1: base += 8
-    STA base
+    LDA raster_base
+    SBC #$F8                        ; C=1: raster_base += 8
+    STA raster_base
     BCS sur_end_sbc2_page
 sur_end_sbc2_sec:
     SEC
@@ -708,7 +713,7 @@ sur_end_sbc2_dec:
     BNE sur_end_loop
     RTS
 sur_end_sbc2_page:
-    INC base+1
+    INC raster_base+1
     BRA sur_end_sbc2_dec
 
     ; --- Second pixel, Y-step up (C=0 from SBC borrow) ---
@@ -719,14 +724,14 @@ sur_end_sbc2_ystep:
 sur_end_sbc2_norow:
     ; Column advance via SBC (C=1 preserved through DEY/BMI).
     TAX
-    LDA base
-    SBC #$F8                        ; C=1: base += 8
-    STA base
+    LDA raster_base
+    SBC #$F8                        ; C=1: raster_base += 8
+    STA raster_base
     BCS sur_end_sbc2_page           ; page cross → share handler
     BRA sur_end_sbc2_sec            ; → SEC, DEC, loop
 sur_end_sbc2_row:
-    DEC base+1
-    DEC base+1                      ; base -= 512 (previous character row)
+    DEC raster_base+1
+    DEC raster_base+1                      ; raster_base -= 512 (previous character row)
     LDY #7                          ; wrap sub-row to bottom
     BRA sur_end_sbc2_norow          ; C=1 preserved through DEC/LDY
 
@@ -734,23 +739,23 @@ sur_end_sbc2_row:
 sur_end_fastslow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    LDA color_both
-    STA (base),Y
+    LDA raster_color_both
+    STA (raster_base),Y
     DEY                             ; C=1 preserved
     BMI sur_end_fs_row
 sur_end_fs_norow:
     ; Column advance via SBC (C=1 from ADC, preserved through DEY/BMI).
-    LDA base
-    SBC #$F8                        ; C=1: base += 8
-    STA base
+    LDA raster_base
+    SBC #$F8                        ; C=1: raster_base += 8
+    STA raster_base
     BCS sur_end_fs_page             ; page cross (rare)
     BRA sur_end_sbc2_sec            ; → SEC, DEC, loop
 sur_end_fs_page:
-    INC base+1
+    INC raster_base+1
     BRA sur_end_sbc2_sec
 sur_end_fs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA sur_end_fs_norow            ; C=1 preserved
 
@@ -758,23 +763,23 @@ sur_end_fs_row:
 sur_end_slow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     DEY                             ; C=1 preserved
     BMI sur_end_slow_row
 sur_end_slow_norow:
     ; C=1 here: from ADC (via DEY) or from CPY=8 match on row-cross path.
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA                             ; C=1 preserved (TXA ≠ carry)
     BRA sur_end_sbc2
 sur_end_slow_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA sur_end_slow_norow          ; C=1 preserved
 
@@ -786,18 +791,18 @@ sur_mid_l:
     BEQ sur_trail
     JSR sur_end_sbc1
 sur_trail:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     SBC delta_minor                 ; C=1 from _end exit or dispatch
     BCS sur_trail_done
     ADC delta_major
     DEY
     BPL sur_trail_done
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
 sur_trail_done:
     RTS
@@ -820,27 +825,27 @@ sul_end_sbc1:
 
     ; --- Fast-fast: C=1, column retreat ---
     TAX
-    LDA color_both
-    STA (base),Y
-    LDA base
-    SBC #$08                        ; C=1: base -= 8
-    STA base
+    LDA raster_color_both
+    STA (raster_base),Y
+    LDA raster_base
+    SBC #$08                        ; C=1: raster_base -= 8
+    STA raster_base
     BCC sul_end_ff_borrow           ; page borrow (rare)
 sul_end_ff_nopg:
     DEC pixel_count
     BNE sul_end_loop
     RTS
 sul_end_ff_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC
     BRA sul_end_ff_nopg
 
 sul_end_l:
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     BRA sul_end_sbc2
 
@@ -849,16 +854,16 @@ sul_end_sbc2:
     SBC delta_minor
     BCC sul_end_sbc2_ystep
     TAX
-    LDA base
-    SBC #$08                        ; C=1: base -= 8
-    STA base
+    LDA raster_base
+    SBC #$08                        ; C=1: raster_base -= 8
+    STA raster_base
     BCC sul_end_sbc2_borrow
 sul_end_sbc2_nopg:
     DEC pixel_count
     BNE sul_end_loop
     RTS
 sul_end_sbc2_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC
     BRA sul_end_sbc2_nopg
 
@@ -870,14 +875,14 @@ sul_end_sbc2_ystep:
 sul_end_sbc2_norow:
     ; Column retreat via SBC (C=1 preserved through DEY/BMI).
     TAX
-    LDA base
-    SBC #$08                        ; C=1: base -= 8
-    STA base
+    LDA raster_base
+    SBC #$08                        ; C=1: raster_base -= 8
+    STA raster_base
     BCS sul_end_sbc2_nopg           ; C=1 → no borrow (common)
     BRA sul_end_sbc2_borrow         ; C=0 → borrow (rare)
 sul_end_sbc2_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA sul_end_sbc2_norow          ; C=1 preserved
 
@@ -885,27 +890,27 @@ sul_end_sbc2_row:
 sul_end_fastslow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    LDA color_both
-    STA (base),Y
+    LDA raster_color_both
+    STA (raster_base),Y
     DEY                             ; C=1 preserved
     BMI sul_end_fs_row
 sul_end_fs_norow:
     ; Column retreat via SBC (C=1 from ADC, preserved through DEY/BMI).
-    LDA base
-    SBC #$08                        ; C=1: base -= 8
-    STA base
+    LDA raster_base
+    SBC #$08                        ; C=1: raster_base -= 8
+    STA raster_base
     BCC sul_end_fs_borrow
 sul_end_fs_nopg:
     DEC pixel_count
     BNE sul_end_loop
     RTS
 sul_end_fs_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC
     BRA sul_end_fs_nopg
 sul_end_fs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA sul_end_fs_norow            ; C=1 preserved
 
@@ -913,22 +918,22 @@ sul_end_fs_row:
 sul_end_slow:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     DEY                             ; C=1 preserved
     BMI sul_end_slow_row
 sul_end_slow_norow:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA                             ; C=1 preserved
     BRA sul_end_sbc2
 sul_end_slow_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA sul_end_slow_norow          ; C=1 preserved
 
@@ -940,18 +945,18 @@ sul_mid_r:
     BEQ sul_trail
     JSR sul_end_sbc1
 sul_trail:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     SBC delta_minor                 ; C=1 from _end exit or dispatch
     BCS sul_trail_done
     ADC delta_major
     DEY
     BPL sul_trail_done
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
 sul_trail_done:
     RTS
@@ -989,10 +994,10 @@ sul_mid_l:
 tdr_l:
     TAX
 tdr_l_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     SBC delta_minor                 ; C=1 (invariant)
     BCC tdr_l_xstep                 ; borrow → X-step + toggle to right
@@ -1007,8 +1012,8 @@ tdr_l_norow:
     BNE tdr_l_px
     RTS
 tdr_l_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA tdr_l_norow                 ; C=1 from CPY #8 match
 
@@ -1020,10 +1025,10 @@ tdr_l_xstep:
 tdr_r:
     TAX
 tdr_r_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tdr_r_xstep
@@ -1038,21 +1043,21 @@ tdr_r_norow:
     BNE tdr_r_px
     RTS
 tdr_r_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA tdr_r_norow                 ; C=1 from CPY
 
 tdr_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    ; Column advance: base += 8.  ADC #$07 with C=1 = add 8.
+    ; Column advance: raster_base += 8.  ADC #$07 with C=1 = add 8.
     ; C=1 is chained from ADC delta_major, saving a CLC+ADC #$08.
-    LDA base
+    LDA raster_base
     ADC #$07                        ; C=1 from ADC delta_major
-    STA base
+    STA raster_base
     BCC tdr_l_ystep                 ; no page cross → toggle to left phase
-    INC base+1                      ; page cross (rare)
+    INC raster_base+1                      ; page cross (rare)
     BRA tdr_l_ystep
 
 ; === tdl: steep, Y-down, X-left =======================================
@@ -1060,10 +1065,10 @@ tdr_r_xstep:
 tdl_r:
     TAX
 tdl_r_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tdl_r_xstep
@@ -1078,8 +1083,8 @@ tdl_r_norow:
     BNE tdl_r_px
     RTS
 tdl_r_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA tdl_r_norow                 ; C=1 from CPY
 
@@ -1091,10 +1096,10 @@ tdl_r_xstep:
 tdl_l:
     TAX
 tdl_l_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tdl_l_xstep
@@ -1109,21 +1114,21 @@ tdl_l_norow:
     BNE tdl_l_px
     RTS
 tdl_l_row:
-    INC base+1
-    INC base+1
+    INC raster_base+1
+    INC raster_base+1
     LDY #0
     BRA tdl_l_norow                 ; C=1 from CPY
 
 tdl_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    ; Column retreat: base -= 8.  ADC #$F7 with C=1 = add $F8 = sub 8.
+    ; Column retreat: raster_base -= 8.  ADC #$F7 with C=1 = add $F8 = sub 8.
     ; C=1 chained from ADC delta_major.
-    LDA base
+    LDA raster_base
     ADC #$F7                        ; C=1 from ADC delta_major
-    STA base
+    STA raster_base
     BCS tdl_r_ystep                 ; C=1 → no borrow → toggle to right
-    DEC base+1                      ; page borrow (rare)
+    DEC raster_base+1                      ; page borrow (rare)
     BRA tdl_r_ystep
 
 ; === tur: steep, Y-up, X-right ========================================
@@ -1134,10 +1139,10 @@ tdl_l_xstep:
 tur_l:
     TAX
 tur_l_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     SBC delta_minor                 ; C=1 (invariant)
     BCC tur_l_xstep                 ; borrow → X-step
@@ -1149,8 +1154,8 @@ tur_l_norow:
     BNE tur_l_px
     RTS
 tur_l_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tur_l_norow
 
@@ -1165,18 +1170,18 @@ tur_l_xs_norow:
     BNE tur_r_px                    ; → right-pixel phase
     RTS
 tur_l_xs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tur_l_xs_norow
 
 tur_r:
     TAX
 tur_r_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tur_r_xstep
@@ -1188,8 +1193,8 @@ tur_r_norow:
     BNE tur_r_px
     RTS
 tur_r_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tur_r_norow
 
@@ -1197,9 +1202,9 @@ tur_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
     ; Column advance: ADC #$07 with C=1 = add 8.
-    LDA base
+    LDA raster_base
     ADC #$07                        ; C=1 from ADC delta_major
-    STA base
+    STA raster_base
     BCS tur_r_xs_page               ; page cross (rare, outlined)
 tur_r_xs_sec:
     SEC                             ; C=0 after ADC no-overflow; restore for SBC
@@ -1211,12 +1216,12 @@ tur_r_xs_norow:
     BNE tur_l_px                    ; → left-pixel phase
     RTS
 tur_r_xs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tur_r_xs_norow
 tur_r_xs_page:
-    INC base+1                      ; C=1 preserved (INC ≠ carry)
+    INC raster_base+1                      ; C=1 preserved (INC ≠ carry)
     BRA tur_r_xs_sec
 
 ; === tul: steep, Y-up, X-left =========================================
@@ -1225,10 +1230,10 @@ tur_r_xs_page:
 tul_r:
     TAX
 tul_r_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$EA
-    ORA color_right
-    STA (base),Y
+    ORA raster_color_right
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tul_r_xstep
@@ -1240,8 +1245,8 @@ tul_r_norow:
     BNE tul_r_px
     RTS
 tul_r_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tul_r_norow
 
@@ -1256,18 +1261,18 @@ tul_r_xs_norow:
     BNE tul_l_px                    ; → left-pixel phase
     RTS
 tul_r_xs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tul_r_xs_norow
 
 tul_l:
     TAX
 tul_l_px:
-    LDA (base),Y
+    LDA (raster_base),Y
     AND #$D5
-    ORA color_left
-    STA (base),Y
+    ORA raster_color_left
+    STA (raster_base),Y
     TXA
     SBC delta_minor
     BCC tul_l_xstep
@@ -1279,8 +1284,8 @@ tul_l_norow:
     BNE tul_l_px
     RTS
 tul_l_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tul_l_norow
 
@@ -1288,9 +1293,9 @@ tul_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
     ; Column retreat: ADC #$F7 with C=1 = add $F8 = sub 8.
-    LDA base
+    LDA raster_base
     ADC #$F7                        ; C=1 from ADC delta_major
-    STA base
+    STA raster_base
     BCC tul_l_xs_borrow             ; C=0 → page borrow (rare, outlined)
 tul_l_xs_dey:
     ; Inlined tul_r ystep.  C=1 here (no borrow, or restored by SEC).
@@ -1301,23 +1306,23 @@ tul_l_xs_norow:
     BNE tul_r_px                    ; → right-pixel phase
     RTS
 tul_l_xs_row:
-    DEC base+1
-    DEC base+1
+    DEC raster_base+1
+    DEC raster_base+1
     LDY #7
     BRA tul_l_xs_norow
 tul_l_xs_borrow:
-    DEC base+1
+    DEC raster_base+1
     SEC                             ; C=0 from borrow → restore for SBC
     BRA tul_l_xs_dey
 
 ; =====================================================================
-; init_base — Compute screen address for pixel (x0, y0)
+; init_base — Compute screen address for pixel (raster_x0, raster_y0)
 ;
-; Inputs:   x0           pixel X coordinate (0..127)
-;           y0           pixel Y coordinate (0..159)
-;           screen_page  high byte of screen buffer ($30 or $58)
+; Inputs:   raster_x0           pixel X coordinate (0..127)
+;           raster_y0           pixel Y coordinate (0..159)
+;           raster_page  high byte of screen buffer ($30 or $58)
 ;
-; Outputs:  base         2-byte screen cell pointer
+; Outputs:  raster_base         2-byte screen cell pointer
 ;           Y            sub-row within character cell (0..7)
 ;
 ; Clobbers: A, X
@@ -1325,46 +1330,46 @@ tul_l_xs_borrow:
 ; Notes:    Must be called once before the first draw_line in a chain.
 ;
 ;   addr = screen_base + char_row*512 + byte_col*8 + sub_row
-;   byte_col = x0 >> 1,  char_row = y0 >> 3,  sub_row = y0 & 7
+;   byte_col = raster_x0 >> 1,  char_row = raster_y0 >> 3,  sub_row = raster_y0 & 7
 ;
-;   The sub-row component is NOT folded into base; instead it lives
-;   in Y and is added implicitly by (base),Y addressing in the loops.
+;   The sub-row component is NOT folded into raster_base; instead it lives
+;   in Y and is added implicitly by (raster_base),Y addressing in the loops.
 ;
-;   High byte = screen_page + char_row*2 + (byte_col >= 32 ? 1 : 0)
+;   High byte = raster_page + char_row*2 + (byte_col >= 32 ? 1 : 0)
 ;   Low byte  = (byte_col & 31) * 8
 ;
-;   Implementation computes the low byte first: (x0 & $FE) << 2.
-;   The second ASL naturally shifts x0 bit 6 (the byte_col >= 32 flag)
-;   into the carry, which is then consumed by ADC screen_page to form
+;   Implementation computes the low byte first: (raster_x0 & $FE) << 2.
+;   The second ASL naturally shifts raster_x0 bit 6 (the byte_col >= 32 flag)
+;   into the carry, which is then consumed by ADC raster_page to form
 ;   the high byte in a single branchless instruction.
 ; =====================================================================
 
 init_base:
     ; char_row * 2 → X
-    LDA y0
+    LDA raster_y0
     AND #$F8                        ; char_row * 8 (clear sub-row bits)
     LSR A
     LSR A                           ; char_row * 2; C=0 (shifted-out bits
     TAX                             ;   were cleared by AND)
 
-    ; Low byte: (x0 & $FE) << 2 = byte_col * 8 (mod 256)
-    ; The second ASL shifts x0 bit 6 into carry:
-    ;   C=1 iff byte_col >= 32 (x0 >= 64)
-    LDA x0
+    ; Low byte: (raster_x0 & $FE) << 2 = byte_col * 8 (mod 256)
+    ; The second ASL shifts raster_x0 bit 6 into carry:
+    ;   C=1 iff byte_col >= 32 (raster_x0 >= 64)
+    LDA raster_x0
     AND #$FE                        ; clear pixel-parity bit
     ASL A
     ASL A                           ; C = byte_col >= 32
-    STA base
+    STA raster_base
 
-    ; High byte: char_row*2 + screen_page + carry, all in one ADC.
+    ; High byte: char_row*2 + raster_page + carry, all in one ADC.
     ; C from ASL = byte_col overflow; X = char_row*2; C is preserved
     ; through STA/TXA (neither affects carry).
     TXA
-    ADC screen_page                 ; char_row*2 + screen_page + C
-    STA base+1                      ; no overflow possible: max $58+38+1=$7F
+    ADC raster_page                 ; char_row*2 + raster_page + C
+    STA raster_base+1                      ; no overflow possible: max $58+38+1=$7F
 
-    ; Sub-row → Y (reloading y0 is cheaper than saving/restoring)
-    LDA y0
+    ; Sub-row → Y (reloading raster_y0 is cheaper than saving/restoring)
+    LDA raster_y0
     AND #$07
     TAY
     RTS

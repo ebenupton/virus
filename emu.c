@@ -12,6 +12,7 @@
  *   $FE01 write: CRTC data (tracks R12/R13 for buffer selection)
  *   $FE43 write: System VIA DDRA (absorbed, no effect)
  *   $FE4D read:  bit 1 = vsync flag; write: clear flagged bits
+ *   $FE32 write: Dump call-stack profile to stderr and reset counters
  *   $FE4F read:  System VIA ORA — key scan (bit 7: 0=pressed, 1=not pressed)
  *   $FE4F write: System VIA ORA — latch scan code
  *   $FFEE/$FFF4: RTS stubs (OSWRCH/OSBYTE)
@@ -60,7 +61,7 @@ static uint8_t via_ora = 0;       /* last value written to $FE4F */
 static uint64_t cycle_latch = 0;
 
 /* Keyboard state */
-static uint8_t key_state = 0;      /* bit0=Z, 1=X, 2=Return, 3=Space */
+static uint8_t key_state = 0;      /* bit0=Z, 1=X, 2=Return, 3=Space, 4=K, 5=M, 6=L */
 
 /* ── Standard MODE 2 palette (logical colour → ARGB) ──────────────── */
 
@@ -83,6 +84,42 @@ static const uint32_t mode2_palette[16] = {
     0xFFFFFFFF,  /* 15 = white  (flash)    */
 };
 
+/* ── Profiling ─────────────────────────────────────────────────────── */
+
+#define PROFILE_RANGE_LO 0x0600
+#define PROFILE_RANGE_HI 0x3000
+#define PROFILE_SIZE     (PROFILE_RANGE_HI - PROFILE_RANGE_LO)
+
+static uint64_t profile_cycles[PROFILE_SIZE];
+static int profile_mode = 0;
+
+/* ── Call-stack profiling ──────────────────────────────────────────
+ *
+ * Instruments JSR ($20) and RTS ($60) to maintain a shadow call stack.
+ * This enables "self" vs "inclusive" cycle attribution per function:
+ *
+ *   self cycles:      time executing the function's own instructions
+ *   inclusive cycles:  time in the function + all descendant callees
+ *
+ * The call stack is an array of JSR target addresses. The entry point
+ * ($0800) is pre-loaded as the root. JSR pushes the callee address;
+ * RTS pops it. Cycles are attributed BEFORE stack manipulation, so
+ * JSR's cycles go to the caller and RTS's cycles go to the callee.
+ *
+ * Inclusive attribution walks the entire stack for each instruction,
+ * adding cycles to every ancestor. This is O(depth) but call depth
+ * is typically <20 on 6502, so the overhead is negligible.
+ */
+#define MAX_CALL_DEPTH 256
+static uint16_t call_stack[MAX_CALL_DEPTH];
+static int call_depth = 0;
+static uint64_t fn_self_cycles[PROFILE_SIZE];
+static uint64_t fn_incl_cycles[PROFILE_SIZE];
+static int profile_frame_count = 0;
+
+/* Forward declaration */
+static void print_call_profile(int num_frames);
+
 /* ── Memory read/write with I/O ────────────────────────────────────── */
 
 static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
@@ -104,6 +141,9 @@ static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
         if (scan == 0x42) pressed = (key_state & 0x02);  /* X */
         if (scan == 0x49) pressed = (key_state & 0x04);  /* Return */
         if (scan == 0x62) pressed = (key_state & 0x08);  /* Space */
+        if (scan == 0x46) pressed = (key_state & 0x10);  /* K */
+        if (scan == 0x65) pressed = (key_state & 0x20);  /* M */
+        if (scan == 0x56) pressed = (key_state & 0x40);  /* L */
         return pressed ? (via_ora & 0x7F) : (via_ora | 0x80);
     }
 
@@ -134,6 +174,18 @@ static void mem_write(struct w65c02s_cpu *cpu, uint16_t addr, uint8_t val)
     case 0xFE31:
         /* Debug newline */
         fprintf(stderr, "\n");
+        break;
+    case 0xFE32:
+        /* Dump call-stack profile and reset counters.
+         * First hit just resets (discards init), subsequent hits
+         * print one frame's data then reset. */
+        if (profile_mode) {
+            if (profile_frame_count > 0)
+                print_call_profile(profile_frame_count);
+            memset(fn_self_cycles, 0, sizeof(fn_self_cycles));
+            memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));
+            profile_frame_count = 0;
+        }
         break;
     case 0xFE00:
         crtc_reg_select = val;
@@ -345,14 +397,6 @@ static void print_line_stats(int num_frames)
             (double)ls_vert.total_pixels / num_frames * 12);
 }
 
-/* ── Profiling ─────────────────────────────────────────────────────── */
-
-#define PROFILE_RANGE_LO 0x0800
-#define PROFILE_RANGE_HI 0x3000
-#define PROFILE_SIZE     (PROFILE_RANGE_HI - PROFILE_RANGE_LO)
-
-static uint64_t profile_cycles[PROFILE_SIZE];
-
 /* Per-frame cycle tracking */
 #define MAX_FRAME_TRACK 100000
 static unsigned long frame_active_cycles[MAX_FRAME_TRACK];
@@ -533,6 +577,56 @@ static void print_profile(int num_frames)
     }
 }
 
+static void print_call_profile(int num_frames)
+{
+    /* Collect functions with non-zero self or inclusive cycles */
+    struct { uint16_t addr; const char *name; uint64_t self; uint64_t incl; } fns[MAX_LABELS];
+    int nfns = 0;
+    uint64_t total = 0;
+
+    for (int i = 0; i < PROFILE_SIZE; i++) {
+        if (fn_self_cycles[i] == 0 && fn_incl_cycles[i] == 0) continue;
+        uint16_t addr = PROFILE_RANGE_LO + i;
+        /* Only include addresses that are actual labels (JSR targets) */
+        const char *name = NULL;
+        for (int j = 0; j < num_labels; j++) {
+            if (labels[j].addr == addr) { name = labels[j].name; break; }
+        }
+        if (!name) continue;  /* skip unlabelled addresses */
+        fns[nfns].addr = addr;
+        fns[nfns].name = name;
+        fns[nfns].self = fn_self_cycles[i];
+        fns[nfns].incl = fn_incl_cycles[i];
+        total += fn_self_cycles[i];
+        nfns++;
+    }
+
+    /* Sort by inclusive cycles descending */
+    for (int i = 0; i < nfns - 1; i++)
+        for (int j = i + 1; j < nfns; j++)
+            if (fns[j].incl > fns[i].incl) {
+                /* swap */
+                uint16_t ta = fns[i].addr; const char *tn = fns[i].name;
+                uint64_t ts = fns[i].self; uint64_t ti = fns[i].incl;
+                fns[i] = fns[j];
+                fns[j].addr = ta; fns[j].name = tn;
+                fns[j].self = ts; fns[j].incl = ti;
+            }
+
+    fprintf(stderr, "\n=== Call-stack profile (%d frames, %llu total cycles) ===\n",
+            num_frames, (unsigned long long)total);
+    fprintf(stderr, "%-30s %10s %6s %10s %6s\n",
+            "Function", "Self", "Self%", "Incl", "Incl%");
+    for (int i = 0; i < nfns; i++) {
+        fprintf(stderr, "%-30s %10llu %5.1f%% %10llu %5.1f%%\n",
+                fns[i].name,
+                (unsigned long long)fns[i].self,
+                100.0 * fns[i].self / total,
+                (unsigned long long)fns[i].incl,
+                100.0 * fns[i].incl / total);
+    }
+}
+
 /* ── Main ───────────────────────────────────────────────────────────── */
 
 #ifndef EMU_HEADLESS_ONLY
@@ -552,7 +646,6 @@ int main(int argc, char *argv[])
     int headless_frames = 0;
     int headless_keys = 0;   /* simulated key_state for headless mode */
     int log_mode = 0;        /* dump vertex coords to stderr each frame */
-    int profile_mode = 0;
     const char *dump_dir = NULL;  /* if set, dump each scanout frame as 2x PPM */
     uint16_t dump_mem_lo = 0, dump_mem_hi = 0;
     for (int i = 2; i < argc; i++) {
@@ -577,18 +670,18 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Load binary at $0800 */
+    /* Load binary at $0600 */
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    if (size > 0x2800) {
-        fprintf(stderr, "binary too large (%ld bytes, max $2800)\n", size);
+    if (size > 0x2A00) {
+        fprintf(stderr, "binary too large (%ld bytes, max $2A00)\n", size);
         fclose(f);
         return 1;
     }
     fseek(f, 0, SEEK_SET);
-    if ((long)fread(&memory[0x0800], 1, size, f) != size) {
+    if ((long)fread(&memory[0x0600], 1, size, f) != size) {
         perror("fread");
         fclose(f);
         return 1;
@@ -600,9 +693,9 @@ int main(int argc, char *argv[])
     memory[0xFFEE] = 0x60;  /* RTS */
     memory[0xFFF4] = 0x60;  /* RTS */
 
-    /* Set reset vector to $0800 */
+    /* Set reset vector to $0600 */
     memory[0xFFFC] = 0x00;
-    memory[0xFFFD] = 0x08;
+    memory[0xFFFD] = 0x06;
 
     /* Load label map if available (for profiling) */
     if (profile_mode) {
@@ -642,6 +735,12 @@ int main(int argc, char *argv[])
 
         key_state = headless_keys;
         int dump_num = 0;
+        /* Initialize call stack for call-stack profiling */
+        call_stack[0] = 0x0600;
+        call_depth = 1;
+        memset(fn_self_cycles, 0, sizeof(fn_self_cycles));
+        memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));
+
         for (int frame = 0; frame < headless_frames; frame++) {
             if (profile_mode) {
                 /* Step instruction-by-instruction, recording cycles per PC */
@@ -649,10 +748,36 @@ int main(int argc, char *argv[])
                 unsigned long frame_vsync_cycles = 0;
                 while (frame_cycles < CYCLES_PER_FRAME) {
                     uint16_t pc = w65c02s_reg_get_pc(cpu);
+                    uint8_t opcode = memory[pc];
+                    uint16_t jsr_target = 0;
+                    if (opcode == 0x20)  /* JSR abs */
+                        jsr_target = memory[pc + 1] | ((uint16_t)memory[pc + 2] << 8);
+
                     unsigned long c = w65c02s_step_instruction(cpu);
                     frame_cycles += c;
+
+                    /* Flat per-PC profiling (existing) */
                     if (pc >= PROFILE_RANGE_LO && pc < PROFILE_RANGE_HI)
                         profile_cycles[pc - PROFILE_RANGE_LO] += c;
+
+                    /* Call-stack profiling: self + inclusive attribution */
+                    if (call_depth > 0) {
+                        uint16_t fn = call_stack[call_depth - 1];
+                        if (fn >= PROFILE_RANGE_LO && fn < PROFILE_RANGE_HI)
+                            fn_self_cycles[fn - PROFILE_RANGE_LO] += c;
+                        for (int d = 0; d < call_depth; d++) {
+                            uint16_t afn = call_stack[d];
+                            if (afn >= PROFILE_RANGE_LO && afn < PROFILE_RANGE_HI)
+                                fn_incl_cycles[afn - PROFILE_RANGE_LO] += c;
+                        }
+                    }
+
+                    /* Stack manipulation (after attribution) */
+                    if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH)
+                        call_stack[call_depth++] = jsr_target;
+                    else if (opcode == 0x60 && call_depth > 1)
+                        call_depth--;
+
                     /* Line statistics */
                     if (line_stats_mode && draw_line_addr && pc == draw_line_addr) {
                         uint8_t lx0 = memory[ZP_X0], ly0 = memory[ZP_Y0];
@@ -689,6 +814,7 @@ int main(int argc, char *argv[])
                 w65c02s_run_cycles(cpu, CYCLES_PER_FRAME);
             }
             vsync_flag |= 0x02;  /* set vsync bit */
+            profile_frame_count++;
 
             if (dump_dir)
                 dump_frame_2x(dump_dir, dump_num++);
@@ -732,8 +858,10 @@ int main(int argc, char *argv[])
         if (!profile_mode)
             write_ppm(stdout, pixels);
 
-        if (profile_mode)
+        if (profile_mode) {
             print_profile(headless_frames);
+            print_call_profile(profile_frame_count);
+        }
 
         if (line_stats_mode)
             print_line_stats(headless_frames);
@@ -795,6 +923,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Initialize call stack for call-stack profiling */
+    call_stack[0] = 0x0600;
+    call_depth = 1;
+    memset(fn_self_cycles, 0, sizeof(fn_self_cycles));
+    memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));
+
     int running = 1;
     int sdl_dump_num = 0;
     while (running) {
@@ -815,10 +949,47 @@ int main(int argc, char *argv[])
         if (keys[SDL_SCANCODE_Z])      key_state |= 0x01;  /* left */
         if (keys[SDL_SCANCODE_X])      key_state |= 0x02;  /* right */
         if (keys[SDL_SCANCODE_RETURN]) key_state |= 0x04;  /* forward */
-        if (keys[SDL_SCANCODE_SPACE])  key_state |= 0x08;  /* fire */
+        if (keys[SDL_SCANCODE_SPACE])  key_state |= 0x08;  /* back */
+        if (keys[SDL_SCANCODE_K])      key_state |= 0x10;  /* pitch up */
+        if (keys[SDL_SCANCODE_M])      key_state |= 0x20;  /* pitch down */
+        if (keys[SDL_SCANCODE_L])      key_state |= 0x40;  /* thrust */
 
         /* Run CPU for one frame */
-        w65c02s_run_cycles(cpu, CYCLES_PER_FRAME);
+        if (profile_mode) {
+            unsigned long frame_cycles = 0;
+            while (frame_cycles < CYCLES_PER_FRAME) {
+                uint16_t pc = w65c02s_reg_get_pc(cpu);
+                uint8_t opcode = memory[pc];
+                uint16_t jsr_target = 0;
+                if (opcode == 0x20)
+                    jsr_target = memory[pc + 1] | ((uint16_t)memory[pc + 2] << 8);
+
+                unsigned long c = w65c02s_step_instruction(cpu);
+                frame_cycles += c;
+
+                if (pc >= PROFILE_RANGE_LO && pc < PROFILE_RANGE_HI)
+                    profile_cycles[pc - PROFILE_RANGE_LO] += c;
+
+                if (call_depth > 0) {
+                    uint16_t fn = call_stack[call_depth - 1];
+                    if (fn >= PROFILE_RANGE_LO && fn < PROFILE_RANGE_HI)
+                        fn_self_cycles[fn - PROFILE_RANGE_LO] += c;
+                    for (int d = 0; d < call_depth; d++) {
+                        uint16_t afn = call_stack[d];
+                        if (afn >= PROFILE_RANGE_LO && afn < PROFILE_RANGE_HI)
+                            fn_incl_cycles[afn - PROFILE_RANGE_LO] += c;
+                    }
+                }
+
+                if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH)
+                    call_stack[call_depth++] = jsr_target;
+                else if (opcode == 0x60 && call_depth > 1)
+                    call_depth--;
+            }
+            profile_frame_count++;
+        } else {
+            w65c02s_run_cycles(cpu, CYCLES_PER_FRAME);
+        }
 
         /* Set vsync flag */
         vsync_flag |= 0x02;

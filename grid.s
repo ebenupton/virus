@@ -576,9 +576,8 @@ draw_grid:
     LDA run_hi
     CPX n_vtx                 ; first vertex?
     BEQ @clamp_left_edge
-    CPX #1                    ; last vertex?
-    BEQ @clamp_right_edge
-    BRA @sx_done
+    DEX                       ; proj_col - 1
+    BEQ @clamp_right_edge    ; was 1 → last vertex
 @clamp_left_edge:
     ; First vertex: sx = max(clamp_left, run_hi)
     CMP #128

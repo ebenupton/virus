@@ -635,7 +635,6 @@ draw_grid:
 :   LDA edge_color_lut,X     ; packed: h in 4,2,0; v in 5,3,1
     TAX                       ; save packed in X
     AND #$15                  ; h_color
-    STA offset_tmp            ; save for H-chain color update
     LDY #2
     STA (v_ptr),Y
     TXA

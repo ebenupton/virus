@@ -98,86 +98,79 @@ draw_grid:
     STA grid_min_sy
 
     ; === Compute z_cam for row 0 ===
+    ; z_cam = CAM_Z_BEHIND - HALF_ROWS*$40 - sub_z (from cam position)
     LDA cam_z_lo
     AND #$3F                  ; sub_z (0..63)
     CMP #$20
     BCS @z_wrap
-    ; sub_z < $20: z_cam = (HALF_ROWS+1)*$40 - sub_z
+    ; sub_z < $20: z_cam = (CAM_Z_BEHIND - HALF_ROWS*$40) - sub_z
     STA offset_tmp
     SEC
-    LDA #<((HALF_ROWS + 1) * $40)
+    LDA #<(CAM_Z_BEHIND - HALF_ROWS * $40)
     SBC offset_tmp
     STA z_cam_lo
-    LDA #>((HALF_ROWS + 1) * $40)
+    LDA #>(CAM_Z_BEHIND - HALF_ROWS * $40)
     SBC #0
     STA z_cam_hi
     BRA @z_done
 @z_wrap:
-    ; sub_z >= $20: z_cam = (HALF_ROWS+2)*$40 - sub_z
+    ; sub_z >= $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-1)*$40) - sub_z
     STA offset_tmp
     SEC
-    LDA #<((HALF_ROWS + 2) * $40)
+    LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
     SBC offset_tmp
     STA z_cam_lo
-    LDA #>((HALF_ROWS + 2) * $40)
+    LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
     SBC #0
     STA z_cam_hi
 @z_done:
 
-    ; === Compute heightmap base indices (centred on ship, not camera) ===
-    ; base_x
+    ; === Cache sub_x/sub_z (ship fractional position within cell) ===
     LDA obj_world_pos+OBJ_WORLD_SHIP+0
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                     ; ship_x_lo >> 6 (0..3)
-    STA offset_tmp
-    LDA obj_world_pos+OBJ_WORLD_SHIP+1
-    ASL A
-    ASL A                     ; ship_x_hi * 4
-    CLC
-    ADC offset_tmp
+    AND #$3F
+    STA grid_ptr              ; sub_x cached at $90
+    LDA obj_world_pos+OBJ_WORLD_SHIP+4
+    AND #$3F
+    STA grid_ptr+1            ; sub_z cached at $91
+
+    ; === Compute heightmap base indices (centred on ship, not camera) ===
+    ; base_x (save ship col on stack for terrain lookup)
+    LDY #0
+    JSR ship_hmap_col         ; A = ship_x hmap col (0..31)
+    PHA                       ; save for terrain lookup
     SEC
     SBC #HALF_COLS
     STA base_x
-    ; +1 if sub_x >= $20
-    LDA obj_world_pos+OBJ_WORLD_SHIP+0
-    AND #$3F
+    LDA grid_ptr              ; sub_x
     CMP #$20
     BCC @bx_done
     INC base_x
 @bx_done:
-
-    ; base_z
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                     ; ship_z_lo >> 6 (0..3)
-    STA offset_tmp
-    LDA obj_world_pos+OBJ_WORLD_SHIP+5
-    ASL A
-    ASL A                     ; ship_z_hi * 4
-    CLC
-    ADC offset_tmp
-    CLC
-    ADC #(HALF_ROWS + 1)
+    ; base_z (save ship row on stack for terrain lookup)
+    LDY #4
+    JSR ship_hmap_col         ; A = ship_z hmap row (0..31)
+    PHA                       ; save for terrain lookup
+    SEC
+    SBC #HALF_ROWS
     STA base_z
-    ; +1 if sub_z >= $20
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4
-    AND #$3F
+    LDA grid_ptr+1            ; sub_z
     CMP #$20
     BCC @bz_done
     INC base_z
 @bz_done:
 
+    ; === Sample terrain height at ship position for ground clamp ===
+    PLA                       ; ship_z hmap row
+    JSR set_hmap_ptr
+    PLY                       ; ship_x hmap col
+    LDA (hmap_ptr),Y
+    AND #$1F
+    ASL A
+    ASL A
+    STA terrain_y              ; height * 4 (cam follows ship, halving effective offset)
+
     ; === Determine n_vtx based on sub_x ===
-    LDA obj_world_pos+OBJ_WORLD_SHIP+0
-    AND #$3F
+    LDA grid_ptr              ; sub_x
     CMP #$20
     BNE @full_grid
     ; sub_x == $20: omit rightmost column
@@ -190,8 +183,7 @@ draw_grid:
 @grid_size_done:
 
     ; === Determine n_rows based on sub_z ===
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4
-    AND #$3F
+    LDA grid_ptr+1            ; sub_z
     CMP #$20
     BNE @full_z
     ; sub_z == $20: omit farthest row
@@ -204,8 +196,7 @@ draw_grid:
 @z_size_done:
 
     ; === Compute interpolation offsets for edge height correction ===
-    LDA obj_world_pos+OBJ_WORLD_SHIP+0
-    AND #$3F                  ; sub_x
+    LDA grid_ptr              ; sub_x
     CMP #$20
     BCS @interp_hi
     ; sub_x < $20: offset_l = 32 + sub_x, offset_r = 32 - sub_x
@@ -231,8 +222,7 @@ draw_grid:
 @interp_done:
 
     ; === Compute Z interpolation offsets (same formula as X, using sub_z) ===
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4
-    AND #$3F                  ; sub_z
+    LDA grid_ptr+1            ; sub_z
     CMP #$20
     BCS @z_interp_hi
     ; sub_z < $20: offset_near = 32 + sub_z, offset_far = 32 - sub_z
@@ -882,6 +872,29 @@ draw_grid:
 ; =====================================================================
 ; Input:  A = hmap row index (0..31)
 ; Output: hmap_ptr set, X = input A (preserved for caller)
+
+; =====================================================================
+; ship_hmap_col — Convert ship world position axis to heightmap index
+; =====================================================================
+; Input:  Y = axis offset (0 = X, 4 = Z)
+; Output: A = heightmap col/row (0..31)
+ship_hmap_col:
+    LDA obj_world_pos+OBJ_WORLD_SHIP,Y
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A                     ; lo >> 6
+    STA offset_tmp
+    INY
+    LDA obj_world_pos+OBJ_WORLD_SHIP,Y
+    ASL A
+    ASL A                     ; hi * 4
+    CLC
+    ADC offset_tmp
+    AND #$1F
+    RTS
 
 set_hmap_ptr:
     TAX

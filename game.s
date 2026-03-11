@@ -54,7 +54,7 @@ KEY_L       = $56
 ; Camera constants
 CAM_HEIGHT_LO   = $80        ; camera height 1.5 in 8.8 = $0180
 CAM_HEIGHT_HI   = $01
-CAM_Z_BEHIND    = $0300      ; camera 3.0 units behind ship
+CAM_Z_BEHIND    = $0240      ; camera 2.25 units behind ship (= grid centre z)
 
 ; Physics constants (12.5 fps, 1 grid cell = $40 in 8.8)
 GRAVITY_ACCEL   = 52          ; 0.5 cells/s²
@@ -118,8 +118,9 @@ entry:
     STZ cam_x_lo
     LDA #$04                ; ship_x_hi = 4
     STA cam_x_hi
-    STZ cam_z_lo
-    LDA #($04 - >CAM_Z_BEHIND)  ; ship_z_hi - CAM_Z_BEHIND hi = $04 - $03 = $01
+    LDA #<($0400 - CAM_Z_BEHIND)  ; cam_z = ship_z - CAM_Z_BEHIND
+    STA cam_z_lo
+    LDA #>($0400 - CAM_Z_BEHIND)
     STA cam_z_hi
     LDA #CAM_HEIGHT_LO          ; cam_y = 0 + 1.5 = $0180
     STA cam_y_lo
@@ -392,10 +393,16 @@ update_physics:
     ADC vel_z_hi
     STA obj_world_pos+OBJ_WORLD_SHIP+5
 
-    ; 5. Ground clamp: if ship_y_hi < 0, zero Y position and velocity
-    LDA obj_world_pos+OBJ_WORLD_SHIP+3
-    BPL @above_ground
-    STZ obj_world_pos+OBJ_WORLD_SHIP+2
+    ; 5. Ground clamp: use terrain_y computed by project_grid
+    LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
+    BMI @do_clamp                          ; negative → below ground
+    BNE @above_ground                      ; hi > 0 → above
+    LDA obj_world_pos+OBJ_WORLD_SHIP+2    ; y_lo
+    CMP terrain_y
+    BCS @above_ground
+@do_clamp:
+    LDA terrain_y
+    STA obj_world_pos+OBJ_WORLD_SHIP+2
     STZ obj_world_pos+OBJ_WORLD_SHIP+3
     STZ pos_y_frac
     STZ vel_y_hi

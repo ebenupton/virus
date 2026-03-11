@@ -15,8 +15,9 @@ HALF_COLS       = GRID_COLS / 2  ; half-width in cells
 HALF_ROWS       = GRID_ROWS / 2  ; half-depth in cells
 ROW_STRIDE      = GRID_VTX_X * 4  ; bytes per vertex row in v_buf
 
-; ── Dirty-top output (set by draw_grid, read by game.s) ──────────
+; ── Outputs (set by project_grid, read by game.s) ────────────────
 grid_min_sy     = $BE           ; minimum screen Y across all grid vertices
+terrain_y       = $BF           ; terrain height at ship pos (height*8, 8.8 lo)
 
 ; ── Derived geometry constants ──────────────────────────────────────
 HALF_GRID_X     = (GRID_COLS - 1) * $20   ; X half-extent in 8.8

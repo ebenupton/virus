@@ -513,6 +513,18 @@ draw_grid:
     ADC #>v_buf
     STA v_ptr+1
 
+    ; --- Init grid_ptr = v_ptr - ROW_STRIDE (prev row, for V-chains) ---
+    CPX #0
+    BEQ @skip_grid_init
+    LDA v_ptr
+    SEC
+    SBC #ROW_STRIDE
+    STA grid_ptr
+    LDA v_ptr+1
+    SBC #0
+    STA grid_ptr+1
+@skip_grid_init:
+
     ; --- Column loop: n_vtx vertices ---
     LDA n_vtx
     STA proj_col
@@ -637,14 +649,7 @@ draw_grid:
     LDA proj_row
     BEQ @no_v_draw
 
-    ; grid_ptr = v_ptr - ROW_STRIDE (prev row, same column)
-    LDA v_ptr
-    SEC
-    SBC #ROW_STRIDE
-    STA grid_ptr
-    LDA v_ptr+1
-    SBC #0
-    STA grid_ptr+1
+    ; grid_ptr already points to prev row vertex (init at row start)
 
     ; Start point = previous row vertex
     LDY #0
@@ -705,7 +710,14 @@ draw_grid:
 @vs_final:
     STA (raster_base),Y
 @no_v_final:
-
+    ; Advance grid_ptr for next column's V-chain
+    LDA grid_ptr
+    CLC
+    ADC #4
+    STA grid_ptr
+    BCC :+
+    INC grid_ptr+1
+:
 @no_v_draw:
 
     ; Advance chain_state_idx

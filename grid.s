@@ -855,26 +855,24 @@ draw_h_row:
     LDA (grid_ptr),Y          ; sy
     STA raster_y0
     JSR init_base             ; Y = sub_y
-    LDA #4
-    STA chain_idx             ; offset to 2nd vertex
 @h_seg:
     STY saved_y
-    ; h_color of start vertex = chain_idx - 2
-    LDY chain_idx
-    DEY
-    DEY
+    LDY #2
     LDA (grid_ptr),Y          ; h_color
     STA saved_color
-    LDY chain_idx
+    ; Advance grid_ptr to next vertex
+    LDA grid_ptr
+    CLC
+    ADC #4
+    STA grid_ptr
+    BCC :+
+    INC grid_ptr+1
+:   LDY #0
     LDA (grid_ptr),Y          ; endpoint sx
     STA raster_x1
     INY
     LDA (grid_ptr),Y          ; endpoint sy
     STA raster_y1
-    INY
-    INY                       ; skip h_color
-    INY                       ; skip v_color → next vertex sx
-    STY chain_idx
     LDY saved_y
     LDA saved_color
     JSR draw_line

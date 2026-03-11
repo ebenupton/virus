@@ -597,11 +597,13 @@ draw_grid:
     LDA clamp_right
 @sx_done:
     ; A = final sx for this vertex
+    STA raster_x1             ; cache for V-chain endpoint
     ; Store (sx, sy, h_color, v_color) to v_buf
     LDY #0
     STA (v_ptr),Y
     INY
     LDA offset_tmp+1          ; final sy for this vertex
+    STA raster_y1             ; cache for V-chain endpoint
     CMP grid_min_sy
     BCS @no_dirty_upd
     STA grid_min_sy
@@ -669,15 +671,7 @@ draw_grid:
     LDA chain_state+2,X
     STA raster_base+1
 @v_ready:
-    ; Endpoint = current vertex (still at v_ptr)
-    STY saved_y
-    LDY #0
-    LDA (v_ptr),Y
-    STA raster_x1
-    INY
-    LDA (v_ptr),Y
-    STA raster_y1
-    LDY saved_y
+    ; Endpoint = current vertex (raster_x1/y1 cached from v_buf write)
 
     ; Draw
     PLA                       ; v_color

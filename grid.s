@@ -248,25 +248,17 @@ draw_grid:
 @z_interp_done:
 
     ; === Compute clamp_near_sy from constant Z_NEAR_BOUND ===
-    ; Near row projects at Z_NEAR_BOUND (z_cam adjusted to match)
-    LDA #<(Z_NEAR_BOUND * 4)  ; = $80
-    STA math_b
-    LDA #>(Z_NEAR_BOUND * 4)  ; = $05
-    STA math_a
-    JSR urecip15
-    LDA math_res_lo
+    ; recip = 65536 / (Z_NEAR_BOUND * 4), compile-time constant
+    RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 4)
+    LDA #RECIP_NEAR
     JSR mul_cam_y             ; A = recip * cam_y
     CLC
     ADC #80
     STA clamp_near_sy
 
     ; === Compute clamp_far_sy (far boundary screen-y) ===
-    LDA #<(Z_FAR_BOUND * 4)
-    STA math_b
-    LDA #>(Z_FAR_BOUND * 4)
-    STA math_a
-    JSR urecip15
-    LDA math_res_lo
+    RECIP_FAR = 65536 / (Z_FAR_BOUND * 4)
+    LDA #RECIP_FAR
     JSR mul_cam_y             ; A = recip * cam_y
     CLC
     ADC #80                   ; sy (can't overflow for far boundary)
@@ -549,9 +541,12 @@ draw_grid:
     ; Z-interpolate height if on a boundary row
     LDA z_interp_offset
     BEQ @no_z_interp
-    JSR z_interp_vertex
+    JSR z_interp_vertex       ; A = pre-scaled h*8 (0..248)
+    BEQ @use_sy_val           ; zero → sea/flat
+    STA math_a                ; already pre-scaled, skip ×8
+    BRA @do_height_mul
 @no_z_interp:
-    LDA offset_tmp            ; re-load (may have been modified)
+    LDA offset_tmp
     AND #$1F                  ; height 0..31
     BEQ @use_sy_val           ; flat → use row's base sy
 
@@ -560,6 +555,7 @@ draw_grid:
     ASL A
     ASL A                     ; h * 8 (max 248, fits in byte)
     STA math_a
+@do_height_mul:
     LDA recip_val
     STA math_b
     JSR umul8x8
@@ -960,13 +956,11 @@ mul_cam_y:
 
 lut_lookup:
     DEC A                     ; diff - 1 (0..3)
+    STA chain_idx
+    LDA seg_count
     ASL A
-    ASL A
-    ASL A
-    ASL A
-    ASL A
-    ASL A                     ; (diff-1) * 64
-    ORA seg_count             ; + offset
+    ASL A                     ; offset * 4
+    ORA chain_idx             ; + (diff-1)
     TAX
     LDA interp_lut,X
     RTS
@@ -1032,14 +1026,6 @@ z_interp_vertex:
     LDA offset_tmp
     AND #$1F                  ; h_outer_z
     JSR lerp_height            ; A = pre-scaled (0..248)
-    LSR A
-    LSR A
-    LSR A                     ; → height units (0..31)
-    STA chain_idx              ; temp
-    LDA offset_tmp
-    AND #$E0                  ; preserve colour bits
-    ORA chain_idx
-    STA offset_tmp
     RTS
 
 ; =====================================================================

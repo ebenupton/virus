@@ -66,14 +66,11 @@ delta_val       = $61       ; interpolation delta (used by urecip15)
 ; Inputs:   math_a = unsigned multiplier  (0..255)
 ;           math_b = unsigned multiplicand (0..255)
 ; Outputs:  math_res_hi:math_res_lo = 16-bit unsigned product
-; Clobbers: A, X
-; Preserves: Y
+; Clobbers: A, X, Y
 ;
-; Cycles: ~65 including JSR/RTS.
+; Cycles: ~57 including JSR/RTS.
 
 umul8x8:
-    PHY
-
     ; -- Compute |a - b| --
     LDA math_a
     SEC
@@ -98,7 +95,6 @@ umul8x8:
     LDA sqr_hi,X
     SBC sqr_hi,Y
     STA math_res_hi
-    PLY
     RTS
 
 @u_sum_overflow:
@@ -109,7 +105,6 @@ umul8x8:
     LDA sqr2_hi,X
     SBC sqr_hi,Y
     STA math_res_hi
-    PLY
     RTS
 
 ; =====================================================================
@@ -120,14 +115,11 @@ umul8x8:
 ;           math_b = signed multiplicand (-128..+127)
 ; Outputs:  math_res_hi:math_res_lo = signed 16-bit product
 ;           A = math_res_hi (for quick sign checks)
-; Clobbers: A, X
-; Preserves: Y
+; Clobbers: A, X, Y
 ;
-; Cycles: ~70.
+; Cycles: ~62.
 
 smul8x8:
-    PHY
-
     ; -- Compute |a - b| --
     LDA math_a
     SEC
@@ -173,7 +165,6 @@ smul8x8:
     SBC math_a
 @done:
     STA math_res_hi
-    PLY
     RTS
 
 ; =====================================================================

@@ -92,6 +92,12 @@ entry:
     SEI
     JSR init_screen
     JSR init_status
+    JSR draw_map              ; blit minimap to buf1 (raster_page=$58 from init)
+    LDA #$30
+    STA raster_page
+    JSR draw_map              ; blit minimap to buf0
+    LDA #$58
+    STA raster_page           ; restore to buf1 (back buffer)
 
     ; Initialize rotation angle and orientation
     STZ obj_rot_angle
@@ -132,41 +138,14 @@ entry:
 ; =====================================================================
 
 main_loop:
-    STA $FE32               ; dump & reset call-stack profile
     JSR update_camera
     JSR update_physics
     JSR clear_screen
     JSR draw_grid
 
-    ; Advance object rotation angle
-    LDA obj_rot_angle
-    CLC
-    ADC #4
-    STA obj_rot_angle
-
-    ; Set up object pointer
-    LDA #<obj_pyramid
-    STA obj_ptr
-    LDA #>obj_pyramid
-    STA obj_ptr+1
-
     ; Default bbox: nothing drawn by object (overwritten if draw_object runs)
     LDA #160
     STA obj_bb_min_sy
-    STZ obj_roll_angle         ; pyramid has no roll
-
-    ; Compute view-space coords for pyramid
-    LDY #OBJ_WORLD_PYRAMID
-    JSR setup_obj_view
-    BCS @skip_pyramid
-    JSR draw_object
-@skip_pyramid:
-
-    ; Save pyramid dirty top, then draw ship
-    LDA obj_bb_min_sy
-    PHA
-    LDA obj_rot_angle
-    PHA
 
     LDA ship_yaw
     STA obj_rot_angle
@@ -176,23 +155,12 @@ main_loop:
     STA obj_ptr
     LDA #>obj_ship
     STA obj_ptr+1
-    LDA #160
-    STA obj_bb_min_sy
 
     LDY #OBJ_WORLD_SHIP
     JSR setup_obj_view
     BCS @skip_ship
     JSR draw_object
 @skip_ship:
-
-    ; obj_bb_min_sy = min(pyramid, ship)
-    PLA
-    STA obj_rot_angle
-    PLA                         ; pyramid's bb_min_sy
-    CMP obj_bb_min_sy
-    BCS @ship_lower
-    STA obj_bb_min_sy
-@ship_lower:
 
     ; Combine grid + object dirty tops → save for this buffer's next clear
     LDA grid_min_sy
@@ -203,7 +171,6 @@ main_loop:
     LDX back_buf_idx
     STA dirty_top_buf0,X
 
-    JSR draw_map
     JSR draw_status
     JSR wait_vsync
     JSR flip_buffers

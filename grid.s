@@ -560,15 +560,14 @@ draw_grid:
     LDA sy_val
     SEC
     SBC math_res_hi
-    BCS @sy_vert_ok
-    LDA #0                    ; underflow → clamp to 0
-@sy_vert_ok:
-    BRA @sy_vert_done
+    BCS @sy_store
+    LDA #0
+    BRA @sy_store
 
 @use_sy_val:
     LDA sy_val
 
-@sy_vert_done:
+@sy_store:
     STA offset_tmp+1          ; save adjusted sy (borrow $A4 briefly)
 
     ; --- sx: only first/last vertices need clamping ---

@@ -423,9 +423,7 @@ draw_grid:
 
     ; sub_x in [1,$1F]: run -= sub_x * recip
     STA math_a
-    LDA recip_val
-    STA math_b
-    JSR umul8x8
+    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
     LDA run_lo
     SEC
     SBC math_res_lo
@@ -440,9 +438,7 @@ draw_grid:
     EOR #$3F
     INC A                     ; A = $40 - sub_x (1..$20)
     STA math_a
-    LDA recip_val
-    STA math_b
-    JSR umul8x8
+    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
     LDA run_lo
     CLC
     ADC math_res_lo
@@ -561,9 +557,7 @@ draw_grid:
     ASL A                     ; h * 8 (max 248, fits in byte)
     STA math_a
 @do_height_mul:
-    LDA recip_val
-    STA math_b
-    JSR umul8x8
+    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
     ; sy_vertex = sy_val - Δsy, clamp to 0
     LDA sy_val
     SEC
@@ -1111,9 +1105,7 @@ interp_height:
     ; Convert interpolated height to sy
     BEQ @ih_base_sy
     STA math_a                ; already world-coord scale
-    LDA recip_val
-    STA math_b
-    JSR umul8x8
+    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
     LDA sy_val
     SEC
     SBC math_res_hi

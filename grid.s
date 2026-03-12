@@ -532,8 +532,7 @@ draw_grid:
     ; --- SMC: patch V-chain final-row branch ---
     ; On last row, BRA opcode ($80) becomes BIT zp ($24) → falls through
     LDA #$80                  ; BRA opcode (skip final pixel)
-    LDX proj_row
-    CPX last_row_idx
+    CPX last_row_idx          ; X = proj_row from LDX at v_ptr init
     BNE :+
     LDA #$24                  ; BIT zp opcode (fall through on last row)
 :   STA @v_final_br
@@ -671,10 +670,10 @@ draw_grid:
     ; --- Edge colours from precomputed index ---
     LDX saved_color
     LDA h_color_lut,X
-    LDY #2
+    INY                       ; Y: 1→2
     STA (v_ptr),Y
     LDA v_color_lut,X
-    LDY #3
+    INY                       ; Y: 2→3
     STA (v_ptr),Y
 
     ; --- Inline vertical chain drawing ---
@@ -696,7 +695,7 @@ draw_grid:
     ; Chain state: init_base on row 1, restore on row 2+
     LDX chain_state_idx
     LDA proj_row
-    CMP #1
+    DEC A                     ; Z=1 iff proj_row==1 (65C02)
     BNE @v_restore
     JSR init_base             ; Y = sub_y
     BRA @v_ready
@@ -721,11 +720,11 @@ draw_grid:
     STA chain_state+1,X
     LDA raster_base+1
     STA chain_state+2,X
-    ; Advance chain_state_idx (X = current idx, TXA saves reload)
-    TXA
-    CLC
-    ADC #3
-    STA chain_state_idx
+    ; Advance chain_state_idx
+    INX
+    INX
+    INX
+    STX chain_state_idx
 
     ; Final pixel on last row (SMC'd: BRA on non-final, BIT zp on final)
 @v_final_br:

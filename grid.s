@@ -540,20 +540,18 @@ draw_grid:
     LDA (hmap_ptr),Y
     STA offset_tmp            ; save full byte for color extraction
     ; Z-interpolate height if on a boundary row
-    LDA z_interp_offset
-    BEQ @no_z_interp
-    JSR z_interp_vertex       ; A = pre-scaled h*8 (0..248)
-    BEQ @use_sy_val           ; zero → sea/flat
-    BRA @do_height_mul        ; already pre-scaled, skip ×8
-@no_z_interp:
-    LDA offset_tmp
+    LDX z_interp_offset       ; preserves A = hmap byte
+    BNE @z_interp_path
+    ; Common path: A still = offset_tmp
     AND #$1F                  ; height 0..31
     BEQ @use_sy_val           ; flat → use row's base sy
-
-    ; Δsy = hi_byte(h*8 * recip) = h * recip / 32
     ASL A
     ASL A
     ASL A                     ; h * 8 (max 248, fits in byte)
+    BRA @do_height_mul
+@z_interp_path:
+    JSR z_interp_vertex       ; X = z_interp_offset, A = pre-scaled h*8
+    BEQ @use_sy_val           ; zero → sea/flat
 @do_height_mul:
     ; Inline umul8x8 hi-byte: A * math_b (= recip_val, set by clamp)
     TAX                       ; save A
@@ -1081,8 +1079,7 @@ lerp_height:
 ; Preserves colour bits (5–7) in offset_tmp.
 
 z_interp_vertex:
-    LDA z_interp_offset
-    STA seg_count
+    STX seg_count             ; X = z_interp_offset from caller
     LDY hmap_col
     LDA (interp_z_ptr),Y      ; inner row cell byte
     AND #$1F                  ; h_inner_z

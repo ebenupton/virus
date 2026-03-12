@@ -529,6 +529,15 @@ draw_grid:
     STA grid_ptr+1
 @skip_grid_init:
 
+    ; --- SMC: patch V-chain final-row branch ---
+    ; On last row, BRA opcode ($80) becomes BIT zp ($24) → falls through
+    LDA #$80                  ; BRA opcode (skip final pixel)
+    LDX proj_row
+    CPX last_row_idx
+    BNE :+
+    LDA #$24                  ; BIT zp opcode (fall through on last row)
+:   STA @v_final_br
+
     ; --- Column loop: n_vtx vertices ---
     LDA n_vtx
     STA proj_col
@@ -718,10 +727,9 @@ draw_grid:
     ADC #3
     STA chain_state_idx
 
-    ; Final pixel on last row
-    LDA proj_row
-    CMP last_row_idx
-    BNE @no_v_final
+    ; Final pixel on last row (SMC'd: BRA on non-final, BIT zp on final)
+@v_final_br:
+    BRA @no_v_final
     LDA raster_x1
     STA raster_x0
     LSR A

@@ -583,18 +583,18 @@ draw_grid:
     CLC
     ADC math_b
     TAX                       ; X = (A + math_b) & $FF
-    BCS @hm_so
-    SEC
-    LDA sqr_lo,X
-    SBC sqr_lo,Y
-    LDA sqr_hi,X
-    SBC sqr_hi,Y
-    BRA @hm_end
-@hm_so:
+    BCC @hm_no
     SEC
     LDA sqr2_lo,X
     SBC sqr_lo,Y
     LDA sqr2_hi,X
+    SBC sqr_hi,Y
+    BRA @hm_end
+@hm_no:
+    SEC
+    LDA sqr_lo,X
+    SBC sqr_lo,Y
+    LDA sqr_hi,X
     SBC sqr_hi,Y
 @hm_end:
     ; A = hi(h*8 * recip_val); sy = sy_val - A, clamp ≥ 0

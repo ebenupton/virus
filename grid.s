@@ -868,7 +868,7 @@ draw_h_row:
     STY saved_y
     LDY #2
     LDA (grid_ptr),Y          ; h_color
-    STA saved_color
+    TAX                       ; cache in X (free until draw_line)
     ; Advance grid_ptr to next vertex
     LDA grid_ptr
     CLC
@@ -883,7 +883,7 @@ draw_h_row:
     LDA (grid_ptr),Y          ; endpoint sy
     STA raster_y1
     LDY saved_y
-    LDA saved_color
+    TXA                       ; recover h_color
     JSR draw_line
     LDA raster_x1
     STA raster_x0

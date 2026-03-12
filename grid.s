@@ -518,7 +518,7 @@ draw_grid:
     STA v_ptr+1
 
     ; --- Init grid_ptr = v_ptr - ROW_STRIDE (prev row, for V-chains) ---
-    CPX #0
+    TXA                       ; set Z flag from proj_row (1 byte vs CPX #0)
     BEQ @skip_grid_init
     LDA v_ptr
     SEC

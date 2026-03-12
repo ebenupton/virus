@@ -645,6 +645,7 @@ int main(int argc, char *argv[])
     int headless = 0;
     int headless_frames = 0;
     int headless_keys = 0;   /* simulated key_state for headless mode */
+    int boot_mode = 0;       /* --boot: fill RAM with garbage, load at $3000 */
     int log_mode = 0;        /* dump vertex coords to stderr each frame */
     const char *dump_dir = NULL;  /* if set, dump each scanout frame as 2x PPM */
     uint16_t dump_mem_lo = 0, dump_mem_hi = 0;
@@ -667,21 +668,32 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--dump-mem") == 0 && i + 2 < argc) {
             dump_mem_lo = (uint16_t)strtol(argv[++i], NULL, 0);
             dump_mem_hi = (uint16_t)strtol(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--boot") == 0) {
+            boot_mode = 1;
         }
     }
 
-    /* Load binary at $0600 */
+    /* In boot mode, fill all RAM with deterministic garbage before loading */
+    if (boot_mode) {
+        srand(42);
+        for (int i = 0; i < 65536; i++)
+            memory[i] = rand() & 0xFF;
+    }
+
+    /* Load binary */
+    uint16_t load_addr = boot_mode ? 0x3000 : 0x0600;
+    long max_size = boot_mode ? 0x5000 : 0x2A00;
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    if (size > 0x2A00) {
-        fprintf(stderr, "binary too large (%ld bytes, max $2A00)\n", size);
+    if (size > max_size) {
+        fprintf(stderr, "binary too large (%ld bytes, max $%04lX)\n", size, max_size);
         fclose(f);
         return 1;
     }
     fseek(f, 0, SEEK_SET);
-    if ((long)fread(&memory[0x0600], 1, size, f) != size) {
+    if ((long)fread(&memory[load_addr], 1, size, f) != size) {
         perror("fread");
         fclose(f);
         return 1;
@@ -693,9 +705,9 @@ int main(int argc, char *argv[])
     memory[0xFFEE] = 0x60;  /* RTS */
     memory[0xFFF4] = 0x60;  /* RTS */
 
-    /* Set reset vector to $0600 */
-    memory[0xFFFC] = 0x00;
-    memory[0xFFFD] = 0x06;
+    /* Set reset vector */
+    memory[0xFFFC] = load_addr & 0xFF;
+    memory[0xFFFD] = (load_addr >> 8) & 0xFF;
 
     /* Load label map if available (for profiling) */
     if (profile_mode) {
@@ -736,7 +748,7 @@ int main(int argc, char *argv[])
         key_state = headless_keys;
         int dump_num = 0;
         /* Initialize call stack for call-stack profiling */
-        call_stack[0] = 0x0600;
+        call_stack[0] = load_addr;
         call_depth = 1;
         memset(fn_self_cycles, 0, sizeof(fn_self_cycles));
         memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));
@@ -924,7 +936,7 @@ int main(int argc, char *argv[])
     }
 
     /* Initialize call stack for call-stack profiling */
-    call_stack[0] = 0x0600;
+    call_stack[0] = load_addr;
     call_depth = 1;
     memset(fn_self_cycles, 0, sizeof(fn_self_cycles));
     memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));

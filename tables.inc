@@ -20,25 +20,8 @@ sin_table:
     .byte $A6, $A8, $AB, $AD, $AF, $B2, $B4, $B7, $B9, $BC, $BF, $C1, $C4, $C7, $CA, $CD
     .byte $CF, $D2, $D5, $D8, $DB, $DE, $E1, $E4, $E7, $EA, $ED, $F0, $F4, $F7, $FA, $FD
 
-; cos_table eliminated: cos(x) = sin(x + 64), derived inline in object.s
-
-; =====================================================================
-; lerp_recip_lo / lerp_recip_hi — Linear interpolation table for urecip15
-; =====================================================================
-;
-; 129 entries (16-bit each, split lo/hi), indexed by i = m - 128:
-;
-;   lerp_recip[i] = round(2^22 / (128 + i))   for i in [0, 128]
-;
-; The extra entry at i=128 is needed to compute the delta for the last
-; interval.  Range of values: [16384, 32768] ($4000..$8000).
-;
-; Adjacent deltas D[i] = T[i] - T[i+1] range from 254 down to 64,
-; always fitting in a byte, which keeps the interpolation multiply
-; within u8 x u8.
-;
-; Total: 258 bytes (129 x 2).
-
+; lerp_recip_lo / lerp_recip_hi — round(2^22 / (128+i)) for i=0..128
+; 129 entries (16-bit, split lo/hi) for urecip15 linear interpolation
 lerp_recip_lo:
     .byte $00, $02, $08, $12, $1F, $30, $45, $5D, $78, $97, $BA, $DF, $07, $33, $61, $93
     .byte $C7, $FE, $38, $75, $B4, $F6, $3A, $81, $CA, $16, $64, $B4, $07, $5B, $B2, $0B
@@ -60,7 +43,6 @@ lerp_recip_hi:
     .byte $49, $48, $48, $48, $47, $47, $47, $46, $46, $46, $46, $45, $45, $45, $44, $44
     .byte $44, $43, $43, $43, $43, $42, $42, $42, $42, $41, $41, $41, $41, $40, $40, $40
     .byte $40
-
 
 ; sqr_lo: quarter-square table low byte, sqr_lo[i] = floor(i*i/4) & $FF
 sqr_lo:
@@ -137,5 +119,4 @@ sqr2_hi:
     .byte $D2, $D3, $D4, $D4, $D5, $D6, $D7, $D8, $D9, $DA, $DB, $DC, $DD, $DE, $DF, $E0
     .byte $E1, $E1, $E2, $E3, $E4, $E5, $E6, $E7, $E8, $E9, $EA, $EB, $EC, $ED, $EE, $EF
     .byte $F0, $F1, $F2, $F3, $F4, $F5, $F6, $F7, $F8, $F9, $FA, $FB, $FC, $FD, $FE, $FF
-
 

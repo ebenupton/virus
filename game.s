@@ -90,6 +90,18 @@ cam_y_hi        = $58
 
 entry:
     SEI
+
+    ; Zero status bar rows that clear_screen skips (real hardware init)
+    LDY #0
+    TYA
+@clr_status:
+    STA $3000,Y
+    STA $3100,Y
+    STA $5800,Y
+    STA $5900,Y
+    INY
+    BNE @clr_status
+
     JSR init_screen
     JSR init_status
     JSR draw_map              ; blit minimap to buf1 (raster_page=$58 from init)

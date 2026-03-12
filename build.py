@@ -22,7 +22,7 @@ DEMO_LOAD = 0x1800
 DEMO_EXEC = 0x1800
 
 
-def assemble(src, binfile, objfile=None, extra_flags=None):
+def assemble(src, binfile, objfile=None, extra_flags=None, linker_cfg="linker.cfg"):
     """Assemble a .s file → .bin via ca65 + ld65."""
     if objfile is None:
         objfile = src.replace(".s", ".o")
@@ -43,7 +43,7 @@ def assemble(src, binfile, objfile=None, extra_flags=None):
     dbgfile = binfile.replace(".bin", ".dbg")
     lblfile = binfile.replace(".bin", ".labels")
     r = subprocess.run(
-        ["ld65", "-C", "linker.cfg", "--dbgfile", dbgfile, objfile, "-o", binfile],
+        ["ld65", "-C", linker_cfg, "--dbgfile", dbgfile, objfile, "-o", binfile],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -79,8 +79,13 @@ def assemble(src, binfile, objfile=None, extra_flags=None):
     return size
 
 
-def create_ssd(binfile, ssdfile, title=b"LineDEMO", progname=b"DEMO   "):
+def create_ssd(binfile, ssdfile, title=b"LineDEMO", progname=b"DEMO   ",
+               load_addr=None, exec_addr=None):
     """Create an auto-booting DFS disk image containing !BOOT and the binary."""
+    if load_addr is None:
+        load_addr = DEMO_LOAD
+    if exec_addr is None:
+        exec_addr = DEMO_EXEC
     bin_size = os.path.getsize(binfile)
     print(f"Creating {ssdfile} ...")
 
@@ -120,7 +125,7 @@ def create_ssd(binfile, ssdfile, title=b"LineDEMO", progname=b"DEMO   "):
     disk[0x10F] = boot_sector
 
     # Entry 1 (program)
-    struct.pack_into("<HH", disk, 0x110, DEMO_LOAD, DEMO_EXEC)
+    struct.pack_into("<HH", disk, 0x110, load_addr, exec_addr)
     struct.pack_into("<H",  disk, 0x114, bin_size)
     disk[0x116] = 0x00
     disk[0x117] = prog_sector
@@ -164,53 +169,26 @@ def generate_tables():
 
     lines.append("")
 
-    # Cos table: 256 entries, cos(i * 2pi / 256) * 127, signed
-    lines.append("; cos_table: 256 entries, signed (-127..+127)")
-    lines.append("; cos_table[i] = round(cos(i * 2*pi / 256) * 127)")
-    lines.append("cos_table:")
-    cos_vals = []
-    for i in range(256):
-        angle = i * 2.0 * math.pi / 256.0
-        val = round(math.cos(angle) * 127.0)
-        val = max(-127, min(127, val))
-        cos_vals.append(val & 0xFF)
-    for row in range(0, 256, 16):
-        chunk = cos_vals[row:row+16]
+    # Lerp reciprocal table for urecip15: 129 entries, 16-bit split lo/hi
+    # lerp_recip[i] = round(2^22 / (128 + i)) for i in [0, 128]
+    lines.append("; lerp_recip_lo / lerp_recip_hi — round(2^22 / (128+i)) for i=0..128")
+    lines.append("; 129 entries (16-bit, split lo/hi) for urecip15 linear interpolation")
+    lerp_vals = []
+    for i in range(129):
+        lerp_vals.append(round(2**22 / (128 + i)))
+
+    lines.append("lerp_recip_lo:")
+    lerp_lo = [v & 0xFF for v in lerp_vals]
+    for row in range(0, 129, 16):
+        chunk = lerp_lo[row:row+16]
         lines.append("    .byte " + ", ".join(f"${v:02X}" for v in chunk))
 
     lines.append("")
 
-    # Reciprocal table: K=8, 256 entries covering z=2.000 to z=33.875
-    # index = (z - 1) * 8 + frac>>5, recip[i] = min(127, round(128 / (1 + i/8)))
-    lines.append("; recip_table: K=8, 256 entries, z=1.000..32.875 eighth-unit resolution")
-    lines.append("; index = (vz-1)*8 + (vz_frac>>5), recip[i] = min(127, round(128/(1+i/8)))")
-    lines.append("recip_table:")
-    recip_vals = []
-    for i in range(256):
-        z = 1.0 + i / 8.0
-        val = min(127, round(128.0 / z))
-        recip_vals.append(val)
-    for row in range(0, 256, 16):
-        chunk = recip_vals[row:row+16]
-        lines.append("    .byte " + ", ".join(f"${v:02X}" for v in chunk))
-
-    lines.append("")
-
-    # Reciprocal fractional correction table (K=8)
-    lines.append("; recip_lo_table: fractional correction for recip_table (K=8)")
-    lines.append("; recip_lo[i] = round((ideal - rounded) * 128), signed")
-    lines.append("recip_lo_table:")
-    recip_lo_vals = []
-    for i in range(256):
-        z = 1.0 + i / 8.0
-        ideal = 128.0 / z
-        rounded = min(127, round(ideal))
-        error = ideal - rounded
-        correction = round(error * 128)
-        correction = max(-64, min(63, correction))
-        recip_lo_vals.append(correction & 0xFF)
-    for row in range(0, 256, 16):
-        chunk = recip_lo_vals[row:row+16]
+    lines.append("lerp_recip_hi:")
+    lerp_hi = [(v >> 8) & 0xFF for v in lerp_vals]
+    for row in range(0, 129, 16):
+        chunk = lerp_hi[row:row+16]
         lines.append("    .byte " + ", ".join(f"${v:02X}" for v in chunk))
 
     lines.append("")
@@ -312,14 +290,49 @@ def build_game():
     print(f"\nDone!  Run: ./emu game.bin")
 
 
+def build_bootable():
+    """Build bootable image: bootloader + game for real BBC Micro hardware."""
+    generate_tables()
+
+    # Assemble bootloader
+    boot_size = assemble("boot.s", "boot.bin", "boot.o",
+                         linker_cfg="boot_linker.cfg")
+
+    # Assemble game
+    game_size = assemble("game.s", "game.bin", "game.o",
+                         extra_flags=["-DUNROLL_SHALLOW=1"])
+
+    # Concatenate: boot.bin + game.bin → game_boot.bin
+    with open("boot.bin", "rb") as bf:
+        boot_data = bf.read()
+    with open("game.bin", "rb") as gf:
+        game_data = gf.read()
+    with open("game_boot.bin", "wb") as out:
+        out.write(boot_data)
+        out.write(game_data)
+    total_size = len(boot_data) + len(game_data)
+    print(f"  game_boot.bin: {total_size} bytes (boot={len(boot_data)}, game={len(game_data)})")
+
+    # Create SSD with load=$3000, exec=$3000
+    create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
+               load_addr=0x3000, exec_addr=0x3000)
+
+    # Compile emulator
+    compile_emu()
+
+    print(f"\nDone!  Run: ./emu game_boot.bin --boot")
+
+
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "demo"
 
     if target == "game":
         build_game()
+    elif target == "boot":
+        build_bootable()
     elif target == "demo":
         build_demo()
     else:
         print(f"Unknown target: {target}")
-        print("Usage: python3 build.py [demo|game]")
+        print("Usage: python3 build.py [demo|game|boot]")
         sys.exit(1)

@@ -32,8 +32,8 @@ init_screen:
     LDA #$00
     STA CRTC_DAT
 
-    ; Init dirty-top tracking (160 = no clear needed, screen already zeroed)
-    LDA #160
+    ; Init dirty-top tracking (0 = fully dirty, clear everything)
+    LDA #0
     STA dirty_top_buf0
     STA dirty_top_buf1
 

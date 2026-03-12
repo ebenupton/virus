@@ -74,11 +74,12 @@ v_row_offset_hi:
 color_unpack:
     .byte $00, $01, $04, $05, $10, $11, $14, $15
 
-; Edge colour LUT: index = (bits7-5 << 1) | sea_flag
-; Packed byte: h_color in bits 4,2,0; v_color in bits 5,3,1
-; Extract h: AND #$15   Extract v: LSR then AND #$15
-edge_color_lut:
-    .byte $0F,$3C,$3F,$3C,$2E,$38,$2A,$38,$1D,$34,$15,$34,$0C,$30,$00,$30
+; Edge colour LUTs: index = (bits7-5 << 1) | sea_flag
+; Split tables avoid runtime bit extraction (h=bits 4,2,0; v=bits 5,3,1)
+h_color_lut:
+    .byte $05,$14,$15,$14,$04,$10,$00,$10,$15,$14,$15,$14,$04,$10,$00,$10
+v_color_lut:
+    .byte $05,$14,$15,$14,$15,$14,$15,$14,$04,$10,$00,$10,$04,$10,$00,$10
 
 ; Step low-byte lookup: (recip & 3) << 6
 step_lo_tbl:
@@ -635,14 +636,10 @@ draw_grid:
     AND #$1F                  ; height
     BNE :+
     INX                       ; sea_flag = 1
-:   LDA edge_color_lut,X     ; packed: h in 4,2,0; v in 5,3,1
-    TAX                       ; save packed in X
-    AND #$15                  ; h_color
+:   LDA h_color_lut,X
     LDY #2
     STA (v_ptr),Y
-    TXA
-    LSR A
-    AND #$15                  ; v_color
+    LDA v_color_lut,X
     LDY #3
     STA (v_ptr),Y
 

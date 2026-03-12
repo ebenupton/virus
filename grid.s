@@ -689,6 +689,11 @@ draw_grid:
     STA chain_state+1,X
     LDA raster_base+1
     STA chain_state+2,X
+    ; Advance chain_state_idx (X = current idx, TXA saves reload)
+    TXA
+    CLC
+    ADC #3
+    STA chain_state_idx
 
     ; Final pixel on last row
     LDA proj_row
@@ -717,12 +722,6 @@ draw_grid:
     INC grid_ptr+1
 :
 @no_v_draw:
-
-    ; Advance chain_state_idx
-    LDA chain_state_idx
-    CLC
-    ADC #3
-    STA chain_state_idx
 
     ; Advance heightmap column
     LDA hmap_col

@@ -657,7 +657,7 @@ draw_grid:
     STA raster_y0
     LDY #3
     LDA (grid_ptr),Y          ; prev v_color
-    PHA                       ; save for draw_line
+    STA saved_color           ; save for draw_line (ZP faster than stack)
 
     ; Chain state: init_base on row 1, restore on row 2+
     LDX chain_state_idx
@@ -676,7 +676,7 @@ draw_grid:
     ; Endpoint = current vertex (raster_x1/y1 cached from v_buf write)
 
     ; Draw
-    PLA                       ; v_color
+    LDA saved_color           ; v_color
     JSR draw_line             ; Y = sub_y
 
     ; Save chain state

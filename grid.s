@@ -533,25 +533,42 @@ draw_grid:
     LDA n_vtx
     STA proj_col
     STZ chain_state_idx
+    BRA @col_loop
+
+    ; --- Uncommon paths (placed before hot loop for branch reach) ---
+@sea_cell:
+    INC saved_color           ; set sea flag (odd LUT index)
+    LDX z_interp_offset
+    BNE @z_interp_go
+    BRA @use_sy_val
+@z_interp_go:
+    JSR z_interp_vertex       ; A = pre-scaled h*8
+    BEQ @use_sy_val           ; zero → sea/flat
+    JMP @do_height_mul
 
 @col_loop:
-    ; --- Height lookup and sy adjustment ---
+    ; --- Height lookup, color precompute, and sy adjustment ---
     LDY hmap_col
     LDA (hmap_ptr),Y
-    STA offset_tmp            ; save full byte for color extraction
-    ; Z-interpolate height if on a boundary row
-    LDX z_interp_offset       ; preserves A = hmap byte
-    BNE @z_interp_path
-    ; Common path: A still = offset_tmp
+    STA offset_tmp            ; save full byte for z_interp_vertex
+    ; Precompute color LUT index: (offset_tmp >> 4) & $0E | sea_flag
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    AND #$0E
+    STA saved_color           ; color base index (even=land, odd=sea)
+    ; Extract height
+    LDA offset_tmp
     AND #$1F                  ; height 0..31
-    BEQ @use_sy_val           ; flat → use row's base sy
+    BEQ @sea_cell             ; flat → set sea flag, check z_interp
+    ; Land cell, height > 0
+    LDX z_interp_offset
+    BNE @z_interp_go          ; boundary row → interpolate
     ASL A
     ASL A
     ASL A                     ; h * 8 (max 248, fits in byte)
-    BRA @do_height_mul
-@z_interp_path:
-    JSR z_interp_vertex       ; X = z_interp_offset, A = pre-scaled h*8
-    BEQ @use_sy_val           ; zero → sea/flat
+    ; Fall through to @do_height_mul
 @do_height_mul:
     ; Inline umul8x8 hi-byte: A * math_b (= recip_val, set by clamp)
     TAX                       ; save A
@@ -642,19 +659,9 @@ draw_grid:
 @no_dirty_upd:
     LDY #1
     STA (v_ptr),Y
-    ; --- Edge colours from LUT ---
-    LDA offset_tmp
-    AND #$E0                  ; keep bits 7-5
-    LSR A
-    LSR A
-    LSR A
-    LSR A                     ; A = (bits7-5) << 1
-    TAX
-    LDA offset_tmp
-    AND #$1F                  ; height
-    BNE :+
-    INX                       ; sea_flag = 1
-:   LDA h_color_lut,X
+    ; --- Edge colours from precomputed index ---
+    LDX saved_color
+    LDA h_color_lut,X
     LDY #2
     STA (v_ptr),Y
     LDA v_color_lut,X

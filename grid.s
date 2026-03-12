@@ -50,6 +50,7 @@ interp_offset_far  = $B8    ; far-row Z interpolation offset (0..64, 64=skip)
 z_interp_offset    = $B9    ; current row's Z offset (0 = no Z interp)
 interp_z_ptr       = $BA    ; 2 bytes — inner row heightmap pointer for Z interp
 prev_hmap_ptr      = $BC    ; 2 bytes — previous row's hmap_ptr (for far row)
+last_row_idx       = $AA    ; n_rows-1, precomputed for V-chain final pixel check
 ; grid_min_sy = $BE declared in grid_zp.inc
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
@@ -193,10 +194,14 @@ draw_grid:
     ; sub_z == $20: omit farthest row
     LDA #(GRID_VTX_Z - 1)
     STA n_rows
+    LDA #(GRID_VTX_Z - 2)
+    STA last_row_idx          ; precompute n_rows-1
     BRA @z_size_done
 @full_z:
     LDA #GRID_VTX_Z
     STA n_rows
+    LDA #(GRID_VTX_Z - 1)
+    STA last_row_idx          ; precompute n_rows-1
 @z_size_done:
 
     ; === Compute interpolation offsets for edge height correction ===
@@ -690,8 +695,7 @@ draw_grid:
 
     ; Final pixel on last row
     LDA proj_row
-    INC A
-    CMP n_rows
+    CMP last_row_idx
     BNE @no_v_final
     LDA raster_x1
     STA raster_x0

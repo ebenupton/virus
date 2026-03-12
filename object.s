@@ -73,6 +73,7 @@ obj_vy_hi:      .res MAX_OBJ_VERTICES   ; view-space Y hi
 obj_vz_lo:      .res MAX_OBJ_VERTICES   ; view-space Z lo
 obj_vz_hi:      .res MAX_OBJ_VERTICES   ; view-space Z hi
 obj_vtx_clip:   .res MAX_OBJ_VERTICES   ; per-vertex 4-bit outcode
+obj_clip_flags: .res 1                   ; object flags byte (bit 7 = skip clip)
 .segment "CODE"
 
 ; ── Bit mask table for edge bit testing ──
@@ -91,7 +92,8 @@ obj_world_pos:
 ; ── Object: Octagonal bipyramid (10 vtx, 24 edges, 16 faces) ──
 ;
 ; New data format:
-;   Header:   n_vertices, n_edges                       (2 bytes)
+;   Header:   n_vertices, n_edges, flags                (3 bytes)
+;             flags bit 7: skip 3D clipping
 ;   Vertices: n_vertices × (x, y, z)                    (signed bytes)
 ;   Edges:    n_edges × (v_from, v_to, color)           (3 bytes each)
 ;   Faces:    n, v_0..v_{n-1}, face_color, eid_0..eid_{n-1} ($FF terminated)
@@ -101,8 +103,8 @@ obj_world_pos:
 ;   e12-e23: chain 1 (lower star + odd base edges)
 
 obj_pyramid:
-    ; Header: n_vertices, n_edges
-    .byte 10, 24
+    ; Header: n_vertices, n_edges, flags
+    .byte 10, 24, $00
 
     ; Vertices (x, y, z) — signed bytes, object-local coords
     .byte   0,  38,   0            ; v0: top apex
@@ -171,16 +173,16 @@ obj_pyramid:
 ; Based on Zarch lander_model_ship, scaled ×35, Y negated.
 
 obj_ship:
-    ; Header: n_vertices, n_edges
-    .byte 6, 9
+    ; Header: n_vertices, n_edges, flags (bit 7 = no clip)
+    .byte 6, 9, $80
 
-    ; Vertices (x, y, z) — signed bytes, 8/3× scale
-    .byte <(-56),   0, <(-48)      ; v0: rear left
-    .byte  56,      0, <(-48)      ; v1: rear right
-    .byte  29,      0,  48         ; v2: front right
-    .byte <(-29),   0,  48         ; v3: front left
-    .byte <(-19),  37, <(-48)      ; v4: left fin top
-    .byte  19,     37, <(-48)      ; v5: right fin top
+    ; Vertices (x, y, z) — signed bytes, halved
+    .byte <(-28),   0, <(-24)      ; v0: rear left
+    .byte  28,      0, <(-24)      ; v1: rear right
+    .byte  14,      0,  24         ; v2: front right
+    .byte <(-14),   0,  24         ; v3: front left
+    .byte <(-10),  18, <(-24)      ; v4: left fin top
+    .byte  10,     18, <(-24)      ; v5: right fin top
 
     ; Edge table: 9 edges × (v_from, v_to, color)
     .byte 0,1,$15                   ; e0:  rear base (white)
@@ -283,6 +285,9 @@ draw_object:
     LDY #0
     LDA (obj_ptr),Y
     STA obj_n_vtx               ; vertex count from header
+    LDY #2
+    LDA (obj_ptr),Y
+    STA obj_clip_flags          ; flags (bit 7 = skip clip)
 
     ; Init bounding box to empty
     LDA #127
@@ -309,12 +314,12 @@ draw_object:
     JMP @proj_done
 
 @proj_vtx:
-    ; Y offset = 2 + vtx_idx * 3
+    ; Y offset = 3 + vtx_idx * 3
     ASL A
     CLC
     ADC vtx_idx
     CLC
-    ADC #2
+    ADC #3
     TAY
 
     ; Load signed local coords
@@ -365,13 +370,11 @@ draw_object:
     JMP @vtx_clamp
 @vz_nz:
 
-    ; recip = urecip15(vz << 2)
+    ; recip = urecip15(vz << 1)
     LDA vcoord_lo
     ASL A
     STA math_b
     LDA vcoord_hi
-    ROL A
-    ASL math_b
     ROL A
     STA math_a
     JSR urecip15
@@ -403,9 +406,11 @@ draw_object:
     LDA vcoord_hi
     STA obj_vx_hi,X
 
-    ; Compute 4-bit outcode (left/right/near/far)
+    ; Compute 4-bit outcode (left/right/near/far) unless no-clip
+    BIT obj_clip_flags          ; bit 7 = skip clip
+    BMI :+
     JSR compute_outcode         ; X preserved, uses obj_vx/vz buffers
-
+:
     ; offset_x = hi16(view_x * recip)
     LDA vcoord_lo             ; vx_lo
     STA math_a
@@ -520,7 +525,7 @@ draw_object:
 @sy_pos:
     LDA vcoord_lo
     CLC
-    ADC #80
+    ADC #16
     BCS @sy_max
     CMP #160
     BCC @sy_st
@@ -530,7 +535,7 @@ draw_object:
 @sy_neg:
     LDA vcoord_lo
     CLC
-    ADC #80
+    ADC #16
     BCS @sy_st                  ; carry → valid
 @sy_zero:
     LDA #0
@@ -569,8 +574,11 @@ draw_object:
 @clamp_vx_st:
     STA obj_vx_hi,X
 
-    ; Compute 4-bit outcode (vx and vz already in buffers)
+    ; Compute 4-bit outcode (vx and vz already in buffers) unless no-clip
+    BIT obj_clip_flags
+    BMI :+
     JSR compute_outcode
+:
 
     ; view_y = obj_view_y - sign_extend(local_y)
     LDX vtx_idx
@@ -620,7 +628,7 @@ draw_object:
     STZ obj_edge_drawn+2
     STZ obj_edge_drawn+3
 
-    ; Compute edge_tab_off = 2 + n_vtx * 3
+    ; Compute edge_tab_off = 3 + n_vtx * 3
     LDY #0
     LDA (obj_ptr),Y             ; n_vertices
     STA obj_n_vtx               ; temp
@@ -628,7 +636,7 @@ draw_object:
     CLC
     ADC obj_n_vtx
     CLC
-    ADC #2
+    ADC #3
     STA edge_tab_off
 
     ; Compute face data offset = edge_tab_off + n_edges * 3

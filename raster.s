@@ -400,9 +400,7 @@ sdr_end_sbc2_norow:
     BCS sdr_end_sbc2_page           ; page cross → share handler
     BRA sdr_end_sbc2_sec            ; no page → restore C=1
 sdr_end_sbc2_row:
-    INC raster_base+1
-    INC raster_base+1                      ; raster_base += 512 (next character row)
-    LDY #0                          ; wrap sub-row
+    JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY #8 match → clear for ADC
     BRA sdr_end_sbc2_norow
 
@@ -426,9 +424,7 @@ sdr_end_fs_page:
     INC raster_base+1
     BRA sdr_end_sbc2_sec
 sdr_end_fs_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
+    JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdr_end_fs_norow
 
@@ -455,10 +451,9 @@ sdr_end_slow_norow:
     TXA                             ; restore error; C=1 from SEC or CPY
     BRA sdr_end_sbc2                ; → second pixel SBC, column advance
 sdr_end_slow_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA sdr_end_slow_norow          ; C=1 from CPY #8 match
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1 for second pixel SBC
+    BRA sdr_end_slow_norow
 
 ; === sdr: shallow, Y-down, X-right — exits in middle ==================
 ; Draws pc-1 pairs via the _end loop, then one trailing left pixel.
@@ -482,9 +477,7 @@ sdr_trail:
     INY
     CPY #8
     BNE sdr_trail_done              ; no row cross → done
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
+    JSR stripe_advance               ; raster_base += 512; Y=0
 sdr_trail_done:
     RTS
 
@@ -564,9 +557,7 @@ sdl_end_sbc2_norow:
     BCS sdl_end_sbc2_nopg           ; C=1 → no borrow (common)
     BRA sdl_end_sbc2_borrow         ; C=0 → borrow (rare)
 sdl_end_sbc2_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
+    JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdl_end_sbc2_norow
 
@@ -615,14 +606,11 @@ sdl_end_slow_norow:
     TXA                             ; C=1 from SEC or CPY
     BRA sdl_end_sbc2
 sdl_end_slow_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA sdl_end_slow_norow          ; C=1 from CPY #8 match
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1 for second pixel SBC
+    BRA sdl_end_slow_norow
 sdl_end_fs_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
+    JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
     BRA sdl_end_fs_norow
 
@@ -647,9 +635,7 @@ sdl_trail:
     INY
     CPY #8
     BNE sdl_trail_done
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
+    JSR stripe_advance               ; raster_base += 512; Y=0
 sdl_trail_done:
     RTS
 
@@ -730,10 +716,8 @@ sur_end_sbc2_norow:
     BCS sur_end_sbc2_page           ; page cross → share handler
     BRA sur_end_sbc2_sec            ; → SEC, DEC, loop
 sur_end_sbc2_row:
-    DEC raster_base+1
-    DEC raster_base+1                      ; raster_base -= 512 (previous character row)
-    LDY #7                          ; wrap sub-row to bottom
-    BRA sur_end_sbc2_norow          ; C=1 preserved through DEC/LDY
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sur_end_sbc2_norow
 
     ; --- Fast-slow: second pixel Y-steps up ---
 sur_end_fastslow:
@@ -754,10 +738,8 @@ sur_end_fs_page:
     INC raster_base+1
     BRA sur_end_sbc2_sec
 sur_end_fs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
-    BRA sur_end_fs_norow            ; C=1 preserved
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sur_end_fs_norow
 
     ; --- Slow: first pixel Y-steps up ---
 sur_end_slow:
@@ -778,10 +760,8 @@ sur_end_slow_norow:
     TXA                             ; C=1 preserved (TXA ≠ carry)
     BRA sur_end_sbc2
 sur_end_slow_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
-    BRA sur_end_slow_norow          ; C=1 preserved
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sur_end_slow_norow
 
 ; === sur: shallow, Y-up, X-right — exits in middle ====================
 
@@ -801,9 +781,7 @@ sur_trail:
     ADC delta_major
     DEY
     BPL sur_trail_done
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
 sur_trail_done:
     RTS
 
@@ -881,10 +859,8 @@ sul_end_sbc2_norow:
     BCS sul_end_sbc2_nopg           ; C=1 → no borrow (common)
     BRA sul_end_sbc2_borrow         ; C=0 → borrow (rare)
 sul_end_sbc2_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
-    BRA sul_end_sbc2_norow          ; C=1 preserved
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sul_end_sbc2_norow
 
     ; --- Fast-slow: second pixel Y-steps up ---
 sul_end_fastslow:
@@ -909,10 +885,8 @@ sul_end_fs_borrow:
     SEC
     BRA sul_end_fs_nopg
 sul_end_fs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
-    BRA sul_end_fs_norow            ; C=1 preserved
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sul_end_fs_norow
 
     ; --- Slow: first pixel Y-steps up ---
 sul_end_slow:
@@ -932,10 +906,8 @@ sul_end_slow_norow:
     TXA                             ; C=1 preserved
     BRA sul_end_sbc2
 sul_end_slow_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
-    BRA sul_end_slow_norow          ; C=1 preserved
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
+    BRA sul_end_slow_norow
 
 ; === sul: shallow, Y-up, X-left — exits in middle =====================
 
@@ -955,9 +927,7 @@ sul_trail:
     ADC delta_major
     DEY
     BPL sul_trail_done
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
 sul_trail_done:
     RTS
 
@@ -1012,10 +982,9 @@ tdr_l_norow:
     BNE tdr_l_px
     RTS
 tdr_l_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA tdr_l_norow                 ; C=1 from CPY #8 match
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1
+    BRA tdr_l_norow
 
 tdr_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out (always)
@@ -1043,10 +1012,9 @@ tdr_r_norow:
     BNE tdr_r_px
     RTS
 tdr_r_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA tdr_r_norow                 ; C=1 from CPY
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1
+    BRA tdr_r_norow
 
 tdr_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1083,10 +1051,9 @@ tdl_r_norow:
     BNE tdl_r_px
     RTS
 tdl_r_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA tdl_r_norow                 ; C=1 from CPY
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1
+    BRA tdl_r_norow
 
 tdl_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1114,10 +1081,9 @@ tdl_l_norow:
     BNE tdl_l_px
     RTS
 tdl_l_row:
-    INC raster_base+1
-    INC raster_base+1
-    LDY #0
-    BRA tdl_l_norow                 ; C=1 from CPY
+    JSR stripe_advance               ; raster_base += 512; Y=0
+    SEC                             ; restore C=1
+    BRA tdl_l_norow
 
 tdl_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1154,9 +1120,7 @@ tur_l_norow:
     BNE tur_l_px
     RTS
 tur_l_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tur_l_norow
 
 tur_l_xstep:
@@ -1170,9 +1134,7 @@ tur_l_xs_norow:
     BNE tur_r_px                    ; → right-pixel phase
     RTS
 tur_l_xs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tur_l_xs_norow
 
 tur_r:
@@ -1193,9 +1155,7 @@ tur_r_norow:
     BNE tur_r_px
     RTS
 tur_r_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tur_r_norow
 
 tur_r_xstep:
@@ -1216,9 +1176,7 @@ tur_r_xs_norow:
     BNE tur_l_px                    ; → left-pixel phase
     RTS
 tur_r_xs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tur_r_xs_norow
 tur_r_xs_page:
     INC raster_base+1                      ; C=1 preserved (INC ≠ carry)
@@ -1245,9 +1203,7 @@ tul_r_norow:
     BNE tul_r_px
     RTS
 tul_r_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tul_r_norow
 
 tul_r_xstep:
@@ -1261,9 +1217,7 @@ tul_r_xs_norow:
     BNE tul_l_px                    ; → left-pixel phase
     RTS
 tul_r_xs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tul_r_xs_norow
 
 tul_l:
@@ -1284,9 +1238,7 @@ tul_l_norow:
     BNE tul_l_px
     RTS
 tul_l_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tul_l_norow
 
 tul_l_xstep:
@@ -1306,9 +1258,7 @@ tul_l_xs_norow:
     BNE tul_r_px                    ; → right-pixel phase
     RTS
 tul_l_xs_row:
-    DEC raster_base+1
-    DEC raster_base+1
-    LDY #7
+    JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
     BRA tul_l_xs_norow
 tul_l_xs_borrow:
     DEC raster_base+1
@@ -1367,9 +1317,65 @@ init_base:
     TXA
     ADC raster_page                 ; char_row*2 + raster_page + C
     STA raster_base+1                      ; no overflow possible: max $58+38+1=$7F
+;    CMP #$58
+;    BCC @ib_skip
+;    CMP #$5A
+;    BCS @ib_skip
+;    ORA #$80                        ; $58 or $59 → redirect to ROM
+;    STA raster_base+1
+;@ib_skip:
 
     ; Sub-row → Y (reloading raster_y0 is cheaper than saving/restoring)
     LDA raster_y0
     AND #$07
     TAY
+    RTS
+
+; =====================================================================
+; stripe_advance — Row-cross advance with buf0 overflow protection
+;
+; Advances raster_base by 512 (next char row), sets Y=0.
+; If buf0 overflows into buf1 ($58/$59), redirects to ROM via ORA #$80.
+; Carry on exit: undefined.
+;
+stripe_advance:
+    LDY #0
+    INC raster_base+1
+    INC raster_base+1
+;    BPL @check                      ; N clear → check for overflow
+;    RTS                             ; bit 7 set → already redirected to ROM
+;@check:
+;    LDA raster_base+1
+;    CMP #$58
+;    BCC @done                       ; < $58 → on screen
+;    CMP #$5A
+;    BCS @done                       ; >= $5A → valid buf1 page
+;    ORA #$80                        ; $58 or $59 → redirect to ROM
+;    STA raster_base+1
+;@done:
+    RTS
+
+; =====================================================================
+; stripe_retreat — Row-cross retreat with buf0 overflow un-redirect
+;
+; Retreats raster_base by 512 (previous char row), sets Y=7.
+; If a redirected buf0 address ($D8/$D9) comes back to $56/$57,
+; unmasks it (AND #$7F) to restore valid screen address.
+; Carry on exit: C=1 (all paths).
+;
+stripe_retreat:
+    LDY #7
+    DEC raster_base+1
+    DEC raster_base+1
+;    BPL @done                       ; N clear → on screen (carry preserved)
+;    LDA raster_base+1
+;    AND #$7F                        ; unmask in A (AND doesn't affect carry)
+;    CMP #$56
+;    BCC @restore_c                  ; unmasked < $56 → not buf0 redirect
+;    CMP #$58
+;    BCS @restore_c                  ; unmasked >= $58 → still past buf0 boundary
+;    STA raster_base+1               ; unmasked $56 or $57 → back on screen
+;@restore_c:
+    SEC                             ; restore C=1
+;@done:
     RTS

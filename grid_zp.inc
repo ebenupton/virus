@@ -24,7 +24,7 @@ HALF_GRID_X     = (GRID_COLS - 1) * $20   ; X half-extent in 8.8
 HALF_GRID_X_LO  = HALF_GRID_X & $FF       ; low byte
 HALF_GRID_X_HI  = HALF_GRID_X >> 8        ; high byte
 HALF_GRID_Z     = (GRID_ROWS - 1) * $20   ; Z half-extent in 8.8
-Z_GRID_CENTER   = $0240          ; must match CAM_Z_BEHIND in game.s
+Z_GRID_CENTER   = $0280          ; CAM_Z_BEHIND + $40 (grid pushed out one cell)
 Z_NEAR_BOUND    = Z_GRID_CENTER - HALF_GRID_Z
 Z_FAR_BOUND     = Z_GRID_CENTER + HALF_GRID_Z
 

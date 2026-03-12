@@ -92,7 +92,7 @@ step_lo_tbl:
 ; Grid: GRID_COLS × GRID_ROWS cells, 0.25-unit spacing, centred on camera.
 ; Camera: (cam_x, -1.5, cam_z) — cam_y constant, no yaw.
 ; Projection: vx = 64·x_cam/z_cam, vy = 64·y_cam/z_cam,
-;             screen centre (64, 80).
+;             screen centre (64, 16).
 ;
 ; Per-row: one urecip15 call gives recip ≈ 64/z_cam.
 ; sy_val = base sy from camera height (constant per row).
@@ -104,29 +104,29 @@ draw_grid:
     STA grid_min_sy
 
     ; === Compute z_cam for row 0 ===
-    ; z_cam = CAM_Z_BEHIND - HALF_ROWS*$40 - sub_z (from cam position)
+    ; z_cam = CAM_Z_BEHIND - (HALF_ROWS-1)*$40 - sub_z (pushed out one cell)
     LDA cam_z_lo
     AND #$3F                  ; sub_z (0..63)
     CMP #$20
     BCS @z_wrap
-    ; sub_z < $20: z_cam = (CAM_Z_BEHIND - HALF_ROWS*$40) - sub_z
-    STA offset_tmp
-    SEC
-    LDA #<(CAM_Z_BEHIND - HALF_ROWS * $40)
-    SBC offset_tmp
-    STA z_cam_lo
-    LDA #>(CAM_Z_BEHIND - HALF_ROWS * $40)
-    SBC #0
-    STA z_cam_hi
-    BRA @z_done
-@z_wrap:
-    ; sub_z >= $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-1)*$40) - sub_z
+    ; sub_z < $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-1)*$40) - sub_z
     STA offset_tmp
     SEC
     LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
     SBC offset_tmp
     STA z_cam_lo
     LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
+    SBC #0
+    STA z_cam_hi
+    BRA @z_done
+@z_wrap:
+    ; sub_z >= $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-2)*$40) - sub_z
+    STA offset_tmp
+    SEC
+    LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 2) * $40)
+    SBC offset_tmp
+    STA z_cam_lo
+    LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 2) * $40)
     SBC #0
     STA z_cam_hi
 @z_done:
@@ -157,7 +157,7 @@ draw_grid:
     JSR ship_hmap_col         ; A = ship_z hmap row (0..31)
     PHA                       ; save for terrain lookup
     SEC
-    SBC #HALF_ROWS
+    SBC #(HALF_ROWS - 1)
     STA base_z
     LDA grid_ptr+1            ; sub_z
     CMP #$20
@@ -258,20 +258,20 @@ draw_grid:
 @z_interp_done:
 
     ; === Compute clamp_near_sy from constant Z_NEAR_BOUND ===
-    ; recip = 65536 / (Z_NEAR_BOUND * 4), compile-time constant
-    RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 4)
+    ; recip = 65536 / (Z_NEAR_BOUND * 2), compile-time constant
+    RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 2)
     LDA #RECIP_NEAR
     JSR mul_cam_y             ; A = recip * cam_y
     CLC
-    ADC #80
+    ADC #16
     STA clamp_near_sy
 
     ; === Compute clamp_far_sy (far boundary screen-y) ===
-    RECIP_FAR = 65536 / (Z_FAR_BOUND * 4)
+    RECIP_FAR = 65536 / (Z_FAR_BOUND * 2)
     LDA #RECIP_FAR
     JSR mul_cam_y             ; A = recip * cam_y
     CLC
-    ADC #80                   ; sy (can't overflow for far boundary)
+    ADC #16                   ; sy (can't overflow for far boundary)
     STA clamp_far_sy
 
     ; === Row loop: j = 0..GRID_VTX_Z-1 ===
@@ -320,13 +320,11 @@ draw_grid:
     STA z_cam_hi
 @no_z_adj:
 
-    ; --- Reciprocal: recip = urecip15(z_cam << 2) ≈ 64/z_cam ---
+    ; --- Reciprocal: recip = urecip15(z_cam << 1) ≈ 128/z_cam ---
     LDA z_cam_lo
     ASL A
     STA math_b
     LDA z_cam_hi
-    ROL A
-    ASL math_b
     ROL A
     STA math_a
     JSR urecip15
@@ -337,7 +335,7 @@ draw_grid:
     JSR mul_cam_y             ; A = recip * cam_y
     BCS @sy_near_clamp        ; overflow → exceeds near clamp
     CLC
-    ADC #80
+    ADC #16
     BCS @sy_near_clamp        ; overflow → exceeds near clamp
     CMP clamp_near_sy
     BCC @check_far_sy
@@ -538,6 +536,13 @@ draw_grid:
 @z_interp_go:
     JSR z_interp_vertex       ; A = pre-scaled h*8
     BEQ @use_sy_val           ; zero → sea/flat
+    ; Save Z-interpolated height in offset_tmp for edge interp corners
+    TAX
+    LSR A
+    LSR A
+    LSR A                     ; h (0..31)
+    STA offset_tmp
+    TXA
     JMP @do_height_mul
 
 @col_loop:
@@ -1013,10 +1018,12 @@ mul_cam_y:
 ; =====================================================================
 ; lut_lookup — Look up interpolation LUT value
 ; =====================================================================
-; Input:  A = diff (1..4), seg_count = offset (0..63)
-; Output: A = LUT value
+; Input:  A = diff (1..31), seg_count = offset (0..63)
+; Output: A = LUT value (pre-scaled delta)
 
 lut_lookup:
+    CMP #5
+    BCS @ll_big               ; diff > 4 → multiply path
     DEC A                     ; diff - 1 (0..3)
     STA chain_idx
     LDA seg_count
@@ -1025,6 +1032,27 @@ lut_lookup:
     ORA chain_idx             ; + (diff-1)
     TAX
     LDA interp_lut,X
+    RTS
+@ll_big:
+    ; diff > 4: compute diff * offset / 8 via repeated addition
+    TAX                       ; X = diff (loop counter)
+    LDA #0
+    STA chain_idx             ; hi byte of accumulator
+@ll_add:
+    CLC
+    ADC seg_count
+    BCC @ll_nc
+    INC chain_idx
+@ll_nc:
+    DEX
+    BNE @ll_add
+    ; chain_idx:A = diff * offset; shift right 3
+    LSR chain_idx
+    ROR A
+    LSR chain_idx
+    ROR A
+    LSR chain_idx
+    ROR A
     RTS
 
 ; =====================================================================

@@ -544,8 +544,7 @@ draw_grid:
     BEQ @no_z_interp
     JSR z_interp_vertex       ; A = pre-scaled h*8 (0..248)
     BEQ @use_sy_val           ; zero → sea/flat
-    STA math_a                ; already pre-scaled, skip ×8
-    BRA @do_height_mul
+    BRA @do_height_mul        ; already pre-scaled, skip ×8
 @no_z_interp:
     LDA offset_tmp
     AND #$1F                  ; height 0..31
@@ -555,13 +554,38 @@ draw_grid:
     ASL A
     ASL A
     ASL A                     ; h * 8 (max 248, fits in byte)
-    STA math_a
 @do_height_mul:
-    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
-    ; sy_vertex = sy_val - Δsy, clamp to 0
-    LDA sy_val
+    ; Inline umul8x8 hi-byte: A * math_b (= recip_val, set by clamp)
+    TAX                       ; save A
     SEC
-    SBC math_res_hi
+    SBC math_b
+    BCS @hm_dp
+    EOR #$FF
+    INC A
+@hm_dp:
+    TAY                       ; Y = |A - math_b|
+    TXA                       ; restore A
+    CLC
+    ADC math_b
+    TAX                       ; X = (A + math_b) & $FF
+    BCS @hm_so
+    SEC
+    LDA sqr_lo,X
+    SBC sqr_lo,Y
+    LDA sqr_hi,X
+    SBC sqr_hi,Y
+    BRA @hm_end
+@hm_so:
+    SEC
+    LDA sqr2_lo,X
+    SBC sqr_lo,Y
+    LDA sqr2_hi,X
+    SBC sqr_hi,Y
+@hm_end:
+    ; A = hi(h*8 * recip_val); sy = sy_val - A, clamp ≥ 0
+    EOR #$FF
+    SEC
+    ADC sy_val
     BCS @sy_store
     LDA #0
     BRA @sy_store

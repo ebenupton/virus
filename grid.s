@@ -614,15 +614,14 @@ draw_grid:
     ; A = final sx for this vertex
     STA raster_x1             ; cache for V-chain endpoint
     ; Store (sx, sy, h_color, v_color) to v_buf
-    LDY #0
-    STA (v_ptr),Y
-    INY
+    STA (v_ptr)               ; sx at offset 0 (65C02 zp indirect)
     LDA offset_tmp+1          ; final sy for this vertex
     STA raster_y1             ; cache for V-chain endpoint
     CMP grid_min_sy
     BCS @no_dirty_upd
     STA grid_min_sy
 @no_dirty_upd:
+    LDY #1
     STA (v_ptr),Y
     ; --- Edge colours from LUT ---
     LDA offset_tmp
@@ -654,10 +653,9 @@ draw_grid:
     ; grid_ptr already points to prev row vertex (init at row start)
 
     ; Start point = previous row vertex
-    LDY #0
-    LDA (grid_ptr),Y          ; prev sx
+    LDA (grid_ptr)            ; prev sx (65C02 zp indirect)
     STA raster_x0
-    INY
+    LDY #1
     LDA (grid_ptr),Y          ; prev sy
     STA raster_y0
     LDY #3
@@ -861,10 +859,9 @@ draw_grid:
 ; Input:  grid_ptr = row start, seg_count = segments (n_vtx - 1)
 
 draw_h_row:
-    LDY #0
-    LDA (grid_ptr),Y          ; sx
+    LDA (grid_ptr)            ; sx (65C02 zp indirect)
     STA raster_x0
-    INY
+    LDY #1
     LDA (grid_ptr),Y          ; sy
     STA raster_y0
     JSR init_base             ; Y = sub_y
@@ -880,10 +877,9 @@ draw_h_row:
     STA grid_ptr
     BCC :+
     INC grid_ptr+1
-:   LDY #0
-    LDA (grid_ptr),Y          ; endpoint sx
+:   LDA (grid_ptr)            ; endpoint sx (65C02 zp indirect)
     STA raster_x1
-    INY
+    LDY #1
     LDA (grid_ptr),Y          ; endpoint sy
     STA raster_y1
     LDY saved_y

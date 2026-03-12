@@ -355,11 +355,13 @@ draw_grid:
     LSR A
     LSR A                     ; step_hi = recip >> 2
     STA step_hi
+    STA @run_add_hi + 1      ; SMC: embed step_hi as immediate
     LDA recip_val
     AND #$03
     TAX
     LDA step_lo_tbl,X        ; (recip & 3) << 6
     STA step_lo
+    STA @run_add_lo + 1      ; SMC: embed step_lo as immediate
 
     ; --- sx_running = $4000 - 5*step ---
     ; 5*step = 5*recip*64 = recip*320 = recip*256 + recip*64 = recip*256 + step
@@ -737,13 +739,15 @@ draw_grid:
     INC v_ptr+1
 @no_vpc:
 
-    ; sx_running += step
+    ; sx_running += step (SMC: immediate operands)
     LDA run_lo
     CLC
-    ADC step_lo
+@run_add_lo:
+    ADC #$00                  ; SMC'd to step_lo
     STA run_lo
     LDA run_hi
-    ADC step_hi
+@run_add_hi:
+    ADC #$00                  ; SMC'd to step_hi
     STA run_hi
 
     DEC proj_col

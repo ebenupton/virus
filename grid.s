@@ -1086,8 +1086,7 @@ z_interp_vertex:
     STA chain_idx
     LDA offset_tmp
     AND #$1F                  ; h_outer_z
-    JSR lerp_height            ; A = pre-scaled (0..248)
-    RTS
+    JMP lerp_height            ; tail call — A = pre-scaled (0..248)
 
 ; =====================================================================
 ; interp_height — Interpolate height between outer and inner cell

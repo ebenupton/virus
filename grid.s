@@ -63,11 +63,11 @@ chain_state:  .res GRID_VTX_X * 3              ; v-chain state per column
 v_row_offset_lo:
     .byte <(0*ROW_STRIDE), <(1*ROW_STRIDE), <(2*ROW_STRIDE)
     .byte <(3*ROW_STRIDE), <(4*ROW_STRIDE), <(5*ROW_STRIDE)
-    .byte <(6*ROW_STRIDE), <(7*ROW_STRIDE), <(8*ROW_STRIDE)
+    .byte <(6*ROW_STRIDE)
 v_row_offset_hi:
     .byte >(0*ROW_STRIDE), >(1*ROW_STRIDE), >(2*ROW_STRIDE)
     .byte >(3*ROW_STRIDE), >(4*ROW_STRIDE), >(5*ROW_STRIDE)
-    .byte >(6*ROW_STRIDE), >(7*ROW_STRIDE), >(8*ROW_STRIDE)
+    .byte >(6*ROW_STRIDE)
 
 ; ── Colour unpack table: 3-bit packed → MODE 2 right-pixel (bits 4,2,0) ──
 ; 0=black, 1=red, 2=green, 3=yellow, 4=blue, 5=magenta, 6=cyan, 7=white
@@ -363,27 +363,21 @@ draw_grid:
     STA step_lo
     STA @run_add_lo + 1      ; SMC: embed step_lo as immediate
 
-    ; --- sx_running = $4000 - 5*step ---
-    ; 5*step = 5*recip*64 = recip*320 = recip*256 + recip*64 = recip*256 + step
-    LDA #$00
-    SEC
-    SBC step_lo
-    STA run_lo
+    ; --- sx_running = $4000 - 4*step ---
+    ; 4*step = 4*recip*64 = recip*256 → hi byte only, lo cancels
+    STZ run_lo
     LDA #$40
-    SBC step_hi               ; - step_hi - borrow_lo
-    SBC recip_val              ; - recip (= -256*recip in hi byte)
+    SEC
+    SBC recip_val
     STA run_hi
     ; --- Compute edge clamps ---
-    ; offset = HALF_GRID_X * recip / 256
+    ; offset = HALF_GRID_X * recip / 256 = hi($E0 * recip)
     LDA #HALF_GRID_X_LO
     STA math_a
     LDA recip_val
     STA math_b
     JSR umul8x8
-    LDA math_res_hi           ; hi($20 * recip), max 31
-    CLC
-    ADC recip_val             ; offset = recip + hi part (9-bit, max 286)
-    BCS @clamp_full           ; carry → offset >= 256, full screen visible
+    LDA math_res_hi           ; hi($E0 * recip)
     STA offset_tmp
 
     ; clamp_right = min(127, 64 + offset)
@@ -405,14 +399,6 @@ draw_grid:
     LDA #0
 @cl_ok:
     STA clamp_left
-    BRA @clamp_done
-
-@clamp_full:
-    ; Offset >= 256: entire screen within grid
-    LDA #127
-    STA clamp_right
-    STZ clamp_left
-@clamp_done:
 
     ; --- sub_x offset: adjust run for fractional camera position ---
     LDA cam_x_lo

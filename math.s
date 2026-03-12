@@ -135,22 +135,22 @@ smul8x8:
     CLC
     ADC math_b
     TAX
-    BCS @sum_overflow
+    BCC @no_overflow
 
-    SEC
-    LDA sqr_lo,X
-    SBC sqr_lo,Y
-    STA math_res_lo
-    LDA sqr_hi,X
-    SBC sqr_hi,Y
-    BRA @sign_correct
-
-@sum_overflow:
     SEC
     LDA sqr2_lo,X
     SBC sqr_lo,Y
     STA math_res_lo
     LDA sqr2_hi,X
+    SBC sqr_hi,Y
+    BRA @sign_correct
+
+@no_overflow:
+    SEC
+    LDA sqr_lo,X
+    SBC sqr_lo,Y
+    STA math_res_lo
+    LDA sqr_hi,X
     SBC sqr_hi,Y
 
 @sign_correct:

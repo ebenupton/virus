@@ -595,8 +595,8 @@ draw_object:
     LDA clip_has_isect          ; face_color from $8F
     STA face_color_val          ; → $8B
 
-    ; ── Draw all edges (clipping disabled) ──
-    JMP @all_inside
+    ; ── Draw all edges (face_color always non-zero) ──
+    BNE @all_inside
 
 @skip_face:
     ; Back-facing: clean stack and advance past edge IDs

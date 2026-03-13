@@ -13,7 +13,7 @@
  *   $FE43 write: System VIA DDRA (absorbed, no effect)
  *   $FE4D read:  bit 1 = vsync flag; write: clear flagged bits
  *   $FE32 write: Dump call-stack profile to stderr and reset counters
- *   $FE4F read:  System VIA ORA — key scan (bit 7: 0=pressed, 1=not pressed)
+ *   $FE4F read:  System VIA ORA — key scan (bit 7: 1=pressed, 0=not pressed)
  *   $FE4F write: System VIA ORA — latch scan code
  *   $FFEE/$FFF4: RTS stubs (OSWRCH/OSBYTE)
  *
@@ -144,7 +144,7 @@ static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
         if (scan == 0x46) pressed = (key_state & 0x10);  /* K */
         if (scan == 0x65) pressed = (key_state & 0x20);  /* M */
         if (scan == 0x56) pressed = (key_state & 0x40);  /* L */
-        return pressed ? (via_ora & 0x7F) : (via_ora | 0x80);
+        return pressed ? (via_ora | 0x80) : (via_ora & 0x7F);
     }
 
     /* OSWRCH stub: RTS ($60) */

@@ -73,16 +73,18 @@ delta_val       = $61       ; interpolation delta (used by urecip15)
 umul8x8:
     ; -- Compute |a - b| --
     LDA math_a
+    TAX                     ; cache math_a in X
     SEC
     SBC math_b
     BCS @u_diff_pos
     EOR #$FF
-    INC A
+    CLC
+    ADC #1
 @u_diff_pos:
     TAY                     ; Y = |a - b|
 
     ; -- Compute (a + b) mod 256 --
-    LDA math_a
+    TXA                     ; restore math_a from X (1 cycle faster than LDA zp)
     CLC
     ADC math_b
     TAX
@@ -122,16 +124,18 @@ umul8x8:
 smul8x8:
     ; -- Compute |a - b| --
     LDA math_a
+    TAX                     ; cache math_a in X
     SEC
     SBC math_b
     BCS @diff_pos
     EOR #$FF
-    INC A
+    CLC
+    ADC #1
 @diff_pos:
     TAY
 
     ; -- Compute (a + b) mod 256 --
-    LDA math_a
+    TXA                     ; restore math_a from X (1 cycle faster than LDA zp)
     CLC
     ADC math_b
     TAX
@@ -143,7 +147,7 @@ smul8x8:
     STA math_res_lo
     LDA sqr2_hi,X
     SBC sqr_hi,Y
-    BRA @sign_correct
+    JMP @sign_correct
 
 @no_overflow:
     SEC
@@ -236,8 +240,9 @@ urecip15:
     ASL A
     BPL @norm_lo            ; loop until bit 7 set
 @lo_norm_done:
-    STZ math_b              ; no lower bits (8-bit z fully captured in m)
-    BRA @norm_done
+    LDY #0
+    STY math_b              ; no lower bits (8-bit z fully captured in m)
+    JMP @norm_done
 
 @hi_nonzero:
     ; z_hi in [1, 127]: shift z_hi:z_lo left until bit 7 of z_hi set
@@ -261,7 +266,8 @@ urecip15:
     BNE @m128_not_pow2
 
     ; -- Power-of-2: result = 65536 >> k = $8000 >> (k-1) --
-    STZ math_res_lo
+    LDA #0
+    STA math_res_lo
     LDA #$80
     STA math_res_hi
     DEX                     ; k-1 right shifts
@@ -301,7 +307,8 @@ urecip15:
     SBC delta_val
     BCS @l_diff_pos
     EOR #$FF
-    INC A
+    CLC
+    ADC #1
 @l_diff_pos:
     TAX                     ; X = |f - D|
 
@@ -318,7 +325,7 @@ urecip15:
     SBC sqr_lo,X
     LDA sqr_hi,Y
     SBC sqr_hi,X
-    BRA @l_sub_corr
+    JMP @l_sub_corr
 
 @l_sum_ovf:
     ; Overflow: corr_hi from sqr2 tables
@@ -381,7 +388,8 @@ urecip15:
     LSR A
 @l_s8_store:
     STA math_res_lo
-    STZ math_res_hi
+    LDA #0
+    STA math_res_hi
     RTS
 
 @l_shift_loop:
@@ -412,5 +420,6 @@ urecip15:
     ROL math_res_hi
     LDA math_res_hi
     STA math_res_lo
-    STZ math_res_hi
+    LDA #0
+    STA math_res_hi
     RTS

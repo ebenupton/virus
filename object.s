@@ -262,25 +262,15 @@ draw_object:
     ; ── Phase 1: Transform & project vertices ──
     ; Precompute sin/cos for Y-axis rotation
     LDX obj_rot_angle
-    LDA sin_table,X
+    JSR sincos
     STA sin_val
-    TXA
-    CLC
-    ADC #64
-    TAX
-    LDA sin_table,X
-    STA cos_val
+    STX cos_val
 
     ; Precompute sin/cos for X-axis roll
     LDX obj_roll_angle
-    LDA sin_table,X
+    JSR sincos
     STA roll_sin
-    TXA
-    CLC
-    ADC #64
-    TAX
-    LDA sin_table,X
-    STA roll_cos
+    STX roll_cos
 
     LDY #0
     LDA (obj_ptr),Y
@@ -292,10 +282,12 @@ draw_object:
     ; Init bounding box to empty
     LDA #127
     STA obj_bb_min_sx
-    STZ obj_bb_max_sx
+    LDA #0
+    STA obj_bb_max_sx
     LDA #160
     STA obj_bb_min_sy
-    STZ obj_bb_max_sy
+    LDA #0
+    STA obj_bb_max_sy
 
     ; Clear per-vertex outcode array
     LDX #MAX_OBJ_VERTICES-1
@@ -305,7 +297,8 @@ draw_object:
     DEX
     BPL @clear_clip
 
-    STZ vtx_idx              ; vtx_idx = 0
+    LDA #0
+    STA vtx_idx              ; vtx_idx = 0
 
 @proj_loop:
     LDA vtx_idx
@@ -315,10 +308,8 @@ draw_object:
 
 @proj_vtx:
     ; Y offset = 3 + vtx_idx * 3
-    ASL A
-    CLC
-    ADC vtx_idx
-    CLC
+    ASL A                       ; vtx_idx*2, C=0 (vtx_idx<128)
+    ADC vtx_idx             ; vtx_idx*3, max 69, C=0
     ADC #3
     TAY
 
@@ -337,22 +328,9 @@ draw_object:
     JSR rotate_y                ; yaw: transforms local_x and local_z in-place
 
     ; -- view_z = obj_view_z + sign_extend(local_z) --
+    LDX #obj_view_z
     LDA local_z
-    BPL @lz_pos
-    CLC
-    ADC obj_view_z
-    STA vcoord_lo
-    LDA obj_view_z+1
-    ADC #$FF
-    BRA @vz_hi
-@lz_pos:
-    CLC
-    ADC obj_view_z
-    STA vcoord_lo
-    LDA obj_view_z+1
-    ADC #0
-@vz_hi:
-    STA vcoord_hi
+    JSR sign_ext_add
 
     ; Store view_z in buffers
     LDX vtx_idx
@@ -379,25 +357,12 @@ draw_object:
     STA math_a
     JSR urecip15
     LDA math_res_lo
-    STA recip
+    STA clip_n
 
     ; -- view_x = obj_view_x + sign_extend(local_x) --
+    LDX #obj_view_x
     LDA local_x
-    BPL @lx_pos
-    CLC
-    ADC obj_view_x
-    STA vcoord_lo
-    LDA obj_view_x+1
-    ADC #$FF
-    BRA @vx_hi
-@lx_pos:
-    CLC
-    ADC obj_view_x
-    STA vcoord_lo
-    LDA obj_view_x+1
-    ADC #0
-@vx_hi:
-    STA vcoord_hi
+    JSR sign_ext_add
 
     ; Store view_x
     LDX vtx_idx
@@ -412,77 +377,22 @@ draw_object:
     JSR compute_outcode         ; X preserved, uses obj_vx/vz buffers
 :
     ; offset_x = hi16(view_x * recip)
-    LDA vcoord_lo             ; vx_lo
-    STA math_a
-    LDA recip
-    STA math_b
-    JSR umul8x8
-    LDA math_res_hi
-    PHA                         ; save hi(vx_lo * recip)
-
-    LDA vcoord_hi             ; vx_hi (signed)
-    STA math_a
-    LDA recip
-    STA math_b
-    JSR smul8x8
-    STA vcoord_hi             ; offset_hi = smul_res_hi
-    PLA
-    CLC
-    ADC math_res_lo             ; + lo(smul)
-    STA vcoord_lo             ; offset_lo
-    BCC @no_cx
-    INC vcoord_hi
-@no_cx:
-
+    LDA vcoord_lo
+    LDX vcoord_hi
+    JSR project_coord
     ; sx = clamp(64 + offset, 0, 127)
-    LDA vcoord_hi             ; offset_hi
-    BEQ @sx_pos
-    CMP #$FF
-    BEQ @sx_neg
-    BMI @sx_zero                ; way off screen left
-    LDA #127
-    BRA @sx_st
-@sx_pos:
-    LDA vcoord_lo
-    CLC
-    ADC #64
-    BCS @sx_max                 ; wrapped > 255
-    CMP #128
-    BCC @sx_st                  ; 0..127 valid
-@sx_max:
-    LDA #127
-    BRA @sx_st
-@sx_neg:
-    LDA vcoord_lo
-    CLC
-    ADC #64
-    BCS @sx_st                  ; carry → valid 0..63
-@sx_zero:
-    LDA #0
-@sx_st:
+    LDA #64
+    LDX #127
+    JSR clamp_add
     LDX vtx_idx
     STA obj_proj_sx,X
-    CMP obj_bb_min_sx
-    BCS :+
-    STA obj_bb_min_sx
-:   CMP obj_bb_max_sx
-    BCC :+
-    STA obj_bb_max_sx
-:
+    LDX #0
+    JSR update_bb
+
     ; -- view_y = obj_view_y - sign_extend(local_y) --
-    LDA obj_view_y
-    SEC
-    SBC local_y
-    STA vcoord_lo
-    LDA obj_view_y+1
-    LDX local_y
-    BPL @ly_pos
-    SBC #$FF
-    BRA @vy_hi
-@ly_pos:
-    SBC #0
-@vy_hi:
-    STA vcoord_hi
+    LDX #obj_view_y
+    LDA local_y
+    JSR sign_ext_sub
 
     ; Store view_y in buffers
     LDX vtx_idx
@@ -492,86 +402,32 @@ draw_object:
     STA obj_vy_hi,X
 
     ; offset_y = hi16(view_y * recip)
-    LDA vcoord_lo             ; vy_lo
-    STA math_a
-    LDA recip
-    STA math_b
-    JSR umul8x8
-    LDA math_res_hi
-    PHA
-
-    LDA vcoord_hi             ; vy_hi (signed)
-    STA math_a
-    LDA recip
-    STA math_b
-    JSR smul8x8
-    STA vcoord_hi             ; offset_hi
-    PLA
-    CLC
-    ADC math_res_lo
-    STA vcoord_lo             ; offset_lo
-    BCC @no_cy
-    INC vcoord_hi
-@no_cy:
-
-    ; sy = clamp(80 + offset, 0, 159)
-    LDA vcoord_hi
-    BEQ @sy_pos
-    CMP #$FF
-    BEQ @sy_neg
-    BMI @sy_zero
-    LDA #159
-    BRA @sy_st
-@sy_pos:
     LDA vcoord_lo
-    CLC
-    ADC #16
-    BCS @sy_max
-    CMP #160
-    BCC @sy_st
-@sy_max:
-    LDA #159
-    BRA @sy_st
-@sy_neg:
-    LDA vcoord_lo
-    CLC
-    ADC #16
-    BCS @sy_st                  ; carry → valid
-@sy_zero:
-    LDA #0
-@sy_st:
+    LDX vcoord_hi
+    JSR project_coord
+    ; sy = clamp(16 + offset, 0, 159)
+    LDA #16
+    LDX #159
+    JSR clamp_add
     LDX vtx_idx
     STA obj_proj_sy,X
-    CMP obj_bb_min_sy
-    BCS :+
-    STA obj_bb_min_sy
-:   CMP obj_bb_max_sy
-    BCC :+
-    STA obj_bb_max_sy
-:
+    LDX #2
+    JSR update_bb
+
     INC vtx_idx
     JMP @proj_loop
 
 @vtx_clamp:
     ; Vertex behind camera: store view-space coords, clamp screen position
-    LDX vtx_idx
 
     ; view_x = obj_view_x + sign_extend(local_x)
+    LDX #obj_view_x
     LDA local_x
-    BPL @clamp_lx_pos
-    CLC
-    ADC obj_view_x
+    JSR sign_ext_add
+    LDX vtx_idx
+    LDA vcoord_lo
     STA obj_vx_lo,X
-    LDA obj_view_x+1
-    ADC #$FF
-    BRA @clamp_vx_st
-@clamp_lx_pos:
-    CLC
-    ADC obj_view_x
-    STA obj_vx_lo,X
-    LDA obj_view_x+1
-    ADC #0
-@clamp_vx_st:
+    LDA vcoord_hi
     STA obj_vx_hi,X
 
     ; Compute 4-bit outcode (vx and vz already in buffers) unless no-clip
@@ -581,61 +437,44 @@ draw_object:
 :
 
     ; view_y = obj_view_y - sign_extend(local_y)
-    LDX vtx_idx
-    LDA obj_view_y
-    SEC
-    SBC local_y
-    STA obj_vy_lo,X
+    LDX #obj_view_y
     LDA local_y
-    AND #$80
-    BEQ @clamp_ly_pos
-    LDA obj_view_y+1
-    SBC #$FF
-    BRA @clamp_vy_st
-@clamp_ly_pos:
-    LDA obj_view_y+1
-    SBC #0
-@clamp_vy_st:
+    JSR sign_ext_sub
+    LDX vtx_idx
+    LDA vcoord_lo
+    STA obj_vy_lo,X
+    LDA vcoord_hi
     STA obj_vy_hi,X
 
     ; Clamped screen coords
     LDA #64
     STA obj_proj_sx,X
-    CMP obj_bb_min_sx
-    BCS :+
-    STA obj_bb_min_sx
-:   CMP obj_bb_max_sx
-    BCC :+
-    STA obj_bb_max_sx
-:
+    STX nmos_tmp
+    LDX #0
+    JSR update_bb
+    LDX nmos_tmp
     LDA #80
     STA obj_proj_sy,X
-    CMP obj_bb_min_sy
-    BCS :+
-    STA obj_bb_min_sy
-:   CMP obj_bb_max_sy
-    BCC :+
-    STA obj_bb_max_sy
-:
+    LDX #2
+    JSR update_bb
     INC vtx_idx
     JMP @proj_loop
 
 ; ── Phase 2: Face-oriented draw ─────────────────────────────────────
 @proj_done:
     ; Clear edge-drawn bitmap
-    STZ obj_edge_drawn
-    STZ obj_edge_drawn+1
-    STZ obj_edge_drawn+2
-    STZ obj_edge_drawn+3
+    LDA #0
+    STA obj_edge_drawn
+    STA obj_edge_drawn+1
+    STA obj_edge_drawn+2
+    STA obj_edge_drawn+3
 
     ; Compute edge_tab_off = 3 + n_vtx * 3
     LDY #0
     LDA (obj_ptr),Y             ; n_vertices
     STA obj_n_vtx               ; temp
-    ASL A
-    CLC
-    ADC obj_n_vtx
-    CLC
+    ASL A                       ; n_vtx*2, C=0 (n_vtx<128)
+    ADC obj_n_vtx               ; n_vtx*3, max 72, C=0
     ADC #3
     STA edge_tab_off
 
@@ -643,10 +482,8 @@ draw_object:
     LDY #1
     LDA (obj_ptr),Y             ; n_edges
     STA obj_n_vtx               ; temp
-    ASL A
-    CLC
-    ADC obj_n_vtx               ; n_edges * 3
-    CLC
+    ASL A                       ; n_edges*2, C=0 (n_edges<128)
+    ADC obj_n_vtx               ; n_edges*3, max 96, C=0
     ADC edge_tab_off
     STA data_off
 
@@ -709,9 +546,7 @@ draw_object:
     SEC
     SBC obj_proj_sy,X
     STA dy1
-    LDA #0
-    SBC #0                      ; sign-extend: $00 or $FF
-    CMP #$80                    ; carry = sign bit
+    CMP #$80                    ; C = sign bit (A still = value)
     ROR dy1                     ; ASR → dy1
 
     ; dx2 = sx[v_c] - sx[v_a]
@@ -726,9 +561,7 @@ draw_object:
     SEC
     SBC obj_proj_sy,X
     STA dy2
-    LDA #0
-    SBC #0
-    CMP #$80
+    CMP #$80                    ; C = sign bit (A still = value)
     ROR dy2                     ; ASR → dy2
 
     ; cross = dx1*dy2 - dy1*dx2
@@ -786,7 +619,7 @@ draw_object:
     AND recip
     STA recip                   ; and &= oc_i
     INY
-    BRA @oc_loop
+    JMP @oc_loop
 @oc_done:
 
     LDA obj_n_vtx               ; outcode_or
@@ -827,8 +660,9 @@ draw_object:
 
 ; ── MIXED: polygon clip walk ──
 @mixed_clip:
-    STZ clip_has_isect          ; no intersections yet
-    STZ poly_vtx_idx            ; start at polygon edge 0
+    LDA #0
+    STA clip_has_isect          ; no intersections yet
+    STA poly_vtx_idx            ; start at polygon edge 0
 
 @poly_edge_loop:
     ; Read edge_id from face data
@@ -866,32 +700,12 @@ draw_object:
     BEQ @pe_straddle
 
     ; Both outside → mark edge as drawn (prevent redundant clip attempts)
-    LDA recip
-    AND #$07
-    TAY
-    LDA recip
-    LSR A
-    LSR A
-    LSR A
-    TAX
-    LDA bit_mask_table,Y
-    ORA obj_edge_drawn,X
-    STA obj_edge_drawn,X
+    JSR check_and_mark_edge
     JMP @poly_next
 
 @pe_straddle:
     ; One inside, one outside — mark edge drawn
-    LDA recip                   ; edge_id
-    AND #$07
-    TAY
-    LDA recip
-    LSR A
-    LSR A
-    LSR A
-    TAX
-    LDA bit_mask_table,Y
-    ORA obj_edge_drawn,X
-    STA obj_edge_drawn,X
+    JSR check_and_mark_edge
 
     ; Load P0 = poly_v0 3D coords → clip API
     LDX poly_vtx_idx
@@ -938,12 +752,10 @@ draw_object:
     BCS @pe_clip_reject
 
     ; Look up edge color from table
-    LDA recip                   ; edge_id (preserved across clip calls)
-    ASL A
-    CLC
-    ADC recip                   ; eid * 3
-    ADC #2                      ; + 2 → color byte offset
-    CLC
+    LDA recip                   ; edge_id (0..23, preserved across clip calls)
+    ASL A                       ; eid * 2 (C=0, eid<128)
+    ADC recip                   ; eid * 3 (C=0, max 69)
+    ADC #2                      ; + 2 → color byte offset (C=0)
     ADC edge_tab_off            ; absolute offset in object data
     TAY
     LDA (obj_ptr),Y             ; edge color
@@ -966,7 +778,7 @@ draw_object:
 
 @pe_clip_reject:
     ; Clip rejected — no visible segment, skip intersection tracking
-    JMP @poly_next
+    BCS @poly_next
 
 @pe_second_isect:
     ; Second intersection: draw clip-boundary edge (face_color)
@@ -985,17 +797,7 @@ draw_object:
 
     ; Plot final pixel of clip-boundary edge
     LDA raster_x1
-    LSR A
-    LDA (raster_base),Y
-    BCS @pe_cr
-    AND #$D5
-    ORA raster_color_left
-    BRA @pe_cs
-@pe_cr:
-    AND #$EA
-    ORA raster_color_right
-@pe_cs:
-    STA (raster_base),Y
+    JSR plot_final_pixel
 
 @poly_next:
     INC poly_vtx_idx
@@ -1013,10 +815,10 @@ draw_object:
 ; Output: A = outcode byte, stored in obj_vtx_clip,X
 ;         Bits: 0=left, 1=right, 2=near, 3=far
 ; Preserves: X
-; Clobbers: A, poly_vtx_idx ($8C)
+; Clobbers: A, Y
 
 compute_outcode:
-    STZ poly_vtx_idx           ; accumulator for outcode bits
+    LDY #0                     ; outcode accumulator in Y
 
     ; Left: outside if x + HALF_GRID_X < 0
     LDA obj_vx_lo,X
@@ -1025,8 +827,7 @@ compute_outcode:
     LDA obj_vx_hi,X
     ADC #HALF_GRID_X_HI
     BPL @no_left
-    LDA #$01
-    STA poly_vtx_idx
+    INY                        ; set bit 0
 @no_left:
 
     ; Right: outside if HALF_GRID_X - x < 0
@@ -1036,9 +837,9 @@ compute_outcode:
     LDA #HALF_GRID_X_HI
     SBC obj_vx_hi,X
     BPL @no_right
-    LDA poly_vtx_idx
+    TYA
     ORA #$02
-    STA poly_vtx_idx
+    TAY
 @no_right:
 
     ; Near: outside if z - Z_NEAR_BOUND < 0
@@ -1048,9 +849,9 @@ compute_outcode:
     LDA obj_vz_hi,X
     SBC #CLIP_NEAR_HI
     BPL @no_near
-    LDA poly_vtx_idx
+    TYA
     ORA #$04
-    STA poly_vtx_idx
+    TAY
 @no_near:
 
     ; Far: outside if Z_FAR_BOUND - z < 0
@@ -1060,12 +861,12 @@ compute_outcode:
     LDA #CLIP_FAR_HI
     SBC obj_vz_hi,X
     BPL @no_far
-    LDA poly_vtx_idx
+    TYA
     ORA #$08
-    STA poly_vtx_idx
+    TAY
 @no_far:
 
-    LDA poly_vtx_idx
+    TYA
     STA obj_vtx_clip,X
     RTS
 
@@ -1079,30 +880,13 @@ compute_outcode:
 
 draw_edge_dedup:
     STA recip                   ; save edge_id → $85
-
-    ; Check dedup bitmap
-    AND #$07
-    TAY
-    LDA recip
-    LSR A
-    LSR A
-    LSR A
-    TAX
-    LDA obj_edge_drawn,X
-    AND bit_mask_table,Y
-    BNE @ded_skip               ; already drawn
-
-    ; Mark as drawn
-    LDA bit_mask_table,Y
-    ORA obj_edge_drawn,X
-    STA obj_edge_drawn,X
+    JSR check_and_mark_edge
+    BCS @ded_skip               ; already drawn
 
     ; Look up edge in table: offset = edge_tab_off + eid * 3
-    LDA recip                   ; edge_id
-    ASL A                       ; eid * 2
-    CLC
-    ADC recip                   ; eid * 3
-    CLC
+    LDA recip                   ; edge_id (0..23)
+    ASL A                       ; eid * 2 (C=0, eid<128)
+    ADC recip                   ; eid * 3 (C=0, max 69)
     ADC edge_tab_off            ; absolute offset
     TAY
     LDA (obj_ptr),Y             ; v_from
@@ -1134,19 +918,37 @@ draw_edge_dedup:
 
     ; Plot final pixel at (raster_x1, raster_y1)
     LDA raster_x1
-    LSR A                       ; bit 0 → carry
-    LDA (raster_base),Y
-    BCS @ded_right
-    AND #$D5
-    ORA raster_color_left
-    BRA @ded_store
-@ded_right:
-    AND #$EA
-    ORA raster_color_right
-@ded_store:
-    STA (raster_base),Y
+    JMP plot_final_pixel        ; tail call
 
 @ded_skip:
+    RTS
+
+; =====================================================================
+; check_and_mark_edge — Check dedup bitmap, mark if not already drawn
+; =====================================================================
+; Input:  recip ($85) = edge_id
+; Output: C=1 if already drawn (skip), C=0 if newly marked
+; Clobbers: A, X, Y
+
+check_and_mark_edge:
+    LDA recip
+    AND #$07
+    TAY
+    LDA recip
+    LSR A
+    LSR A
+    LSR A
+    TAX
+    LDA obj_edge_drawn,X
+    AND bit_mask_table,Y
+    BNE @cam_already
+    LDA bit_mask_table,Y
+    ORA obj_edge_drawn,X
+    STA obj_edge_drawn,X
+    CLC
+    RTS
+@cam_already:
+    SEC
     RTS
 
 ; =====================================================================
@@ -1174,8 +976,7 @@ rotate_y:
     ; ── 2. cos * lx → save in vcoord_lo/hi ──
     LDA cos_val
     STA math_a
-    LDA local_x
-    STA math_b
+    ; math_b still = local_x from call 1
     JSR smul8x8
     LDA math_res_lo
     STA vcoord_lo               ; cos*lx lo
@@ -1203,8 +1004,7 @@ rotate_y:
     ; ── 4. cos * lz → subtract stacked sin*lx, shift >>7 → lz' ──
     LDA cos_val
     STA math_a
-    LDA local_z
-    STA math_b
+    ; math_b still = local_z from call 3
     JSR smul8x8
     ; lz' = (cos*lz - sin*lx) >> 7
     ; Pull sin*lx from stack (lo first, then hi)
@@ -1248,8 +1048,7 @@ rotate_x:
     ; ── 2. cos * ly → save in vcoord_lo/hi ──
     LDA roll_cos
     STA math_a
-    LDA local_y
-    STA math_b
+    ; math_b still = local_y from call 1
     JSR smul8x8
     LDA math_res_lo
     STA vcoord_lo               ; cos*ly lo
@@ -1276,8 +1075,7 @@ rotate_x:
     ; ── 4. cos * lz → add stacked sin*ly, shift >>7 → lz' ──
     LDA roll_cos
     STA math_a
-    LDA local_z
-    STA math_b
+    ; math_b still = local_z from call 3
     JSR smul8x8
     ; lz' = (cos*lz + sin*ly) >> 7
     PLA                         ; sin*ly lo
@@ -1294,3 +1092,58 @@ rotate_x:
     ROL A
     STA local_z                 ; lz'
     RTS
+
+; =====================================================================
+; sign_ext_sub — Subtract sign-extended A from 16-bit ZP value at X
+; =====================================================================
+; Input:  A = signed byte, X = ZP address of base
+; Output: vcoord_lo:vcoord_hi = base - sign_ext(A)
+; Note:   Falls through to sign_ext_add after negating A.
+;         Safe for |A| <= 127 (A=$80 wraps).
+
+sign_ext_sub:
+    EOR #$FF
+    CLC
+    ADC #1                      ; A = -A, N flag set correctly
+    ; fall through to sign_ext_add
+
+; =====================================================================
+; sign_ext_add — Add sign-extended A to 16-bit ZP value at X
+; =====================================================================
+; Input:  A = signed byte (N flag must reflect A), X = ZP address of base
+; Output: vcoord_lo:vcoord_hi = base + sign_ext(A)
+; Clobbers: A
+; Preserves: X, Y
+
+sign_ext_add:
+    CLC
+    BPL @pos
+    ADC $00,X
+    STA vcoord_lo
+    LDA $01,X
+    ADC #$FF
+    JMP @done
+@pos:
+    ADC $00,X
+    STA vcoord_lo
+    LDA $01,X
+    ADC #0
+@done:
+    STA vcoord_hi
+    RTS
+
+; =====================================================================
+; update_bb — Update bounding box min/max pair
+; =====================================================================
+; Input:  A = value, X = offset (0 = sx, 2 = sy)
+; Output: obj_bb_min/max updated
+; Preserves: A, Y
+
+update_bb:
+    CMP obj_bb_min_sx,X
+    BCS :+
+    STA obj_bb_min_sx,X
+:   CMP obj_bb_max_sx,X
+    BCC :+
+    STA obj_bb_max_sx,X
+:   RTS

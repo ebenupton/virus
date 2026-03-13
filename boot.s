@@ -5,7 +5,7 @@
 ;
 ; build.py concatenates game.bin after boot_payload to form game_boot.bin.
 
-.setcpu "65C02"
+.setcpu "6502"
 .segment "BOOT"
 
 ; Number of pages to copy: CODE segment $0600-$2FFF = $2A00 = 42 pages

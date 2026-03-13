@@ -119,10 +119,25 @@ def main():
                 for x in range(SIZE)] for y in range(SIZE)]
     grid = rotated
 
+    # Step 4b: Set 5×5 plateau vertices to average of 16 border vertices
+    PLAT_MIN, PLAT_MAX = 14, 18
+    border_sum = 0.0
+    border_count = 0
+    for y in range(PLAT_MIN, PLAT_MAX + 1):
+        for x in range(PLAT_MIN, PLAT_MAX + 1):
+            if y == PLAT_MIN or y == PLAT_MAX or x == PLAT_MIN or x == PLAT_MAX:
+                border_sum += grid[y][x]
+                border_count += 1
+    plat_avg = border_sum / border_count
+    for y in range(PLAT_MIN, PLAT_MAX + 1):
+        for x in range(PLAT_MIN, PLAT_MAX + 1):
+            grid[y][x] = plat_avg
+
     # Step 5: Find lowest height D
     D = min(grid[y][x] for y in range(SIZE) for x in range(SIZE))
 
-    # Step 6: Scale — map H→31, S→0
+    # Step 6: Scale — map H→31, S→0 (H is now plat_avg since peak was smoothed to it)
+    H = plat_avg
     scale = 31.0 / (H - S)
 
     # Step 7a: Quantize heights
@@ -147,10 +162,12 @@ def main():
                         changed = True
         passes += 1
 
-    # Step 7b2: Force 5×5 plateau vertices at (14,14)-(18,18) to height 31
-    for y in range(14, 19):
-        for x in range(14, 19):
-            heights[y][x] = 31
+    # Step 7b2: Ensure 5×5 plateau vertices are uniform (already set in grid,
+    # but quantization rounding may differ — force to the quantized plateau value)
+    plat_h = heights[16][16]  # centre vertex, representative
+    for y in range(PLAT_MIN, PLAT_MAX + 1):
+        for x in range(PLAT_MIN, PLAT_MAX + 1):
+            heights[y][x] = plat_h
 
     # Step 7c: Pack bytes with colour bits (using clamped heights, original Q for colour)
     rng = random.Random(SEED + 1)
@@ -206,7 +223,6 @@ def main():
     # Patterns 010 and 100 are reserved for plateau boundary edges.
     # Remap non-plateau land cells: 010 → 000, 100 → 110
     # Plateau: 4×4 cells = 5×5 vertices centred at (16,16)
-    PLAT_MIN, PLAT_MAX = 14, 18
     PLATEAU_CELLS = {(y, x) for y in range(PLAT_MIN, PLAT_MAX + 1)
                      for x in range(PLAT_MIN, PLAT_MAX + 1)}
     for y in range(SIZE):
@@ -246,7 +262,7 @@ def main():
             else:
                 v = 'B'  # internal
             pattern = color_to_pattern[(h, v)]
-            packed[y][x] = (pattern << 5) | 31
+            packed[y][x] = (pattern << 5) | plat_h
 
     # Step 8: Write assembly include
     with open("map_data.inc", "w") as f:

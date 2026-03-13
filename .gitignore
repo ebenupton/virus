@@ -1,1 +1,30 @@
+# Build artifacts
+*.bin
+*.o
+*.labels
+*.dbg
+*.ssd
+*.lst
+*.map
+emu
+
+# Debug output
+*.ppm
+*.png
+*.mp4
+frame_*
+frames*/
+cycle_out.txt
+mem_*.txt
+tmp_*.txt
+vbuf*.txt
+header.txt
+frame_log*.txt
+
+# System
+.DS_Store
+.claude/
+
+# Backup files
+*.bak
 __pycache__/

@@ -228,7 +228,8 @@ draw_line:
     SBC raster_x0
     BCS @dx_pos
     EOR #$FF                ; negate: complement...
-    INC A                   ; ...and increment
+    CLC
+    ADC #1                  ; ...and increment (NMOS: CLC;ADC replaces INC A)
     SEC                     ; restore C=1 (was C=0 from SBC borrow)
 @dx_pos:
     TAX                     ; X = |dx|, C=1
@@ -238,7 +239,8 @@ draw_line:
     SBC raster_y1                  ; C=1 from SEC or BCS path
     BCS @dy_pos
     EOR #$FF
-    INC A                   ; INC A does not affect carry
+    CLC
+    ADC #1                  ; NMOS: CLC;ADC replaces INC A (carry reset by CPX below)
 @dy_pos:
     ; A = |dy|, X = |dx|, Y = sub-row (preserved)
 
@@ -272,7 +274,14 @@ draw_line:
     LDA delta_major
     SEC
     SBC delta_minor         ; initial error = delta_major - delta_minor
-    JMP (steep_tbl,X)       ; C=1 from SBC (delta_major > delta_minor)
+    PHA                     ; save error (C=1 preserved through PHA/PLA)
+    LDA steep_tbl+1,X
+    STA @steep_jmp+2
+    LDA steep_tbl,X
+    STA @steep_jmp+1
+    PLA                     ; restore error
+@steep_jmp:
+    JMP $0000               ; SMC: target patched above
 
 @shallow:
     ; --- SHALLOW: |dx| >= |dy|, major axis is X ---
@@ -281,7 +290,8 @@ draw_line:
 
     ; pixel_count = ceil(|dx| / 2) = number of pixel pairs
     TXA                     ; A = |dx|
-    INC A
+    CLC
+    ADC #1                  ; NMOS: CLC;ADC replaces INC A (LSR below sets its own C)
     LSR A                   ; A = (|dx|+1)/2, C = (|dx|+1) bit 0
     STA pixel_count         ; C = ~count_parity (preserved below)
 
@@ -302,7 +312,14 @@ draw_line:
     LDA delta_major
     SEC
     SBC delta_minor         ; initial error, C=1 (delta_major >= delta_minor)
-    JMP (shallow_tbl,X)
+    PHA                     ; save error (C=1 preserved through PHA/PLA)
+    LDA shallow_tbl+1,X
+    STA @shallow_jmp+2
+    LDA shallow_tbl,X
+    STA @shallow_jmp+1
+    PLA                     ; restore error
+@shallow_jmp:
+    JMP $0000               ; SMC: target patched above
 
 @zero_line:
     RTS
@@ -354,7 +371,7 @@ sdr_end_ff_dec:
     RTS
 sdr_end_ff_page:
     INC raster_base+1                      ; C=1 preserved (INC doesn't touch C)
-    BRA sdr_end_ff_dec
+    BCS sdr_end_ff_dec              ; C=1 preserved through INC
 
 sdr_end_r:
     TAX
@@ -363,7 +380,7 @@ sdr_end_r:
     ORA raster_color_right
     STA (raster_base),Y
     TXA
-    BRA sdr_end_sbc2
+    BCS sdr_end_sbc2                ; C=1 from dispatch (AND/ORA/STA/TXA preserve C)
 
     ; --- Second pixel, no Y-step (C=1 from SBC) ---
 sdr_end_sbc2:
@@ -383,7 +400,7 @@ sdr_end_sbc2_dec:
     RTS
 sdr_end_sbc2_page:
     INC raster_base+1                      ; C=1 preserved
-    BRA sdr_end_sbc2_dec
+    BCS sdr_end_sbc2_dec             ; C=1 preserved through INC
 
     ; --- Second pixel, Y-step (C=0 from SBC borrow) ---
 sdr_end_sbc2_ystep:
@@ -398,11 +415,11 @@ sdr_end_sbc2_norow:
     ADC #$08                        ; C=0 from CPY
     STA raster_base
     BCS sdr_end_sbc2_page           ; page cross → share handler
-    BRA sdr_end_sbc2_sec            ; no page → restore C=1
+    BCC sdr_end_sbc2_sec            ; C=0: no page cross → restore C=1
 sdr_end_sbc2_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY #8 match → clear for ADC
-    BRA sdr_end_sbc2_norow
+    BCC sdr_end_sbc2_norow           ; C=0 after CLC
 
     ; --- Fast-slow: first pixel fast, second Y-steps (C=0) ---
 sdr_end_fastslow:
@@ -419,14 +436,14 @@ sdr_end_fs_norow:
     ADC #$08                        ; C=0 from CPY
     STA raster_base
     BCS sdr_end_fs_page             ; page cross (rare)
-    BRA sdr_end_sbc2_sec            ; → SEC, DEC, loop
+    BCC sdr_end_sbc2_sec            ; C=0: no page cross → SEC, DEC, loop
 sdr_end_fs_page:
     INC raster_base+1
-    BRA sdr_end_sbc2_sec
+    BCS sdr_end_sbc2_sec             ; C=1 preserved through INC
 sdr_end_fs_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
-    BRA sdr_end_fs_norow
+    BCC sdr_end_fs_norow             ; C=0 after CLC
 
     ; --- Slow: first pixel Y-steps, both read-modify-write ---
 sdr_end_slow:
@@ -449,11 +466,11 @@ sdr_end_slow_norow:
     ORA raster_color_right
     STA (raster_base),Y
     TXA                             ; restore error; C=1 from SEC or CPY
-    BRA sdr_end_sbc2                ; → second pixel SBC, column advance
+    BCS sdr_end_sbc2                ; C=1: → second pixel SBC, column advance
 sdr_end_slow_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1 for second pixel SBC
-    BRA sdr_end_slow_norow
+    BCS sdr_end_slow_norow           ; C=1 after SEC
 
 ; === sdr: shallow, Y-down, X-right — exits in middle ==================
 ; Draws pc-1 pairs via the _end loop, then one trailing left pixel.
@@ -483,7 +500,7 @@ sdr_trail_done:
 
 sdr_mid_r:
     JSR sdr_end_r                   ; draw 2*pc-1 pixels; X=error, C=1
-    BRA sdr_trail
+    BCS sdr_trail                    ; C=1 at loop exit
 
 ; === sdl: shallow, Y-down, X-left — exits at end ======================
 
@@ -513,7 +530,7 @@ sdl_end_ff_nopg:
 sdl_end_ff_borrow:
     DEC raster_base+1
     SEC                             ; restore C=1 after borrow
-    BRA sdl_end_ff_nopg
+    BCS sdl_end_ff_nopg              ; C=1 after SEC
 
 sdl_end_l:
     TAX
@@ -522,7 +539,7 @@ sdl_end_l:
     ORA raster_color_left
     STA (raster_base),Y
     TXA
-    BRA sdl_end_sbc2
+    BCS sdl_end_sbc2                ; C=1 from dispatch (AND/ORA/STA/TXA preserve C)
 
     ; --- Second pixel, no Y-step (C=1) ---
 sdl_end_sbc2:
@@ -540,7 +557,7 @@ sdl_end_sbc2_nopg:
 sdl_end_sbc2_borrow:
     DEC raster_base+1
     SEC
-    BRA sdl_end_sbc2_nopg
+    BCS sdl_end_sbc2_nopg            ; C=1 after SEC
 
     ; --- Second pixel, Y-step (C=0 from SBC borrow) ---
 sdl_end_sbc2_ystep:
@@ -555,11 +572,11 @@ sdl_end_sbc2_norow:
     ADC #$F8                        ; C=0 from CPY
     STA raster_base
     BCS sdl_end_sbc2_nopg           ; C=1 → no borrow (common)
-    BRA sdl_end_sbc2_borrow         ; C=0 → borrow (rare)
+    BCC sdl_end_sbc2_borrow         ; C=0 → borrow (rare)
 sdl_end_sbc2_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
-    BRA sdl_end_sbc2_norow
+    BCC sdl_end_sbc2_norow           ; C=0 after CLC
 
     ; --- Fast-slow (C=0 from second SBC borrow) ---
 sdl_end_fastslow:
@@ -583,7 +600,7 @@ sdl_end_fs_nopg:
 sdl_end_fs_borrow:
     DEC raster_base+1
     SEC
-    BRA sdl_end_fs_nopg
+    BCS sdl_end_fs_nopg              ; C=1 after SEC
 
     ; --- Slow: first pixel Y-steps ---
 sdl_end_slow:
@@ -604,15 +621,15 @@ sdl_end_slow_norow:
     ORA raster_color_left
     STA (raster_base),Y
     TXA                             ; C=1 from SEC or CPY
-    BRA sdl_end_sbc2
+    BCS sdl_end_sbc2                ; C=1: → second pixel SBC
 sdl_end_slow_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1 for second pixel SBC
-    BRA sdl_end_slow_norow
+    BCS sdl_end_slow_norow           ; C=1 after SEC
 sdl_end_fs_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     CLC                             ; C=1 from CPY → clear for ADC
-    BRA sdl_end_fs_norow
+    BCC sdl_end_fs_norow             ; C=0 after CLC
 
 ; === sdl: shallow, Y-down, X-left — exits in middle ===================
 ; Draws pc-1 pairs via _end, then one trailing right pixel.
@@ -641,7 +658,7 @@ sdl_trail_done:
 
 sdl_mid_l:
     JSR sdl_end_l
-    BRA sdl_trail
+    BCS sdl_trail                    ; C=1 at loop exit
 
 ; === sur: shallow, Y-up, X-right — exits at end =======================
 ; Y-up variant: DEY/BMI instead of INY/CPY.  DEY preserves carry,
@@ -672,7 +689,7 @@ sur_end_ff_dec:
     RTS
 sur_end_ff_page:
     INC raster_base+1                      ; C=1 preserved
-    BRA sur_end_ff_dec
+    BCS sur_end_ff_dec               ; C=1 preserved through INC
 
 sur_end_r:
     TAX
@@ -681,7 +698,7 @@ sur_end_r:
     ORA raster_color_right
     STA (raster_base),Y
     TXA
-    BRA sur_end_sbc2
+    BCS sur_end_sbc2                ; C=1 from dispatch (AND/ORA/STA/TXA preserve C)
 
     ; --- Second pixel, no Y-step (C=1) ---
 sur_end_sbc2:
@@ -700,7 +717,7 @@ sur_end_sbc2_dec:
     RTS
 sur_end_sbc2_page:
     INC raster_base+1
-    BRA sur_end_sbc2_dec
+    BCS sur_end_sbc2_dec             ; C=1 preserved through INC
 
     ; --- Second pixel, Y-step up (C=0 from SBC borrow) ---
 sur_end_sbc2_ystep:
@@ -714,10 +731,10 @@ sur_end_sbc2_norow:
     SBC #$F8                        ; C=1: raster_base += 8
     STA raster_base
     BCS sur_end_sbc2_page           ; page cross → share handler
-    BRA sur_end_sbc2_sec            ; → SEC, DEC, loop
+    BCC sur_end_sbc2_sec            ; C=0: no page cross → SEC, DEC, loop
 sur_end_sbc2_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sur_end_sbc2_norow
+    BCS sur_end_sbc2_norow           ; C=1 from stripe_retreat
 
     ; --- Fast-slow: second pixel Y-steps up ---
 sur_end_fastslow:
@@ -733,13 +750,13 @@ sur_end_fs_norow:
     SBC #$F8                        ; C=1: raster_base += 8
     STA raster_base
     BCS sur_end_fs_page             ; page cross (rare)
-    BRA sur_end_sbc2_sec            ; → SEC, DEC, loop
+    BCC sur_end_sbc2_sec            ; C=0: no page cross → SEC, DEC, loop
 sur_end_fs_page:
     INC raster_base+1
-    BRA sur_end_sbc2_sec
+    BCS sur_end_sbc2_sec             ; C=1 preserved through INC
 sur_end_fs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sur_end_fs_norow
+    BCS sur_end_fs_norow             ; C=1 from stripe_retreat
 
     ; --- Slow: first pixel Y-steps up ---
 sur_end_slow:
@@ -758,10 +775,10 @@ sur_end_slow_norow:
     ORA raster_color_right
     STA (raster_base),Y
     TXA                             ; C=1 preserved (TXA ≠ carry)
-    BRA sur_end_sbc2
+    BCS sur_end_sbc2                ; C=1: → second pixel SBC
 sur_end_slow_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sur_end_slow_norow
+    BCS sur_end_slow_norow           ; C=1 from stripe_retreat
 
 ; === sur: shallow, Y-up, X-right — exits in middle ====================
 
@@ -787,7 +804,7 @@ sur_trail_done:
 
 sur_mid_r:
     JSR sur_end_r
-    BRA sur_trail
+    BCS sur_trail                    ; C=1 at loop exit
 
 ; === sul: shallow, Y-up, X-left — exits at end ========================
 
@@ -816,7 +833,7 @@ sul_end_ff_nopg:
 sul_end_ff_borrow:
     DEC raster_base+1
     SEC
-    BRA sul_end_ff_nopg
+    BCS sul_end_ff_nopg              ; C=1 after SEC
 
 sul_end_l:
     TAX
@@ -825,7 +842,7 @@ sul_end_l:
     ORA raster_color_left
     STA (raster_base),Y
     TXA
-    BRA sul_end_sbc2
+    BCS sul_end_sbc2                ; C=1 from dispatch (AND/ORA/STA/TXA preserve C)
 
     ; --- Second pixel, no Y-step (C=1) ---
 sul_end_sbc2:
@@ -843,7 +860,7 @@ sul_end_sbc2_nopg:
 sul_end_sbc2_borrow:
     DEC raster_base+1
     SEC
-    BRA sul_end_sbc2_nopg
+    BCS sul_end_sbc2_nopg            ; C=1 after SEC
 
     ; --- Second pixel, Y-step up (C=0 from SBC borrow) ---
 sul_end_sbc2_ystep:
@@ -857,10 +874,10 @@ sul_end_sbc2_norow:
     SBC #$08                        ; C=1: raster_base -= 8
     STA raster_base
     BCS sul_end_sbc2_nopg           ; C=1 → no borrow (common)
-    BRA sul_end_sbc2_borrow         ; C=0 → borrow (rare)
+    BCC sul_end_sbc2_borrow         ; C=0 → borrow (rare)
 sul_end_sbc2_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sul_end_sbc2_norow
+    BCS sul_end_sbc2_norow           ; C=1 from stripe_retreat
 
     ; --- Fast-slow: second pixel Y-steps up ---
 sul_end_fastslow:
@@ -883,10 +900,10 @@ sul_end_fs_nopg:
 sul_end_fs_borrow:
     DEC raster_base+1
     SEC
-    BRA sul_end_fs_nopg
+    BCS sul_end_fs_nopg              ; C=1 after SEC
 sul_end_fs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sul_end_fs_norow
+    BCS sul_end_fs_norow             ; C=1 from stripe_retreat
 
     ; --- Slow: first pixel Y-steps up ---
 sul_end_slow:
@@ -904,10 +921,10 @@ sul_end_slow_norow:
     ORA raster_color_left
     STA (raster_base),Y
     TXA                             ; C=1 preserved
-    BRA sul_end_sbc2
+    BCS sul_end_sbc2                ; C=1: → second pixel SBC
 sul_end_slow_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA sul_end_slow_norow
+    BCS sul_end_slow_norow           ; C=1 from stripe_retreat
 
 ; === sul: shallow, Y-up, X-left — exits in middle =====================
 
@@ -933,7 +950,7 @@ sul_trail_done:
 
 sul_mid_l:
     JSR sul_end_l
-    BRA sul_trail
+    BCS sul_trail                    ; C=1 at loop exit
 
 ; =====================================================================
 ; STEEP LOOPS
@@ -984,12 +1001,12 @@ tdr_l_norow:
 tdr_l_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1
-    BRA tdr_l_norow
+    BCS tdr_l_norow                  ; C=1 after SEC
 
 tdr_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out (always)
     TAX
-    BRA tdr_r_ystep                 ; toggle to right-pixel phase
+    BCS tdr_r_ystep                 ; C=1: toggle to right-pixel phase
 
 tdr_r:
     TAX
@@ -1014,7 +1031,7 @@ tdr_r_norow:
 tdr_r_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1
-    BRA tdr_r_norow
+    BCS tdr_r_norow                  ; C=1 after SEC
 
 tdr_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1026,7 +1043,7 @@ tdr_r_xstep:
     STA raster_base
     BCC tdr_l_ystep                 ; no page cross → toggle to left phase
     INC raster_base+1                      ; page cross (rare)
-    BRA tdr_l_ystep
+    BCS tdr_l_ystep                  ; C=1 preserved through INC
 
 ; === tdl: steep, Y-down, X-left =======================================
 
@@ -1053,12 +1070,12 @@ tdl_r_norow:
 tdl_r_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1
-    BRA tdl_r_norow
+    BCS tdl_r_norow                  ; C=1 after SEC
 
 tdl_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
     TAX
-    BRA tdl_l_ystep                 ; toggle to left-pixel phase
+    BCS tdl_l_ystep                 ; C=1: toggle to left-pixel phase
 
 tdl_l:
     TAX
@@ -1083,7 +1100,7 @@ tdl_l_norow:
 tdl_l_row:
     JSR stripe_advance               ; raster_base += 512; Y=0
     SEC                             ; restore C=1
-    BRA tdl_l_norow
+    BCS tdl_l_norow                  ; C=1 after SEC
 
 tdl_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1095,7 +1112,7 @@ tdl_l_xstep:
     STA raster_base
     BCS tdl_r_ystep                 ; C=1 → no borrow → toggle to right
     DEC raster_base+1                      ; page borrow (rare)
-    BRA tdl_r_ystep
+    BCC tdl_r_ystep                  ; C=0 preserved through DEC
 
 ; === tur: steep, Y-up, X-right ========================================
 ; Y-up eliminates SEC from the hot path: DEY/BMI preserves carry, so
@@ -1121,7 +1138,7 @@ tur_l_norow:
     RTS
 tur_l_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tur_l_norow
+    BCS tur_l_norow                  ; C=1 from stripe_retreat
 
 tur_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out (always)
@@ -1135,7 +1152,7 @@ tur_l_xs_norow:
     RTS
 tur_l_xs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tur_l_xs_norow
+    BCS tur_l_xs_norow               ; C=1 from stripe_retreat
 
 tur_r:
     TAX
@@ -1156,7 +1173,7 @@ tur_r_norow:
     RTS
 tur_r_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tur_r_norow
+    BCS tur_r_norow                  ; C=1 from stripe_retreat
 
 tur_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1177,10 +1194,10 @@ tur_r_xs_norow:
     RTS
 tur_r_xs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tur_r_xs_norow
+    BCS tur_r_xs_norow               ; C=1 from stripe_retreat
 tur_r_xs_page:
     INC raster_base+1                      ; C=1 preserved (INC ≠ carry)
-    BRA tur_r_xs_sec
+    BCS tur_r_xs_sec                 ; C=1 preserved through INC
 
 ; === tul: steep, Y-up, X-left =========================================
 ; Same Y-up carry-preservation pattern as tur.
@@ -1204,7 +1221,7 @@ tul_r_norow:
     RTS
 tul_r_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tul_r_norow
+    BCS tul_r_norow                  ; C=1 from stripe_retreat
 
 tul_r_xstep:
     ADC delta_major                 ; C=0 in; C=1 out (always)
@@ -1218,7 +1235,7 @@ tul_r_xs_norow:
     RTS
 tul_r_xs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tul_r_xs_norow
+    BCS tul_r_xs_norow               ; C=1 from stripe_retreat
 
 tul_l:
     TAX
@@ -1239,7 +1256,7 @@ tul_l_norow:
     RTS
 tul_l_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tul_l_norow
+    BCS tul_l_norow                  ; C=1 from stripe_retreat
 
 tul_l_xstep:
     ADC delta_major                 ; C=0 in; C=1 out
@@ -1259,11 +1276,11 @@ tul_l_xs_norow:
     RTS
 tul_l_xs_row:
     JSR stripe_retreat               ; raster_base -= 512; Y=7; C=1
-    BRA tul_l_xs_norow
+    BCS tul_l_xs_norow               ; C=1 from stripe_retreat
 tul_l_xs_borrow:
     DEC raster_base+1
     SEC                             ; C=0 from borrow → restore for SBC
-    BRA tul_l_xs_dey
+    BCS tul_l_xs_dey                 ; C=1 after SEC
 
 ; =====================================================================
 ; init_base — Compute screen address for pixel (raster_x0, raster_y0)

@@ -1,5 +1,5 @@
 ; game.s — Real-time perspective grid with camera translation for BBC Micro
-; Assembled with ca65: ca65 --cpu 65C02 game.s -o game.o
+; Assembled with ca65: ca65 game.s -o game.o
 ; Linked with ld65:    ld65 -C linker.cfg game.o -o game.bin
 ;
 ; Loads and runs at $0600. Double-buffered at $3000/$5800 (10K each).
@@ -9,7 +9,12 @@
 ; Parameterisable grid centred on camera tile, projected in real time each frame.
 ; Height modulation from 32×32 toroidal heightmap (5-bit height, 3-bit colour).
 
-.setcpu "65C02"
+; CPU selection: default NMOS 6502; pass -DCPU_65C02=1 for 65C02 optimisations
+.ifdef CPU_65C02
+    .setcpu "65C02"
+.else
+    .setcpu "6502"
+.endif
 .segment "CODE"
 
 ; === MOS entry points (RTS stubs in emulator) ===
@@ -28,6 +33,9 @@ SYS_VIA_ORA  = $FE4F
 .include "math_zp.inc"
 .include "grid_zp.inc"
 .include "object_zp.inc"
+
+; === Zero page: NMOS scratch (used by INC A/DEC A replacements) ===
+nmos_tmp        = $0F       ; 1 byte — scratch for NMOS carry-preserving INC A
 
 ; === Zero page: video (forward-declared for ZP addressing) ===
 back_buf_idx    = $10
@@ -55,6 +63,8 @@ KEY_L       = $56
 CAM_HEIGHT_LO   = $80        ; camera height 1.5 in 8.8 = $0180
 CAM_HEIGHT_HI   = $01
 CAM_Z_BEHIND    = $0240      ; camera 2.25 units behind ship (= grid centre z)
+MAX_POS_Y_HI    = $01        ; max ship altitude = 1.25 units
+MAX_POS_Y_LO    = $40
 
 ; Physics constants (12.5 fps, 1 grid cell = $40 in 8.8)
 GRAVITY_ACCEL   = 52          ; 0.5 cells/s²
@@ -76,9 +86,9 @@ vel_z_lo        = $2D
 vel_z_frac      = $2E
 
 ; Sub-pixel position accumulators
-pos_x_frac      = $54
-pos_y_frac      = $55
-pos_z_frac      = $56
+pos_x_frac      = $43       ; spaced 2 apart for Y-indexed update_pos
+pos_y_frac      = $45
+pos_z_frac      = $47
 
 ; Camera Y (8.8 fixed-point, computed = ship_y + 1.5)
 cam_y_lo        = $57
@@ -111,29 +121,35 @@ entry:
     LDA #$58
     STA raster_page           ; restore to buf1 (back buffer)
 
+    ; Mark both buffers clean so first clear_screen doesn't erase the map
+    LDA #160
+    STA dirty_top_buf0
+    STA dirty_top_buf1
+
     ; Initialize rotation angle and orientation
-    STZ obj_rot_angle
-    STZ ship_yaw
-    STZ ship_roll
+    LDA #0
+    STA obj_rot_angle
+    STA ship_yaw
+    STA ship_roll
 
     ; Initialize velocities to zero
-    STZ vel_x_hi
-    STZ vel_x_lo
-    STZ vel_x_frac
-    STZ vel_y_hi
-    STZ vel_y_lo
-    STZ vel_y_frac
-    STZ vel_z_hi
-    STZ vel_z_lo
-    STZ vel_z_frac
+    STA vel_x_hi
+    STA vel_x_lo
+    STA vel_x_frac
+    STA vel_y_hi
+    STA vel_y_lo
+    STA vel_y_frac
+    STA vel_z_hi
+    STA vel_z_lo
+    STA vel_z_frac
 
     ; Initialize position fraction accumulators
-    STZ pos_x_frac
-    STZ pos_y_frac
-    STZ pos_z_frac
+    STA pos_x_frac
+    STA pos_y_frac
+    STA pos_z_frac
 
     ; Initialize camera: follow ship at (4, 0, 4)
-    STZ cam_x_lo
+    STA cam_x_lo
     LDA #$04                ; ship_x_hi = 4
     STA cam_x_hi
     LDA #<($0400 - CAM_Z_BEHIND)  ; cam_z = ship_z - CAM_Z_BEHIND
@@ -153,6 +169,7 @@ main_loop:
     JSR update_camera
     JSR update_physics
     JSR clear_screen
+    JSR draw_map              ; temporary: redraw map every frame
     JSR draw_grid
 
     ; Default bbox: nothing drawn by object (overwritten if draw_object runs)
@@ -196,49 +213,33 @@ update_camera:
     LDA #$7F
     STA SYS_VIA_DDRA        ; bits 0-6 output, bit 7 input
 
-    ; Z key → yaw right (ship_yaw -= 4)
-    LDA #KEY_Z
-    STA SYS_VIA_ORA
-    LDA SYS_VIA_ORA
-    BMI @no_yaw_left
-    LDA ship_yaw
-    SEC
-    SBC #4
-    STA ship_yaw
-@no_yaw_left:
+    LDA #KEY_Z              ; Z key → yaw right (ship_yaw -= 4)
+    LDX #ship_yaw
+    LDY #<(-4)
+    JSR scan_key_add
+    LDA #KEY_X              ; X key → yaw left (ship_yaw += 4)
+    LDY #4
+    JSR scan_key_add
+    LDA #KEY_K              ; K key → roll left (ship_roll += 4)
+    LDX #ship_roll
+    JSR scan_key_add
+    LDA #KEY_M              ; M key → roll right (ship_roll -= 4)
+    LDY #<(-4)
+    JSR scan_key_add
+    RTS
 
-    ; X key → yaw left (ship_yaw += 4)
-    LDA #KEY_X
+; scan_key_add — Check key and add signed delta to ZP variable
+; Input: A = key code, X = ZP address, Y = signed delta
+; Preserves: X
+scan_key_add:
     STA SYS_VIA_ORA
     LDA SYS_VIA_ORA
-    BMI @no_yaw_right
-    LDA ship_yaw
+    BPL @ska_done
+    TYA
     CLC
-    ADC #4
-    STA ship_yaw
-@no_yaw_right:
-
-    ; K key → roll left (ship_roll += 4)
-    LDA #KEY_K
-    STA SYS_VIA_ORA
-    LDA SYS_VIA_ORA
-    BMI @no_roll_up
-    LDA ship_roll
-    CLC
-    ADC #4
-    STA ship_roll
-@no_roll_up:
-
-    ; M key → roll right (ship_roll -= 4)
-    LDA #KEY_M
-    STA SYS_VIA_ORA
-    LDA SYS_VIA_ORA
-    BMI @no_roll_down
-    LDA ship_roll
-    SEC
-    SBC #4
-    STA ship_roll
-@no_roll_down:
+    ADC $00,X
+    STA $00,X
+@ska_done:
     RTS
 
 ; =====================================================================
@@ -255,51 +256,32 @@ update_physics:
     LDA #KEY_L
     STA SYS_VIA_ORA
     LDA SYS_VIA_ORA
-    BMI @no_thrust
+    BPL @no_thrust
 
     ; Precompute trig values into $80-$83
     LDX ship_roll
-    TXA
-    CLC
-    ADC #64
-    TAX
-    LDA sin_table,X          ; cos(roll)
-    STA $80
-    LDX ship_roll
-    LDA sin_table,X          ; sin(roll)
-    STA $81
+    JSR sincos
+    STA $81                   ; sin(roll)
+    STX $80                   ; cos(roll)
     LDX ship_yaw
-    TXA
-    CLC
-    ADC #64
-    TAX
-    LDA sin_table,X          ; cos(yaw)
-    STA $82
-    LDX ship_yaw
-    LDA sin_table,X          ; sin(yaw)
-    STA $83
+    JSR sincos
+    STA $83                   ; sin(yaw)
+    STX $82                   ; cos(yaw)
 
     ; thrust_y = (cos(roll) * THRUST_ACCEL) >> 7
     LDA $80
     STA math_a
     LDA #THRUST_ACCEL
     STA math_b
-    JSR smul8x8
-    ASL math_res_lo
-    LDA math_res_hi
-    ROL A
+    JSR smul_shr7
     LDX #3                   ; Y axis
     JSR add_accel
 
     ; horiz = (sin(roll) * THRUST_ACCEL) >> 7
     LDA $81
     STA math_a
-    LDA #THRUST_ACCEL
-    STA math_b
-    JSR smul8x8
-    ASL math_res_lo
-    LDA math_res_hi
-    ROL A
+    ; math_b still = THRUST_ACCEL from above
+    JSR smul_shr7
     STA $84                  ; save horiz
 
     ; thrust_x = (sin(yaw) * horiz) >> 7
@@ -307,22 +289,15 @@ update_physics:
     STA math_a
     LDA $84
     STA math_b
-    JSR smul8x8
-    ASL math_res_lo
-    LDA math_res_hi
-    ROL A
+    JSR smul_shr7
     LDX #0                   ; X axis
     JSR add_accel
 
     ; thrust_z = (cos(yaw) * horiz) >> 7
     LDA $82
     STA math_a
-    LDA $84
-    STA math_b
-    JSR smul8x8
-    ASL math_res_lo
-    LDA math_res_hi
-    ROL A
+    ; math_b still = $84 (horiz) from above
+    JSR smul_shr7
     LDX #6                   ; Z axis
     JSR add_accel
 
@@ -335,42 +310,18 @@ update_physics:
     LDX #6
     JSR apply_drag
 
-    ; 4. Position update (24-bit add per axis)
-    ; X axis
-    CLC
-    LDA pos_x_frac
-    ADC vel_x_frac
-    STA pos_x_frac
-    LDA obj_world_pos+OBJ_WORLD_SHIP+0
-    ADC vel_x_lo
-    STA obj_world_pos+OBJ_WORLD_SHIP+0
-    LDA obj_world_pos+OBJ_WORLD_SHIP+1
-    ADC vel_x_hi
-    STA obj_world_pos+OBJ_WORLD_SHIP+1
-
-    ; Y axis
-    CLC
-    LDA pos_y_frac
-    ADC vel_y_frac
-    STA pos_y_frac
-    LDA obj_world_pos+OBJ_WORLD_SHIP+2
-    ADC vel_y_lo
-    STA obj_world_pos+OBJ_WORLD_SHIP+2
-    LDA obj_world_pos+OBJ_WORLD_SHIP+3
-    ADC vel_y_hi
-    STA obj_world_pos+OBJ_WORLD_SHIP+3
-
-    ; Z axis
-    CLC
-    LDA pos_z_frac
-    ADC vel_z_frac
-    STA pos_z_frac
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4
-    ADC vel_z_lo
-    STA obj_world_pos+OBJ_WORLD_SHIP+4
-    LDA obj_world_pos+OBJ_WORLD_SHIP+5
-    ADC vel_z_hi
-    STA obj_world_pos+OBJ_WORLD_SHIP+5
+    ; 4. Position update (24-bit add per axis, X=vel offset, Y=pos offset)
+    LDX #0
+    LDY #0
+@pos_loop:
+    JSR update_pos
+    INX
+    INX
+    INX
+    INY
+    INY
+    CPX #9
+    BCC @pos_loop
 
     ; 5. Ground clamp: use terrain_y computed by project_grid
     LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
@@ -382,12 +333,33 @@ update_physics:
 @do_clamp:
     LDA terrain_y
     STA obj_world_pos+OBJ_WORLD_SHIP+2
-    STZ obj_world_pos+OBJ_WORLD_SHIP+3
-    STZ pos_y_frac
-    STZ vel_y_hi
-    STZ vel_y_lo
-    STZ vel_y_frac
+    LDA #0
+    STA obj_world_pos+OBJ_WORLD_SHIP+3
+    STA pos_y_frac
+    STA vel_y_hi
+    STA vel_y_lo
+    STA vel_y_frac
 @above_ground:
+
+    ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y
+    LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
+    CMP #MAX_POS_Y_HI
+    BCC @below_ceiling
+    BNE @do_ceil_clamp
+    LDA obj_world_pos+OBJ_WORLD_SHIP+2    ; y_lo
+    CMP #MAX_POS_Y_LO
+    BCC @below_ceiling
+@do_ceil_clamp:
+    LDA #MAX_POS_Y_LO
+    STA obj_world_pos+OBJ_WORLD_SHIP+2
+    LDA #MAX_POS_Y_HI
+    STA obj_world_pos+OBJ_WORLD_SHIP+3
+    LDA #0
+    STA pos_y_frac
+    STA vel_y_hi
+    STA vel_y_lo
+    STA vel_y_frac
+@below_ceiling:
 
     ; 6. Camera follow
     ; cam_x = ship_x
@@ -416,6 +388,58 @@ update_physics:
     RTS
 
 ; =====================================================================
+; smul_shr7 — Signed multiply then shift right 7
+; =====================================================================
+; Input:  math_a, math_b set
+; Output: A = (math_a * math_b) >> 7
+
+smul_shr7:
+    JSR smul8x8
+    ASL math_res_lo
+    LDA math_res_hi
+    ROL A
+    RTS
+
+; =====================================================================
+; sincos — Look up sin and cos of angle
+; =====================================================================
+; Input:  X = angle (0-255)
+; Output: A = sin(angle), X = cos(angle)
+; Clobbers: none besides A, X
+
+sincos:
+    LDA sin_table,X
+    PHA
+    TXA
+    CLC
+    ADC #64
+    TAX
+    LDA sin_table,X         ; cos
+    TAX                     ; X = cos
+    PLA                     ; A = sin
+    RTS
+
+; =====================================================================
+; update_pos — Add velocity to position for one axis
+; =====================================================================
+; Input:  X = velocity offset (0=X, 3=Y, 6=Z)
+;         Y = position offset (0=X, 2=Y, 4=Z)
+; Preserves: X, Y
+
+update_pos:
+    CLC
+    LDA pos_x_frac,Y
+    ADC vel_x_frac,X
+    STA pos_x_frac,Y
+    LDA obj_world_pos+OBJ_WORLD_SHIP,Y
+    ADC vel_x_lo,X
+    STA obj_world_pos+OBJ_WORLD_SHIP,Y
+    LDA obj_world_pos+OBJ_WORLD_SHIP+1,Y
+    ADC vel_x_hi,X
+    STA obj_world_pos+OBJ_WORLD_SHIP+1,Y
+    RTS
+
+; =====================================================================
 ; add_accel — Add signed 8-bit acceleration to 24-bit velocity
 ; =====================================================================
 ; Input:  A = signed acceleration value
@@ -429,22 +453,21 @@ add_accel:
     STA vel_x_frac,X
     TYA                      ; N flag = sign of accel, carry preserved
     BPL @aa_pos
-    ; Negative: sign-extend with $FF
-    LDA #$FF
-    ADC vel_x_lo,X
-    STA vel_x_lo,X
-    LDA #$FF
-    ADC vel_x_hi,X
-    STA vel_x_hi,X
+    ; Negative: carry=1 → no change to lo:hi; carry=0 → decrement
+    BCS @aa_done
+    LDA vel_x_lo,X
+    BNE @aa_dec_lo
+    DEC vel_x_hi,X
+@aa_dec_lo:
+    DEC vel_x_lo,X
     RTS
 @aa_pos:
-    ; Positive: sign-extend with $00
-    LDA #$00
-    ADC vel_x_lo,X
-    STA vel_x_lo,X
-    LDA #$00
-    ADC vel_x_hi,X
-    STA vel_x_hi,X
+    ; Positive: carry=0 → no change to lo:hi; carry=1 → increment
+    BCC @aa_done
+    INC vel_x_lo,X
+    BNE @aa_done
+    INC vel_x_hi,X
+@aa_done:
     RTS
 
 ; =====================================================================
@@ -456,12 +479,10 @@ add_accel:
 apply_drag:
     ; drag_frac = (vel_lo << 2) | (vel_frac >> 6)
     LDA vel_x_frac,X
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                    ; vel_frac >> 6
+    ASL A
+    ROL A
+    ROL A
+    AND #$03                 ; vel_frac >> 6
     STA $80
     LDA vel_x_lo,X
     ASL A
@@ -471,28 +492,25 @@ apply_drag:
 
     ; drag_lo = (vel_hi << 2) | (vel_lo >> 6)
     LDA vel_x_lo,X
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                    ; vel_lo >> 6
+    ASL A
+    ROL A
+    ROL A
+    AND #$03                 ; vel_lo >> 6
     STA $81
     LDA vel_x_hi,X
+    TAY                      ; cache vel_hi in Y
     ASL A
     ASL A                    ; vel_hi << 2
     ORA $81
     STA $81                  ; drag_lo
 
     ; drag_hi = sign of vel_hi (correct for |vel_hi| < 64)
-    LDA vel_x_hi,X
-    BPL @ad_pos
-    LDA #$FF
-    BRA @ad_sub
-@ad_pos:
-    LDA #$00
+    LDA #0
+    STA $82                  ; assume positive (drag_hi = 0)
+    TYA                      ; restore vel_hi for sign check
+    BPL @ad_sub
+    DEC $82                  ; negative: drag_hi = $FF
 @ad_sub:
-    STA $82                  ; drag_hi
 
     ; vel -= drag (24-bit)
     LDA vel_x_frac,X
@@ -502,7 +520,7 @@ apply_drag:
     LDA vel_x_lo,X
     SBC $81
     STA vel_x_lo,X
-    LDA vel_x_hi,X
+    TYA                      ; restore vel_hi from cache
     SBC $82
     STA vel_x_hi,X
     RTS

@@ -29,11 +29,10 @@ init_screen:
     STA CRTC_DAT
     LDA #13
     STA CRTC_REG
-    LDA #$00
+    LDA #0
     STA CRTC_DAT
 
     ; Init dirty-top tracking (0 = fully dirty, clear everything)
-    LDA #0
     STA dirty_top_buf0
     STA dirty_top_buf1
 
@@ -47,7 +46,6 @@ init_screen:
 
     ; Initialize double-buffer state: back buffer = buffer 1 ($5800)
     LDA #0
-    STA back_buf_idx
     STA frame_count
     LDA #$58
     STA raster_page
@@ -81,36 +79,26 @@ wait_vsync:
 flip_buffers:
     LDA back_buf_idx
     BNE @show_buf1
-
-    ; Show buffer 0 ($3000): R12=$06
-    LDA #12
-    STA CRTC_REG
-    LDA #$06
-    STA CRTC_DAT
-    LDA #13
-    STA CRTC_REG
-    LDA #$00
-    STA CRTC_DAT
+    ; Will show buffer 0: R12=$06, back→buf1
+    LDX #$06
     LDA #$58
-    STA raster_page
-    LDA #1
-    STA back_buf_idx
-    RTS
-
+    LDY #1
+    JMP @do_flip
 @show_buf1:
-    ; Show buffer 1 ($5800): R12=$0B
+    ; Will show buffer 1: R12=$0B, back→buf0
+    LDX #$0B
+    LDA #$30
+    LDY #0
+@do_flip:
+    STA raster_page
+    STY back_buf_idx
     LDA #12
     STA CRTC_REG
-    LDA #$0B
-    STA CRTC_DAT
+    STX CRTC_DAT
     LDA #13
     STA CRTC_REG
-    LDA #$00
-    STA CRTC_DAT
-    LDA #$30
-    STA raster_page
     LDA #0
-    STA back_buf_idx
+    STA CRTC_DAT
     RTS
 
 ; =====================================================================
@@ -139,54 +127,56 @@ clr_got_buf:
     LDA dirty_top_buf0,X     ; dirty_top for this buffer
     LSR A
     LSR A                     ; page_index (0..40)
+    AND #$FE                  ; round to char row (left+right page pair)
     TAY
     LDA bne_offset_lut,Y     ; BNE operand
-    CPX #0
-    BNE clr_do_buf1
+    DEX
+    BPL clr_do_buf1
     STA clr0_bne + 1         ; SMC: patch buf0 BNE
 
 clear_buf0:
     LDX #0
+    LDA #0
 clr0_loop:
     ; Skip char row 0 ($3000-$31FF) — preserved for status bar
-    STZ $3200,X
-    STZ $3300,X
-    STZ $3400,X
-    STZ $3500,X
-    STZ $3600,X
-    STZ $3700,X
-    STZ $3800,X
-    STZ $3900,X
-    STZ $3A00,X
-    STZ $3B00,X
-    STZ $3C00,X
-    STZ $3D00,X
-    STZ $3E00,X
-    STZ $3F00,X
-    STZ $4000,X
-    STZ $4100,X
-    STZ $4200,X
-    STZ $4300,X
-    STZ $4400,X
-    STZ $4500,X
-    STZ $4600,X
-    STZ $4700,X
-    STZ $4800,X
-    STZ $4900,X
-    STZ $4A00,X
-    STZ $4B00,X
-    STZ $4C00,X
-    STZ $4D00,X
-    STZ $4E00,X
-    STZ $4F00,X
-    STZ $5000,X
-    STZ $5100,X
-    STZ $5200,X
-    STZ $5300,X
-    STZ $5400,X
-    STZ $5500,X
-    STZ $5600,X
-    STZ $5700,X
+    STA $3200,X
+    STA $3300,X
+    STA $3400,X
+    STA $3500,X
+    STA $3600,X
+    STA $3700,X
+    STA $3800,X
+    STA $3900,X
+    STA $3A00,X
+    STA $3B00,X
+    STA $3C00,X
+    STA $3D00,X
+    STA $3E00,X
+    STA $3F00,X
+    STA $4000,X
+    STA $4100,X
+    STA $4200,X
+    STA $4300,X
+    STA $4400,X
+    STA $4500,X
+    STA $4600,X
+    STA $4700,X
+    STA $4800,X
+    STA $4900,X
+    STA $4A00,X
+    STA $4B00,X
+    STA $4C00,X
+    STA $4D00,X
+    STA $4E00,X
+    STA $4F00,X
+    STA $5000,X
+    STA $5100,X
+    STA $5200,X
+    STA $5300,X
+    STA $5400,X
+    STA $5500,X
+    STA $5600,X
+    STA $5700,X
     INX
 clr0_bne:
     BNE clr0_loop
@@ -197,46 +187,47 @@ clr_do_buf1:
 
 clear_buf1:
     LDX #0
+    LDA #0
 clr1_loop:
     ; Skip char row 0 ($5800-$59FF) — preserved for status bar
-    STZ $5A00,X
-    STZ $5B00,X
-    STZ $5C00,X
-    STZ $5D00,X
-    STZ $5E00,X
-    STZ $5F00,X
-    STZ $6000,X
-    STZ $6100,X
-    STZ $6200,X
-    STZ $6300,X
-    STZ $6400,X
-    STZ $6500,X
-    STZ $6600,X
-    STZ $6700,X
-    STZ $6800,X
-    STZ $6900,X
-    STZ $6A00,X
-    STZ $6B00,X
-    STZ $6C00,X
-    STZ $6D00,X
-    STZ $6E00,X
-    STZ $6F00,X
-    STZ $7000,X
-    STZ $7100,X
-    STZ $7200,X
-    STZ $7300,X
-    STZ $7400,X
-    STZ $7500,X
-    STZ $7600,X
-    STZ $7700,X
-    STZ $7800,X
-    STZ $7900,X
-    STZ $7A00,X
-    STZ $7B00,X
-    STZ $7C00,X
-    STZ $7D00,X
-    STZ $7E00,X
-    STZ $7F00,X
+    STA $5A00,X
+    STA $5B00,X
+    STA $5C00,X
+    STA $5D00,X
+    STA $5E00,X
+    STA $5F00,X
+    STA $6000,X
+    STA $6100,X
+    STA $6200,X
+    STA $6300,X
+    STA $6400,X
+    STA $6500,X
+    STA $6600,X
+    STA $6700,X
+    STA $6800,X
+    STA $6900,X
+    STA $6A00,X
+    STA $6B00,X
+    STA $6C00,X
+    STA $6D00,X
+    STA $6E00,X
+    STA $6F00,X
+    STA $7000,X
+    STA $7100,X
+    STA $7200,X
+    STA $7300,X
+    STA $7400,X
+    STA $7500,X
+    STA $7600,X
+    STA $7700,X
+    STA $7800,X
+    STA $7900,X
+    STA $7A00,X
+    STA $7B00,X
+    STA $7C00,X
+    STA $7D00,X
+    STA $7E00,X
+    STA $7F00,X
     INX
 clr1_bne:
     BNE clr1_loop

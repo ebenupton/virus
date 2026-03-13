@@ -22,13 +22,13 @@ DEMO_LOAD = 0x1800
 DEMO_EXEC = 0x1800
 
 
-def assemble(src, binfile, objfile=None, extra_flags=None, linker_cfg="linker.cfg"):
+def assemble(src, binfile, objfile=None, extra_flags=None, linker_cfg="linker.cfg", cpu="6502"):
     """Assemble a .s file → .bin via ca65 + ld65."""
     if objfile is None:
         objfile = src.replace(".s", ".o")
     print(f"Assembling {src} ...")
 
-    cmd = ["ca65", "--cpu", "65C02", "-g"]
+    cmd = ["ca65", "--cpu", cpu, "-g"]
     if extra_flags:
         cmd.extend(extra_flags)
     cmd.extend([src, "-o", objfile])
@@ -283,16 +283,6 @@ def build_demo():
 def build_game():
     """Build the Battlezone game + emulator."""
     generate_tables()
-    game_size = assemble("game.s", "game.bin", "game.o",
-                         extra_flags=["-DUNROLL_SHALLOW=1"])
-    create_ssd("game.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ")
-    compile_emu()
-    print(f"\nDone!  Run: ./emu game.bin")
-
-
-def build_bootable():
-    """Build bootable image: bootloader + game for real BBC Micro hardware."""
-    generate_tables()
 
     # Assemble bootloader
     boot_size = assemble("boot.s", "boot.bin", "boot.o",
@@ -313,14 +303,45 @@ def build_bootable():
     total_size = len(boot_data) + len(game_data)
     print(f"  game_boot.bin: {total_size} bytes (boot={len(boot_data)}, game={len(game_data)})")
 
-    # Create SSD with load=$3000, exec=$3000
+    # Create bootable SSD with load=$3000, exec=$3000
     create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
                load_addr=0x3000, exec_addr=0x3000)
 
-    # Compile emulator
     compile_emu()
+    print(f"\nDone!  Run: ./emu game.bin")
 
-    print(f"\nDone!  Run: ./emu game_boot.bin --boot")
+
+def build_game65c02():
+    """Build the game with 65C02 optimisations enabled."""
+    generate_tables()
+
+    # Assemble bootloader
+    boot_size = assemble("boot.s", "boot.bin", "boot.o",
+                         linker_cfg="boot_linker.cfg")
+
+    # Assemble game
+    game_size = assemble("game.s", "game.bin", "game.o",
+                         extra_flags=["-DUNROLL_SHALLOW=1", "-DCPU_65C02=1"],
+                         cpu="65C02")
+
+    # Concatenate: boot.bin + game.bin → game_boot.bin
+    with open("boot.bin", "rb") as bf:
+        boot_data = bf.read()
+    with open("game.bin", "rb") as gf:
+        game_data = gf.read()
+    with open("game_boot.bin", "wb") as out:
+        out.write(boot_data)
+        out.write(game_data)
+    total_size = len(boot_data) + len(game_data)
+    print(f"  game_boot.bin: {total_size} bytes (boot={len(boot_data)}, game={len(game_data)})")
+
+    # Create bootable SSD with load=$3000, exec=$3000
+    create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
+               load_addr=0x3000, exec_addr=0x3000)
+
+    compile_emu()
+    print(f"\nDone (65C02)!  Run: ./emu game.bin")
+
 
 
 if __name__ == "__main__":
@@ -329,10 +350,12 @@ if __name__ == "__main__":
     if target == "game":
         build_game()
     elif target == "boot":
-        build_bootable()
+        build_game()
+    elif target == "game65c02":
+        build_game65c02()
     elif target == "demo":
         build_demo()
     else:
         print(f"Unknown target: {target}")
-        print("Usage: python3 build.py [demo|game|boot]")
+        print("Usage: python3 build.py [demo|game|game65c02|boot]")
         sys.exit(1)

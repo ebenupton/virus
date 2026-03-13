@@ -225,8 +225,7 @@ update_camera:
     JSR scan_key_add
     LDA #KEY_M              ; M key → roll right (ship_roll -= 4)
     LDY #<(-4)
-    JSR scan_key_add
-    RTS
+    JMP scan_key_add        ; tail call
 
 ; scan_key_add — Check key and add signed delta to ZP variable
 ; Input: A = key code, X = ZP address, Y = signed delta
@@ -409,14 +408,14 @@ smul_shr7:
 
 sincos:
     LDA sin_table,X
-    PHA
+    TAY                     ; Y = sin (3 cycles faster than PHA/PLA)
     TXA
     CLC
     ADC #64
     TAX
     LDA sin_table,X         ; cos
     TAX                     ; X = cos
-    PLA                     ; A = sin
+    TYA                     ; A = sin
     RTS
 
 ; =====================================================================

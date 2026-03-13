@@ -78,8 +78,7 @@ umul8x8:
     SBC math_b
     BCS @u_diff_pos
     EOR #$FF
-    CLC
-    ADC #1
+    ADC #1                  ; C=0 from BCS not-taken
 @u_diff_pos:
     TAY                     ; Y = |a - b|
 
@@ -129,8 +128,7 @@ smul8x8:
     SBC math_b
     BCS @diff_pos
     EOR #$FF
-    CLC
-    ADC #1
+    ADC #1                  ; C=0 from BCS not-taken
 @diff_pos:
     TAY
 
@@ -307,8 +305,7 @@ urecip15:
     SBC delta_val
     BCS @l_diff_pos
     EOR #$FF
-    CLC
-    ADC #1
+    ADC #1                  ; C=0 from BCS not-taken
 @l_diff_pos:
     TAX                     ; X = |f - D|
 

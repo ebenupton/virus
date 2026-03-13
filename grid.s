@@ -534,8 +534,7 @@ draw_grid:
     SBC math_b
     BCS @hm_dp
     EOR #$FF
-    CLC
-    ADC #1
+    ADC #1                    ; C=0 from BCS not-taken
 @hm_dp:
     TAY                       ; Y = |A - math_b|
     TXA                       ; restore A

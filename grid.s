@@ -258,11 +258,9 @@ draw_grid:
     STA z_cam_hi
     JMP @no_z_adj
 @not_near_adj:
-    ; Far row check: proj_row + 1 == n_rows?
+    ; Far row check: proj_row == last_row_idx (= n_rows - 1)?
     ; A = proj_row (preserved from LDA above, BNE taken)
-    CLC
-    ADC #1
-    CMP n_rows
+    CMP last_row_idx
     BNE @no_z_adj
     ; Far row: z_cam -= interp_offset_far → projects at Z_FAR_BOUND
     LDA interp_offset_far
@@ -433,9 +431,7 @@ draw_grid:
     STA interp_z_ptr+1
     JMP @z_setup_done
 @z_not_near:
-    CLC
-    ADC #1
-    CMP n_rows
+    CMP last_row_idx
     BNE @z_setup_done
     ; Far row: inner row = previous row
     LDA interp_offset_far
@@ -582,8 +578,18 @@ draw_grid:
     CPX n_vtx                 ; first vertex?
     BEQ @do_left_clamp        ; always clamp to left boundary
     DEX                       ; proj_col - 1
-    BEQ @do_right_clamp       ; was 1 → always clamp to right boundary
-    JMP @sx_done              ; middle vertices: no clamping
+    BNE @sx_done              ; middle vertices: no clamping
+    ; Fall through: right edge (proj_col was 1)
+    ; Interpolate height at right screen edge
+    LDA hmap_col
+    SEC
+    SBC #1
+    AND #$1F
+    TAY                       ; Y = inner column
+    LDA interp_offset_r
+    JSR interp_height
+    LDA clamp_right
+    JMP @sx_done              ; skip left clamp path
 @do_left_clamp:
     ; Interpolate height at left screen edge
     LDA hmap_col
@@ -594,17 +600,6 @@ draw_grid:
     LDA interp_offset_l
     JSR interp_height
     LDA clamp_left
-    JMP @sx_done
-@do_right_clamp:
-    ; Interpolate height at right screen edge
-    LDA hmap_col
-    SEC
-    SBC #1
-    AND #$1F
-    TAY                       ; Y = inner column
-    LDA interp_offset_r
-    JSR interp_height
-    LDA clamp_right
 @sx_done:
     ; A = final sx for this vertex
     STA raster_x1             ; cache for V-chain endpoint
@@ -648,8 +643,7 @@ draw_grid:
     ; Chain state: init_base on row 1, restore on row 2+
     LDX chain_state_idx
     LDA proj_row
-    SEC
-    SBC #1                    ; Z=1 iff proj_row==1
+    CMP #1                    ; Z=1 iff proj_row==1
     BNE @v_restore
     JSR init_base             ; Y = sub_y
     JMP @v_ready
@@ -811,9 +805,7 @@ draw_grid:
     JMP @row_loop
 @proj_done:
     ; --- Post-projection: draw h-chains row by row (back-to-front) ---
-    LDA n_rows
-    SEC
-    SBC #1
+    LDA last_row_idx
     STA proj_row
 @h_row_loop:
     ; grid_ptr = v_buf + row offset
@@ -826,10 +818,9 @@ draw_grid:
     ADC #>v_buf
     STA grid_ptr+1
 
-    LDA n_vtx
-    SEC
-    SBC #1
-    STA seg_count
+    LDX n_vtx
+    DEX
+    STX seg_count
     JSR draw_h_row
 
     DEC proj_row

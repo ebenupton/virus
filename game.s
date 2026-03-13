@@ -116,10 +116,10 @@ entry:
     JSR init_status
     JSR draw_map              ; blit minimap to buf1 (raster_page=$58 from init)
     LDA #$30
-    STA raster_page
+    JSR set_page
     JSR draw_map              ; blit minimap to buf0
     LDA #$58
-    STA raster_page           ; restore to buf1 (back buffer)
+    JSR set_page              ; restore to buf1 (back buffer)
 
     ; Mark both buffers clean so first clear_screen doesn't erase the map
     LDA #160

@@ -38,17 +38,17 @@ init_screen:
 
     ; Clear both screen buffers
     LDA #$30
-    STA raster_page
+    JSR set_page
     JSR clear_screen
     LDA #$58
-    STA raster_page
+    JSR set_page
     JSR clear_screen
 
     ; Initialize double-buffer state: back buffer = buffer 1 ($5800)
     LDA #0
     STA frame_count
     LDA #$58
-    STA raster_page
+    JSR set_page
     LDA #1
     STA back_buf_idx
     RTS
@@ -90,8 +90,8 @@ flip_buffers:
     LDA #$30
     LDY #0
 @do_flip:
-    STA raster_page
     STY back_buf_idx
+    JSR set_page
     LDA #12
     STA CRTC_REG
     STX CRTC_DAT

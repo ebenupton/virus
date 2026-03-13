@@ -1330,54 +1330,109 @@ init_base:
     RTS
 
 ; =====================================================================
+; set_page — Set raster page and patch overflow protection SMC
+;
+; Input:  A = page ($30 for buf0, $58 for buf1)
+; Trashes: A
+;
+set_page:
+    STA raster_page
+    CMP #$58
+    BEQ @sp_buf1
+    ; buf0: install BPL (advance) and BMI (retreat)
+    LDA #$10                        ; BPL opcode
+    STA sa_smc
+    LDA #(sa_fixup - sa_smc - 2)    ; branch offset
+    STA sa_smc + 1
+    LDA #$30                        ; BMI opcode
+    STA sr_smc
+    LDA #(sr_fixup - sr_smc - 2)    ; branch offset
+    STA sr_smc + 1
+    RTS
+@sp_buf1:
+    ; buf1: NOP out both branches
+    LDA #$EA                        ; NOP opcode
+    STA sa_smc
+    STA sa_smc + 1
+    STA sr_smc
+    STA sr_smc + 1
+    RTS
+
+; =====================================================================
 ; stripe_advance — Row-cross advance with buf0 overflow protection
 ;
 ; Advances raster_base by 512 (next char row), sets Y=0.
 ; If buf0 overflows into buf1 ($58/$59), redirects to ROM via ORA #$80.
-; Carry on exit: undefined.
+; A preserved.  Carry on exit: undefined.
+; Requires: set_page called to configure SMC.
 ;
 stripe_advance:
+    LDY raster_base+1
+    INY
+    INY
+    CPY #$58
+sa_smc:
+    BPL sa_fixup                    ; SMC: NOP NOP for buf1
+    STY raster_base+1
     LDY #0
-    INC raster_base+1
-    INC raster_base+1
-    BPL @sa_check                   ; N clear → check for overflow
-    RTS                             ; bit 7 set → already redirected to ROM
-@sa_check:
-    PHA                             ; save A (Bresenham error for shallow callers)
-    LDA raster_base+1
-    CMP #$58
-    BCC @sa_skip                    ; < $58 → on screen
-    CMP #$5A
-    BCS @sa_skip                    ; >= $5A → valid buf1 page
-    ORA #$80                        ; $58 or $59 → redirect to ROM
+    RTS
+sa_fixup:
+    PHA
+    TYA
+    ORA #$80
     STA raster_base+1
-@sa_skip:
-    PLA                             ; restore A
+    PLA
+    LDY #0
     RTS
 
 ; =====================================================================
 ; stripe_retreat — Row-cross retreat with buf0 overflow un-redirect
 ;
 ; Retreats raster_base by 512 (previous char row), sets Y=7.
-; If a redirected buf0 address ($D8/$D9) comes back to $56/$57,
+; If a redirected buf0 address comes back to $56/$57,
 ; unmasks it (AND #$7F) to restore valid screen address.
-; Carry on exit: C=1 (all paths).
+; A preserved.  Carry on exit: C=1 (common path preserves caller's C;
+; fixup path sets C=1 via SEC).
+; Requires: set_page called to configure SMC.
 ;
+; sketch
+; 
+;    LDY raster_base+1
+;    DEY
+;    DEY
+;    CPY #$d8
+;    BMI fixup 
+;    STY raster_base+1
+;    LDY #7
+;    SEC
+;    RTS
+; .fixup
+;    PHA
+;    TYA
+;    AND #$7F
+;    STA raster_base+1
+;    PLA
+;    LDY #7
+;    SEC
+;    RTS
+
 stripe_retreat:
+    LDY raster_base+1
+    DEY
+    DEY
+    CPY #$D8
+sr_smc:
+    BMI sr_fixup                    ; SMC: NOP NOP for buf1
+    STY raster_base+1
     LDY #7
-    DEC raster_base+1
-    DEC raster_base+1
-    BPL @sr_done                    ; N clear → on screen (carry preserved)
-    PHA                             ; save A (Bresenham error for shallow callers)
-    LDA raster_base+1
-    AND #$7F                        ; unmask in A (AND doesn't affect carry)
-    CMP #$56
-    BCC @sr_restore_c               ; unmasked < $56 → not buf0 redirect
-    CMP #$58
-    BCS @sr_restore_c               ; unmasked >= $58 → still past buf0 boundary
-    STA raster_base+1               ; unmasked $56 or $57 → back on screen
-@sr_restore_c:
-    PLA                             ; restore A
-    SEC                             ; restore C=1
-@sr_done:
+    SEC
+    RTS
+sr_fixup:
+    PHA
+    TYA
+    AND #$7F
+    STA raster_base+1
+    PLA
+    LDY #7
+    SEC
     RTS

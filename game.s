@@ -132,16 +132,12 @@ entry:
     STA ship_yaw
     STA ship_roll
 
-    ; Initialize velocities to zero
-    STA vel_x_hi
-    STA vel_x_lo
-    STA vel_x_frac
-    STA vel_y_hi
-    STA vel_y_lo
-    STA vel_y_frac
-    STA vel_z_hi
-    STA vel_z_lo
-    STA vel_z_frac
+    ; Initialize velocities to zero (vel_x_hi..$2E contiguous)
+    LDX #(vel_z_frac - vel_x_hi)
+@clr_vel:
+    STA vel_x_hi,X
+    DEX
+    BPL @clr_vel
 
     ; Initialize position fraction accumulators
     STA pos_x_frac
@@ -241,6 +237,15 @@ scan_key_add:
 @ska_done:
     RTS
 
+; zero_y_vel — Zero Y velocity and position fraction (for ground/ceiling clamp)
+zero_y_vel:
+    LDA #0
+    STA pos_y_frac
+    STA vel_y_hi
+    STA vel_y_lo
+    STA vel_y_frac
+    RTS
+
 ; =====================================================================
 ; Update physics — gravity, thrust, drag, position, ground clamp, camera
 ; =====================================================================
@@ -334,10 +339,7 @@ update_physics:
     STA obj_world_pos+OBJ_WORLD_SHIP+2
     LDA #0
     STA obj_world_pos+OBJ_WORLD_SHIP+3
-    STA pos_y_frac
-    STA vel_y_hi
-    STA vel_y_lo
-    STA vel_y_frac
+    JSR zero_y_vel
 @above_ground:
 
     ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y
@@ -353,11 +355,7 @@ update_physics:
     STA obj_world_pos+OBJ_WORLD_SHIP+2
     LDA #MAX_POS_Y_HI
     STA obj_world_pos+OBJ_WORLD_SHIP+3
-    LDA #0
-    STA pos_y_frac
-    STA vel_y_hi
-    STA vel_y_lo
-    STA vel_y_frac
+    JSR zero_y_vel
 @below_ceiling:
 
     ; 6. Camera follow

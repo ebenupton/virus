@@ -45,7 +45,7 @@ init_screen:
     JSR clear_screen
 
     ; Initialize double-buffer state: back buffer = buffer 1 ($5800)
-    LDA #0
+    ; A=0 from clear_screen loop
     STA frame_count
     LDA #$58
     JSR set_page
@@ -78,17 +78,17 @@ wait_vsync:
 
 flip_buffers:
     LDA back_buf_idx
-    BNE @show_buf1
-    ; Will show buffer 0: R12=$06, back→buf1
-    LDX #$06
-    LDA #$58
-    LDY #1
-    JMP @do_flip
-@show_buf1:
+    BEQ @show_buf0
     ; Will show buffer 1: R12=$0B, back→buf0
     LDX #$0B
     LDA #$30
     LDY #0
+    BEQ @do_flip              ; always taken (Y=0)
+@show_buf0:
+    ; Will show buffer 0: R12=$06, back→buf1
+    LDX #$06
+    LDA #$58
+    LDY #1
 @do_flip:
     STY back_buf_idx
     JSR set_page

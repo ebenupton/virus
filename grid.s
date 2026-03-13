@@ -429,7 +429,7 @@ draw_grid:
     STA interp_z_ptr
     LDA hmap_next_ptr+1
     STA interp_z_ptr+1
-    JMP @z_setup_done
+    BNE @z_setup_done         ; always (hmap hi byte > 0)
 @z_not_near:
     CMP last_row_idx
     BNE @z_setup_done
@@ -502,7 +502,7 @@ draw_grid:
     LSR A                     ; h (0..31)
     STA offset_tmp
     TXA
-    JMP @do_height_mul
+    BNE @do_height_mul        ; always (h*8 > 0 from BEQ check)
 
 @col_loop:
     ; --- Height lookup, color precompute, and sy adjustment ---
@@ -547,7 +547,7 @@ draw_grid:
     SBC sqr_lo,Y
     LDA sqr2_hi,X
     SBC sqr_hi,Y
-    JMP @hm_end
+    BCS @hm_end               ; always (quarter-square never borrows)
 @hm_no:
     SEC
     LDA sqr_lo,X
@@ -588,7 +588,7 @@ draw_grid:
     LDA interp_offset_r
     JSR interp_height
     LDA clamp_right
-    JMP @sx_done              ; skip left clamp path
+    BNE @sx_done              ; always (clamp_right >= 64)
 @do_left_clamp:
     ; Interpolate height at left screen edge
     LDA hmap_col

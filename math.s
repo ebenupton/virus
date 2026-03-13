@@ -156,9 +156,9 @@ smul8x8:
     SBC sqr_hi,Y
 
 @sign_correct:
+    ; C=1: quarter-square subtraction never borrows
     LDX math_a
     BPL @a_pos
-    SEC
     SBC math_b
 @a_pos:
     LDX math_b

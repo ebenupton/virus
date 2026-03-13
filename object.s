@@ -279,26 +279,23 @@ draw_object:
     LDA (obj_ptr),Y
     STA obj_clip_flags          ; flags (bit 7 = skip clip)
 
-    ; Init bounding box to empty
-    LDA #127
-    STA obj_bb_min_sx
+    ; Init bounding box to empty (group zero-stores)
     LDA #0
     STA obj_bb_max_sx
+    STA obj_bb_max_sy
+    STA vtx_idx              ; vtx_idx = 0
+    LDA #127
+    STA obj_bb_min_sx
     LDA #160
     STA obj_bb_min_sy
-    LDA #0
-    STA obj_bb_max_sy
 
-    ; Clear per-vertex outcode array
+    ; Clear per-vertex outcode array (A clobbered, reload 0 not needed)
     LDX #MAX_OBJ_VERTICES-1
     LDA #0
 @clear_clip:
     STA obj_vtx_clip,X
     DEX
     BPL @clear_clip
-
-    LDA #0
-    STA vtx_idx              ; vtx_idx = 0
 
 @proj_loop:
     LDA vtx_idx
@@ -598,45 +595,8 @@ draw_object:
     LDA clip_has_isect          ; face_color from $8F
     STA face_color_val          ; → $8B
 
-    ; ── Clipping temporarily disabled — draw all edges ──
+    ; ── Draw all edges (clipping disabled) ──
     JMP @all_inside
-
-    ; ── Outcode classification (N vertices from poly_ring) ──
-    LDX poly_ring               ; v_0
-    LDA obj_vtx_clip,X
-    STA obj_n_vtx               ; or_accum = oc_0
-    STA recip                   ; and_accum = oc_0
-
-    LDY #1
-@oc_loop:
-    CPY face_n_edges
-    BCS @oc_done
-    LDX poly_ring,Y
-    LDA obj_vtx_clip,X         ; oc_i
-    ORA obj_n_vtx
-    STA obj_n_vtx               ; or |= oc_i
-    LDA obj_vtx_clip,X         ; reload oc_i
-    AND recip
-    STA recip                   ; and &= oc_i
-    INY
-    JMP @oc_loop
-@oc_done:
-
-    LDA obj_n_vtx               ; outcode_or
-    BEQ @all_inside             ; all zero → all inside
-    LDA recip                   ; outcode_and
-    BNE @all_outside            ; all share a clip plane → trivially outside
-
-    ; Mixed: at least one outside, need clipping
-    JMP @mixed_clip
-
-@all_outside:
-    ; Skip face, don't mark edges
-    LDA data_off
-    CLC
-    ADC face_n_edges
-    STA data_off
-    JMP @face_loop
 
 @skip_face:
     ; Back-facing: clean stack and advance past edge IDs

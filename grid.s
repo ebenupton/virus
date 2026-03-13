@@ -377,8 +377,7 @@ draw_grid:
 @x_wrap:
     ; sub_x in [$20,$3F]: run += ($40 - sub_x) * recip
     EOR #$3F
-    CLC
-    ADC #1                    ; A = $40 - sub_x (1..$20)
+    ADC #0                    ; C=1 from BCS, so A = ~lo6 + 1 = $40 - sub_x
     STA math_a
     JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
     LDA run_lo
@@ -1063,8 +1062,7 @@ lerp_height:
 compute_interp_offsets:
     CMP #$20
     BCS @hi
-    CLC
-    ADC #32
+    ADC #32                   ; C=0 from BCS not-taken
     BCC @done
 @hi:
     SEC

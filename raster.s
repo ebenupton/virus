@@ -1316,14 +1316,16 @@ init_base:
     ; through STA/TXA (neither affects carry).
     TXA
     ADC raster_page                 ; char_row*2 + raster_page + C
-    STA raster_base+1                      ; no overflow possible: max $58+38+1=$7F
-;    CMP #$58
-;    BCC @ib_skip
-;    CMP #$5A
-;    BCS @ib_skip
-;    ORA #$80                        ; $58 or $59 → redirect to ROM
-;    STA raster_base+1
-;@ib_skip:
+    STA raster_base+1
+    ; Buf0 overflow: page >= $58 → redirect writes to ROM via bit 7
+    ; Buf1 overflow ($80+) is naturally ROM — skip via BVS (bit 6 of $58)
+    BIT raster_page
+    BVS @ib_skip                    ; buf1: bit 6 set → no redirect needed
+    CMP #$58
+    BCC @ib_skip                    ; buf0: page < $58 → on screen
+    ORA #$80                        ; buf0 overflow → redirect to ROM
+    STA raster_base+1
+@ib_skip:
 
     ; Sub-row → Y (reloading raster_y0 is cheaper than saving/restoring)
     LDA raster_y0
@@ -1342,17 +1344,19 @@ stripe_advance:
     LDY #0
     INC raster_base+1
     INC raster_base+1
-;    BPL @check                      ; N clear → check for overflow
-;    RTS                             ; bit 7 set → already redirected to ROM
-;@check:
-;    LDA raster_base+1
-;    CMP #$58
-;    BCC @done                       ; < $58 → on screen
-;    CMP #$5A
-;    BCS @done                       ; >= $5A → valid buf1 page
-;    ORA #$80                        ; $58 or $59 → redirect to ROM
-;    STA raster_base+1
-;@done:
+    BPL @sa_check                   ; N clear → check for overflow
+    RTS                             ; bit 7 set → already redirected to ROM
+@sa_check:
+    PHA                             ; save A (Bresenham error for shallow callers)
+    LDA raster_base+1
+    CMP #$58
+    BCC @sa_skip                    ; < $58 → on screen
+    CMP #$5A
+    BCS @sa_skip                    ; >= $5A → valid buf1 page
+    ORA #$80                        ; $58 or $59 → redirect to ROM
+    STA raster_base+1
+@sa_skip:
+    PLA                             ; restore A
     RTS
 
 ; =====================================================================
@@ -1367,15 +1371,17 @@ stripe_retreat:
     LDY #7
     DEC raster_base+1
     DEC raster_base+1
-;    BPL @done                       ; N clear → on screen (carry preserved)
-;    LDA raster_base+1
-;    AND #$7F                        ; unmask in A (AND doesn't affect carry)
-;    CMP #$56
-;    BCC @restore_c                  ; unmasked < $56 → not buf0 redirect
-;    CMP #$58
-;    BCS @restore_c                  ; unmasked >= $58 → still past buf0 boundary
-;    STA raster_base+1               ; unmasked $56 or $57 → back on screen
-;@restore_c:
+    BPL @sr_done                    ; N clear → on screen (carry preserved)
+    PHA                             ; save A (Bresenham error for shallow callers)
+    LDA raster_base+1
+    AND #$7F                        ; unmask in A (AND doesn't affect carry)
+    CMP #$56
+    BCC @sr_restore_c               ; unmasked < $56 → not buf0 redirect
+    CMP #$58
+    BCS @sr_restore_c               ; unmasked >= $58 → still past buf0 boundary
+    STA raster_base+1               ; unmasked $56 or $57 → back on screen
+@sr_restore_c:
+    PLA                             ; restore A
     SEC                             ; restore C=1
-;@done:
+@sr_done:
     RTS

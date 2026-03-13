@@ -194,10 +194,10 @@ update_fuel:
     AND #1
     BNE @shrink_odd
     LDA #$00                  ; even: erase both pixels in column
-    JMP @uf_write
+    BEQ @uf_write             ; always (A=0)
 @shrink_odd:
     LDA #$08                  ; odd: keep left green, erase right
-    JMP @uf_write
+    BNE @uf_write             ; always (A=$08)
 
 @uf_grow:
     ; --- Grow: draw green at position cur, increment cur ---
@@ -209,7 +209,7 @@ update_fuel:
     AND #1
     BNE @grow_odd
     LDA #$08                  ; even: left pixel green
-    JMP @uf_write
+    BNE @uf_write             ; always (A=$08)
 @grow_odd:
     LDA #$0C                  ; odd: both pixels green
 

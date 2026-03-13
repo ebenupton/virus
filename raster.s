@@ -161,37 +161,27 @@ pixel_count = $42
 
 ; steep_tbl — 8 entries, indexed by {raster_x0_par, x_left, y_up}
 ; Entry point receives A = initial error, C=1, Y = sub-row.
-steep_tbl:
-    .word tdr_l              ;  0: left-pixel,  right-moving, down
-    .word tur_l              ;  1: left-pixel,  right-moving, up
-    .word tdl_l              ;  2: left-pixel,  left-moving,  down
-    .word tul_l              ;  3: left-pixel,  left-moving,  up
-    .word tdr_r              ;  4: right-pixel, right-moving, down
-    .word tur_r              ;  5: right-pixel, right-moving, up
-    .word tdl_r              ;  6: right-pixel, left-moving,  down
-    .word tul_r              ;  7: right-pixel, left-moving,  up
+steep_tbl_lo:
+    .byte <(tdr_l-1), <(tur_l-1), <(tdl_l-1), <(tul_l-1)
+    .byte <(tdr_r-1), <(tur_r-1), <(tdl_r-1), <(tul_r-1)
+steep_tbl_hi:
+    .byte >(tdr_l-1), >(tur_l-1), >(tdl_l-1), >(tul_l-1)
+    .byte >(tdr_r-1), >(tur_r-1), >(tdl_r-1), >(tul_r-1)
 
 ; shallow_tbl — 16 entries, indexed by {raster_x0_par, ~count_par, x_left, y_up}
 ; The end/mid selection ensures pixel counts align with entry parity:
 ;   Right-moving: XOR(raster_x0_par, ~count_par) = 1 → end, 0 → mid
 ;   Left-moving:  XOR(raster_x0_par, ~count_par) = 0 → end, 1 → mid
-shallow_tbl:
-    .word sdr_mid_l          ;  0: par=0, ~cp=0, right, down  XOR=0→mid
-    .word sur_mid_l          ;  1: par=0, ~cp=0, right, up    XOR=0→mid
-    .word sdl_end_l          ;  2: par=0, ~cp=0, left,  down  XOR=0→end
-    .word sul_end_l          ;  3: par=0, ~cp=0, left,  up    XOR=0→end
-    .word sdr_end_l          ;  4: par=0, ~cp=1, right, down  XOR=1→end
-    .word sur_end_l          ;  5: par=0, ~cp=1, right, up    XOR=1→end
-    .word sdl_mid_l          ;  6: par=0, ~cp=1, left,  down  XOR=1→mid
-    .word sul_mid_l          ;  7: par=0, ~cp=1, left,  up    XOR=1→mid
-    .word sdr_end_r          ;  8: par=1, ~cp=0, right, down  XOR=1→end
-    .word sur_end_r          ;  9: par=1, ~cp=0, right, up    XOR=1→end
-    .word sdl_mid_r          ; 10: par=1, ~cp=0, left,  down  XOR=1→mid
-    .word sul_mid_r          ; 11: par=1, ~cp=0, left,  up    XOR=1→mid
-    .word sdr_mid_r          ; 12: par=1, ~cp=1, right, down  XOR=0→mid
-    .word sur_mid_r          ; 13: par=1, ~cp=1, right, up    XOR=0→mid
-    .word sdl_end_r          ; 14: par=1, ~cp=1, left,  down  XOR=0→end
-    .word sul_end_r          ; 15: par=1, ~cp=1, left,  up    XOR=0→end
+shallow_tbl_lo:
+    .byte <(sdr_mid_l-1), <(sur_mid_l-1), <(sdl_end_l-1), <(sul_end_l-1)
+    .byte <(sdr_end_l-1), <(sur_end_l-1), <(sdl_mid_l-1), <(sul_mid_l-1)
+    .byte <(sdr_end_r-1), <(sur_end_r-1), <(sdl_mid_r-1), <(sul_mid_r-1)
+    .byte <(sdr_mid_r-1), <(sur_mid_r-1), <(sdl_end_r-1), <(sul_end_r-1)
+shallow_tbl_hi:
+    .byte >(sdr_mid_l-1), >(sur_mid_l-1), >(sdl_end_l-1), >(sul_end_l-1)
+    .byte >(sdr_end_l-1), >(sur_end_l-1), >(sdl_mid_l-1), >(sul_mid_l-1)
+    .byte >(sdr_end_r-1), >(sur_end_r-1), >(sdl_mid_r-1), >(sul_mid_r-1)
+    .byte >(sdr_mid_r-1), >(sur_mid_r-1), >(sdl_end_r-1), >(sul_end_r-1)
 
 ; =====================================================================
 ; draw_line — Draw a Bresenham line from (raster_x0,raster_y0) towards (raster_x1,raster_y1)
@@ -227,10 +217,9 @@ draw_line:
     SEC
     SBC raster_x0
     BCS @dx_pos
-    EOR #$FF                ; negate: complement...
-    CLC
-    ADC #1                  ; ...and increment (NMOS: CLC;ADC replaces INC A)
-    SEC                     ; restore C=1 (was C=0 from SBC borrow)
+    EOR #$FF                ; negate: complement + increment
+    ADC #1                  ; C=0 from SBC borrow
+    SEC                     ; restore C=1 for dy SBC
 @dx_pos:
     TAX                     ; X = |dx|, C=1
 
@@ -239,8 +228,7 @@ draw_line:
     SBC raster_y1                  ; C=1 from SEC or BCS path
     BCS @dy_pos
     EOR #$FF
-    CLC
-    ADC #1                  ; NMOS: CLC;ADC replaces INC A (carry reset by CPX below)
+    ADC #1                  ; C=0 from SBC borrow (carry reset by CPX below)
 @dy_pos:
     ; A = |dy|, X = |dx|, Y = sub-row (preserved)
 
@@ -268,20 +256,16 @@ draw_line:
     LDX raster_y0
     CPX raster_y1                  ; C=1 if raster_y0 >= raster_y1 (moving up)
     ROL A                   ; shift in y_up flag
-    ASL A                   ; ×2 for word-sized table entries
     TAX
 
+    LDA steep_tbl_hi,X
+    PHA
+    LDA steep_tbl_lo,X
+    PHA
     LDA delta_major
     SEC
-    SBC delta_minor         ; initial error = delta_major - delta_minor
-    PHA                     ; save error (C=1 preserved through PHA/PLA)
-    LDA steep_tbl+1,X
-    STA @steep_jmp+2
-    LDA steep_tbl,X
-    STA @steep_jmp+1
-    PLA                     ; restore error
-@steep_jmp:
-    JMP $0000               ; SMC: target patched above
+    SBC delta_minor         ; A = initial error, C=1
+    RTS                     ; dispatch via pushed address
 
 @shallow:
     ; --- SHALLOW: |dx| >= |dy|, major axis is X ---
@@ -289,9 +273,8 @@ draw_line:
     ; delta_minor already holds |dy| from the tentative assignment
 
     ; pixel_count = ceil(|dx| / 2) = number of pixel pairs
-    TXA                     ; A = |dx|
-    CLC
-    ADC #1                  ; NMOS: CLC;ADC replaces INC A (LSR below sets its own C)
+    INX
+    TXA                     ; A = |dx|+1
     LSR A                   ; A = (|dx|+1)/2, C = (|dx|+1) bit 0
     STA pixel_count         ; C = ~count_parity (preserved below)
 
@@ -306,20 +289,16 @@ draw_line:
     LDX raster_y0
     CPX raster_y1                  ; C=1 if moving up
     ROL A                   ; shift in y_up
-    ASL A                   ; ×2 for word-sized table entries
     TAX
 
+    LDA shallow_tbl_hi,X
+    PHA
+    LDA shallow_tbl_lo,X
+    PHA
     LDA delta_major
     SEC
-    SBC delta_minor         ; initial error, C=1 (delta_major >= delta_minor)
-    PHA                     ; save error (C=1 preserved through PHA/PLA)
-    LDA shallow_tbl+1,X
-    STA @shallow_jmp+2
-    LDA shallow_tbl,X
-    STA @shallow_jmp+1
-    PLA                     ; restore error
-@shallow_jmp:
-    JMP $0000               ; SMC: target patched above
+    SBC delta_minor         ; A = initial error, C=1
+    RTS                     ; dispatch via pushed address
 
 @zero_line:
     RTS

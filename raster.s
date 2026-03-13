@@ -1394,27 +1394,6 @@ sa_fixup:
 ; A preserved.  Carry on exit: C=1 (common path preserves caller's C;
 ; fixup path sets C=1 via SEC).
 ; Requires: set_page called to configure SMC.
-;
-; sketch
-; 
-;    LDY raster_base+1
-;    DEY
-;    DEY
-;    CPY #$d8
-;    BMI fixup 
-;    STY raster_base+1
-;    LDY #7
-;    SEC
-;    RTS
-; .fixup
-;    PHA
-;    TYA
-;    AND #$7F
-;    STA raster_base+1
-;    PLA
-;    LDY #7
-;    SEC
-;    RTS
 
 stripe_retreat:
     LDY raster_base+1

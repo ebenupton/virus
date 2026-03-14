@@ -1,5 +1,8 @@
 ; grid.s — Perspective grid projection and rendering for BBC Micro
 ;
+; TODO: restore a single plot_final_pixel at the end of draw_grid
+;       (top-right corner pixel is noticeably missing)
+;
 ; Provides: draw_grid
 ; Requires: raster_zp.inc, math_zp.inc, grid_zp.inc
 ; Ext refs: cam_x_lo/hi, cam_z_lo/hi, height_map, urecip15, umul8x8,
@@ -36,7 +39,7 @@ hmap_row        = ZP_GRID + 33     ; current heightmap row index (0..31)
 ; Grid dimensions / clamps
 n_vtx           = ZP_GRID + 34     ; vertices per row this frame
 n_rows          = ZP_GRID + 35     ; vertex rows this frame
-last_row_idx    = ZP_GRID + 36     ; n_rows-1, precomputed for V-chain final pixel check
+n_rows_m1       = ZP_GRID + 36     ; n_rows-1, precomputed for V-chain final pixel check
 chain_state_idx = ZP_GRID + 37     ; index into chain_state[] for v-chain
 clamp_left      = ZP_GRID + 38     ; left edge screen x clamp
 clamp_right     = ZP_GRID + 39     ; right edge screen x clamp
@@ -58,7 +61,8 @@ saved_color     = ZP_GRID + 52     ; colour for current segment
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"
-v_buf:        .res GRID_VTX_Z * ROW_STRIDE    ; row-major, 4 bytes/vertex
+v_buf:        .res GRID_VTX_Z * ROW_STRIDE + 3 ; row-major, 3 bytes/vertex (+3 pad for h_color lookahead)
+v_color_buf:  .res GRID_VTX_X                  ; v-chain colour line buffer
 chain_state:  .res GRID_VTX_X * 3              ; v-chain state per column
 .segment "CODE"
 
@@ -102,32 +106,19 @@ draw_grid:
     STA grid_min_sy
 
     ; === Compute z_cam for row 0 ===
-    ; z_cam = CAM_Z_BEHIND - (HALF_ROWS-1)*$40 - sub_z (pushed out one cell)
+    ; EOR #$20 + AND #$3F biases sub_z so both half-cell cases collapse
+    ; into a single subtraction: z_cam = K - biased_sub_z
     LDA cam_z_lo
-    AND #$3F                  ; sub_z (0..63)
-    CMP #$20
-    BCS @z_wrap
-    ; sub_z < $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-1)*$40) - sub_z
+    EOR #$20
+    AND #$3F
     STA offset_tmp
     SEC
-    LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
+    LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40 + $20)
     SBC offset_tmp
     STA z_cam_lo
-    LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40)
+    LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 1) * $40 + $20)
     SBC #0
     STA z_cam_hi
-    JMP @z_done
-@z_wrap:
-    ; sub_z >= $20: z_cam = (CAM_Z_BEHIND - (HALF_ROWS-2)*$40) - sub_z
-    STA offset_tmp
-    SEC
-    LDA #<(CAM_Z_BEHIND - (HALF_ROWS - 2) * $40)
-    SBC offset_tmp
-    STA z_cam_lo
-    LDA #>(CAM_Z_BEHIND - (HALF_ROWS - 2) * $40)
-    SBC #0
-    STA z_cam_hi
-@z_done:
 
     ; === Cache sub_x/sub_z (ship fractional position within cell) ===
     LDA obj_world_pos+OBJ_WORLD_SHIP+0
@@ -174,35 +165,23 @@ draw_grid:
     ASL A
     STA terrain_y              ; height * 4 (cam follows ship, halving effective offset)
 
-    ; === Determine n_vtx based on sub_x ===
+    ; === Determine n_vtx and n_rows (conditionally omit edge col/row) ===
+    LDX #GRID_VTX_X
     LDA grid_ptr              ; sub_x
     CMP #$20
-    BNE @full_grid
-    ; sub_x == $20: omit rightmost column
-    LDA #(GRID_VTX_X - 1)
-    STA n_vtx
-    BCS @grid_size_done
-@full_grid:
-    LDA #GRID_VTX_X
-    STA n_vtx
-@grid_size_done:
-
-    ; === Determine n_rows based on sub_z ===
+    BNE @keep_x
+    DEX
+@keep_x:
+    STX n_vtx
+    LDY #GRID_VTX_Z
     LDA grid_ptr+1            ; sub_z
     CMP #$20
-    BNE @full_z
-    ; sub_z == $20: omit farthest row
-    LDA #(GRID_VTX_Z - 1)
-    STA n_rows
-    LDA #(GRID_VTX_Z - 2)
-    STA last_row_idx          ; precompute n_rows-1
-    BCS @z_size_done
-@full_z:
-    LDA #GRID_VTX_Z
-    STA n_rows
-    LDA #(GRID_VTX_Z - 1)
-    STA last_row_idx          ; precompute n_rows-1
-@z_size_done:
+    BNE @keep_z
+    DEY
+@keep_z:
+    STY n_rows
+    DEY
+    STY n_rows_m1
 
     ; === Compute interpolation offsets for edge height correction ===
     LDA grid_ptr              ; sub_x
@@ -238,15 +217,6 @@ draw_grid:
     STA proj_row
 
 @row_loop:
-    ; --- Skip if z_cam <= 0 (behind or on camera plane) ---
-    LDA z_cam_hi
-    BMI @do_skip              ; negative → behind camera
-    ORA z_cam_lo
-    BNE @z_cam_ok             ; non-zero positive → proceed
-@do_skip:
-    JMP @skip_row
-@z_cam_ok:
-
     ; --- Adjust z_cam for boundary rows ---
     LDA proj_row
     BNE @not_near_adj
@@ -261,9 +231,9 @@ draw_grid:
     STA z_cam_hi
     JMP @no_z_adj
 @not_near_adj:
-    ; Far row check: proj_row == last_row_idx (= n_rows - 1)?
+    ; Far row check: proj_row == n_rows_m1 (= n_rows - 1)?
     ; A = proj_row (preserved from LDA above, BNE taken)
-    CMP last_row_idx
+    CMP n_rows_m1
     BNE @no_z_adj
     ; Far row: z_cam -= interp_offset_far → projects at Z_FAR_BOUND
     LDA interp_offset_far
@@ -433,7 +403,7 @@ draw_grid:
     STA interp_z_ptr+1
     BNE @z_setup_done         ; always (hmap hi byte > 0)
 @z_not_near:
-    CMP last_row_idx
+    CMP n_rows_m1
     BNE @z_setup_done
     ; Far row: inner row = previous row
     LDA interp_offset_far
@@ -472,14 +442,6 @@ draw_grid:
     SBC #0
     STA grid_ptr+1
 @skip_grid_init:
-
-    ; --- SMC: patch V-chain final-row branch ---
-    ; On last row, BNE opcode ($D0) becomes BIT zp ($24) → falls through
-    LDA #$D0                  ; BNE opcode (skip final pixel; Z=0 from INX)
-    CPX last_row_idx          ; X = proj_row from LDX at v_ptr init
-    BNE :+
-    LDA #$24                  ; BIT zp opcode (fall through on last row)
-:   STA @v_final_br
 
     ; --- Column loop: n_vtx vertices ---
     LDA n_vtx
@@ -618,11 +580,13 @@ draw_grid:
     ; --- Edge colours from precomputed index ---
     LDX saved_color
     LDA h_color_lut,X
-    INY                       ; Y: 1→2
-    STA (v_ptr),Y
-    LDA v_color_lut,X
-    INY                       ; Y: 2→3
-    STA (v_ptr),Y
+    LDY #5
+    STA (v_ptr),Y             ; store at next vertex's +2 slot
+    LDA v_color_lut,X         ; new v_color
+    LDX proj_col
+    LDY v_color_buf - 1,X     ; read old v_color (prev row)
+    STA v_color_buf - 1,X     ; write new v_color
+    STY saved_color           ; old v_color ready for v-chain draw
 
     ; --- Inline vertical chain drawing ---
     LDA proj_row
@@ -637,9 +601,6 @@ draw_grid:
     LDY #1
     LDA (grid_ptr),Y          ; prev sy
     STA raster_y0
-    LDY #3
-    LDA (grid_ptr),Y          ; prev v_color
-    STA saved_color           ; save for draw_line (ZP faster than stack)
 
     ; Chain state: init_base on row 1, restore on row 2+
     LDX chain_state_idx
@@ -684,16 +645,10 @@ draw_grid:
     INX
     STX chain_state_idx
 
-    ; Final pixel on last row (SMC'd: BNE on non-final, BIT zp on final)
-@v_final_br:
-    BNE @no_v_final
-    LDA raster_x1
-    JSR plot_final_pixel
-@no_v_final:
     ; Advance grid_ptr for next column's V-chain
     LDA grid_ptr
     CLC
-    ADC #4
+    ADC #3
     STA grid_ptr
     BCC :+
     INC grid_ptr+1
@@ -707,10 +662,10 @@ draw_grid:
     AND #$1F
     STA hmap_col
 
-    ; Advance v_ptr += 4
+    ; Advance v_ptr += 3
     LDA v_ptr
     CLC
-    ADC #4
+    ADC #3
     STA v_ptr
     BCC @no_vpc
     INC v_ptr+1
@@ -751,45 +706,6 @@ draw_grid:
     SBC #0
     STA z_cam_hi
 @no_near_restore:
-    JMP @next_row
-
-@skip_row:
-    ; Fill n_vtx vertices at (64, 159, 0, 0) in v_buf for behind-camera rows
-
-    ; v_ptr = v_buf + v_row_offset[proj_row]
-    LDX proj_row
-    LDA v_row_offset_lo,X
-    CLC
-    ADC #<v_buf
-    STA v_ptr
-    LDA v_row_offset_hi,X
-    ADC #>v_buf
-    STA v_ptr+1
-    LDX n_vtx
-@skip_v:
-    LDY #0
-    LDA #64
-    STA (v_ptr),Y
-    INY
-    LDA #159
-    STA (v_ptr),Y
-    INY
-    LDA #0                    ; black colour (h_color)
-    STA (v_ptr),Y
-    INY
-    STA (v_ptr),Y             ; black colour (v_color)
-    ; advance v_ptr by 4
-    LDA v_ptr
-    CLC
-    ADC #4
-    STA v_ptr
-    BCC @no_skip_vpc
-    INC v_ptr+1
-@no_skip_vpc:
-    DEX
-    BNE @skip_v
-
-@next_row:
     ; z_cam += 64 ($0040 = 0.25 units in 8.8)
     LDA z_cam_lo
     CLC
@@ -806,7 +722,7 @@ draw_grid:
     JMP @row_loop
 @proj_done:
     ; --- Post-projection: draw h-chains row by row (back-to-front) ---
-    LDA last_row_idx
+    LDA n_rows_m1
     STA proj_row
 @h_row_loop:
     ; grid_ptr = v_buf + row offset
@@ -829,7 +745,7 @@ draw_grid:
     RTS
 
 ; =====================================================================
-; draw_h_row — Draw one horizontal chain from grid_ptr (4-byte stride)
+; draw_h_row — Draw one horizontal chain from grid_ptr (3-byte stride)
 ; =====================================================================
 ; Input:  grid_ptr = row start, seg_count = segments (n_vtx - 1)
 
@@ -843,25 +759,23 @@ draw_h_row:
     JSR init_base             ; Y = sub_y
 @h_seg:
     STY saved_y
-    LDY #2
-    LDA (grid_ptr),Y          ; h_color
-    TAX                       ; cache in X (free until draw_line)
     ; Advance grid_ptr to next vertex
     LDA grid_ptr
     CLC
-    ADC #4
+    ADC #3
     STA grid_ptr
     BCC :+
     INC grid_ptr+1
 :   LDY #0
     LDA (grid_ptr),Y          ; endpoint sx
     STA raster_x1
-    LDY #1
+    INY
     LDA (grid_ptr),Y          ; endpoint sy
     STA raster_y1
-    LDY saved_y
-    TXA                       ; recover h_color
+    INY
+    LDA (grid_ptr),Y          ; h_color (stored here by prev vertex)
     BEQ @h_skip_black
+    LDY saved_y
     JSR draw_line
     JMP @h_drawn
 @h_skip_black:
@@ -881,9 +795,7 @@ draw_h_row:
     STA raster_y0
     DEC seg_count
     BNE @h_seg
-    ; Final pixel
-    LDA raster_x0
-    JMP plot_final_pixel        ; tail call
+    RTS
 
 ; =====================================================================
 ; set_hmap_ptr — Set hmap_ptr from heightmap row index

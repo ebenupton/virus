@@ -14,7 +14,7 @@ GRID_VTX_X      = GRID_COLS + 1 ; vertices per row
 GRID_VTX_Z      = GRID_ROWS + 1 ; vertices per column (= number of rows)
 HALF_COLS       = GRID_COLS / 2  ; half-width in cells
 HALF_ROWS       = GRID_ROWS / 2  ; half-depth in cells
-ROW_STRIDE      = GRID_VTX_X * 4  ; bytes per vertex row in v_buf
+ROW_STRIDE      = GRID_VTX_X * 3  ; bytes per vertex row in v_buf
 
 ; ── Outputs (set by project_grid, read by game.s) ────────────────
 grid_min_sy     = ZP_GRID + 0   ; minimum screen Y across all grid vertices

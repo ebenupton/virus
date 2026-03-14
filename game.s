@@ -321,17 +321,15 @@ update_physics:
     CPX #9
     BCC @pos_loop
 
-    ; 5. Ground clamp: use terrain_y computed by project_grid
+    ; 5. Ground clamp: clamp y to zero (TODO: restore terrain_y clamping)
     LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
     BMI @do_clamp                          ; negative → below ground
     BNE @above_ground                      ; hi > 0 → above
     LDA obj_world_pos+OBJ_WORLD_SHIP+2    ; y_lo
-    CMP terrain_y
-    BCS @above_ground
+    BNE @above_ground
 @do_clamp:
-    LDA terrain_y
-    STA obj_world_pos+OBJ_WORLD_SHIP+2
     LDA #0
+    STA obj_world_pos+OBJ_WORLD_SHIP+2
     STA obj_world_pos+OBJ_WORLD_SHIP+3
     JSR zero_y_vel
 @above_ground:

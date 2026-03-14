@@ -9,49 +9,52 @@
 .include "math_zp.inc"
 .include "grid_zp.inc"
 
-; ── Grid workspace ($90-$B2, 3 blocks) ─────────────────────────────
-; Projection
-grid_ptr        = $90       ; 2 bytes — grid_ptr in draw; sx/h_color temp during projection
-hmap_ptr        = $92       ; 2 bytes — heightmap row pointer
-proj_col        = $94       ; inner loop counter (vertices remaining)
-hmap_col        = $95       ; current heightmap column index (0..31)
-z_cam_lo        = $96       ; z_cam low byte (8.8 fractional part, running)
-z_cam_hi        = $97       ; z_cam high byte (8.8 integer part, running)
-proj_row        = $98       ; outer loop counter (row index)
-recip_val       = $99       ; recip for current row (≈ 64/z_cam)
-step_lo         = $9A       ; x step low byte (recip * 64, fractional)
-step_hi         = $9B       ; x step high byte (recip * 64, integer)
-base_x          = $9C       ; heightmap column base for column 0
-run_lo          = $9D       ; sx running accumulator low byte
-run_hi          = $9E       ; sx running accumulator high byte
-sy_val          = $9F       ; sy for current row (constant per row)
-base_z          = $A0       ; heightmap row base for row 0
-v_ptr           = $A1       ; 2 bytes — V buffer write pointer
-offset_tmp      = $A3       ; scratch (replaces temp2 usage)
-; Draw
-seg_count       = $A5       ; segments remaining in current chain
-chain_idx       = $A6       ; byte offset within current chain
-saved_y         = $A7       ; saved sub-row Y during chain iteration
-saved_color     = $A8       ; colour for current segment
-clamp_left      = $A9       ; left edge screen x clamp (draw_grid)
-clamp_right     = $AC       ; right edge screen x clamp
-; Shared (set in project, read in draw)
-n_vtx           = $AD       ; vertices per row this frame
-chain_state_idx = $AE       ; index into chain_state[] for v-chain
-n_rows          = $AF       ; vertex rows this frame
-hmap_row        = $B0       ; current heightmap row index (0..31)
-clamp_near_sy   = $B1       ; screen-y of near grid edge
-clamp_far_sy    = $B2       ; screen-y of far grid edge
-hmap_next_ptr   = $B3       ; 2 bytes — next heightmap row pointer (for v-edge colour)
-interp_offset_l = $B5       ; left-edge interpolation offset (0..63)
-interp_offset_r = $B6       ; right-edge interpolation offset (0..63)
-interp_offset_near = $B7    ; near-row Z interpolation offset (0..63)
-interp_offset_far  = $B8    ; far-row Z interpolation offset (0..64, 64=skip)
-z_interp_offset    = $B9    ; current row's Z offset (0 = no Z interp)
-interp_z_ptr       = $BA    ; 2 bytes — inner row heightmap pointer for Z interp
-prev_hmap_ptr      = $BC    ; 2 bytes — previous row's hmap_ptr (for far row)
-last_row_idx       = $AA    ; n_rows-1, precomputed for V-chain final pixel check
-; grid_min_sy = $BE declared in grid_zp.inc
+; ── Grid internal workspace (ZP_GRID internal) ────────────────────
+; Pointers
+grid_ptr        = ZP_GRID + 8      ; 2 bytes — prev-row ptr (draw) / sub_x/z cache (project)
+hmap_ptr        = ZP_GRID + 10     ; 2 bytes — heightmap row pointer
+hmap_next_ptr   = ZP_GRID + 12     ; 2 bytes — next heightmap row pointer
+interp_z_ptr    = ZP_GRID + 14     ; 2 bytes — inner row heightmap pointer for Z interp
+prev_hmap_ptr   = ZP_GRID + 16     ; 2 bytes — previous row's hmap_ptr (for far row)
+v_ptr           = ZP_GRID + 18     ; 2 bytes — V buffer write pointer
+; Z / step / run
+z_cam_lo        = ZP_GRID + 20     ; z_cam low byte (8.8 fractional part, running)
+z_cam_hi        = ZP_GRID + 21     ; z_cam high byte (8.8 integer part, running)
+step_lo         = ZP_GRID + 22     ; x step low byte (recip * 64, fractional)
+step_hi         = ZP_GRID + 23     ; x step high byte (recip * 64, integer)
+run_lo          = ZP_GRID + 24     ; sx running accumulator low byte
+run_hi          = ZP_GRID + 25     ; sx running accumulator high byte
+; Per-row state
+proj_row        = ZP_GRID + 26     ; outer loop counter (row index)
+proj_col        = ZP_GRID + 27     ; inner loop counter (vertices remaining)
+recip_val       = ZP_GRID + 28     ; recip for current row (≈ 64/z_cam)
+sy_val          = ZP_GRID + 29     ; sy for current row (constant per row)
+base_x          = ZP_GRID + 30     ; heightmap column base for column 0
+base_z          = ZP_GRID + 31     ; heightmap row base for row 0
+hmap_col        = ZP_GRID + 32     ; current heightmap column index (0..31)
+hmap_row        = ZP_GRID + 33     ; current heightmap row index (0..31)
+; Grid dimensions / clamps
+n_vtx           = ZP_GRID + 34     ; vertices per row this frame
+n_rows          = ZP_GRID + 35     ; vertex rows this frame
+last_row_idx    = ZP_GRID + 36     ; n_rows-1, precomputed for V-chain final pixel check
+chain_state_idx = ZP_GRID + 37     ; index into chain_state[] for v-chain
+clamp_left      = ZP_GRID + 38     ; left edge screen x clamp
+clamp_right     = ZP_GRID + 39     ; right edge screen x clamp
+clamp_near_sy   = ZP_GRID + 40     ; screen-y of near grid edge
+clamp_far_sy    = ZP_GRID + 41     ; screen-y of far grid edge
+; Interpolation
+interp_offset_l    = ZP_GRID + 42  ; left-edge interpolation offset (0..63)
+interp_offset_r    = ZP_GRID + 43  ; right-edge interpolation offset (0..63)
+interp_offset_near = ZP_GRID + 44  ; near-row Z interpolation offset (0..63)
+interp_offset_far  = ZP_GRID + 45  ; far-row Z interpolation offset (0..64, 64=skip)
+z_interp_offset    = ZP_GRID + 46  ; current row's Z offset (0 = no Z interp)
+; Scratch
+offset_tmp      = ZP_GRID + 47     ; scratch (various temporary uses)
+; ZP_GRID + 48 reserved for offset_tmp+1 (implicit 2nd byte)
+seg_count       = ZP_GRID + 49     ; segments remaining / lerp offset
+chain_idx       = ZP_GRID + 50     ; chain byte offset / lerp h_b
+saved_y         = ZP_GRID + 51     ; saved sub-row Y / lerp h_a
+saved_color     = ZP_GRID + 52     ; colour for current segment
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"

@@ -12,24 +12,26 @@
 .include "grid_zp.inc"
 .include "clip_zp.inc"
 
-; ── Object workspace ($80-$8F) ──────────────────────────────────────
-sin_val         = $80       ; precomputed sin(angle) for current frame
-cos_val         = $81       ; precomputed cos(angle) for current frame
-obj_n_vtx       = $82       ; vertex count (phase 1); temp in phase 2
-edge_tab_off    = $83       ; byte offset of edge table in object data
-data_off        = $84       ; byte offset into face/edge data
-recip           = $85       ; reciprocal (phase 1); edge_id temp (phase 2)
+; ── Object internal workspace (ZP_OBJECT internal) ─────────────────
+sin_val         = ZP_OBJECT + 16    ; precomputed sin(angle) for current frame
+cos_val         = ZP_OBJECT + 17    ; precomputed cos(angle) for current frame
+obj_n_vtx       = ZP_OBJECT + 18    ; vertex count (phase 1); temp in phase 2
+edge_tab_off    = ZP_OBJECT + 19    ; byte offset of edge table in object data
+data_off        = ZP_OBJECT + 20    ; byte offset into face/edge data
+recip           = ZP_OBJECT + 21    ; reciprocal (phase 1); edge_id temp (phase 2)
+obj_clip_flags  = ZP_OBJECT + 22    ; object flags byte (bit 7 = skip clip)
+poly_ring       = ZP_OBJECT + 23    ; N-gon vertex ring (up to 15 + wraparound)
 
-; Scratch registers, reused across phases
-scratch0        = $86
-scratch1        = $87
-scratch2        = $88
-scratch3        = $89
-scratch4        = $8A
-scratch5        = $8B
+; Scratch registers, reused across phases (overlap poly_ring[1..])
+scratch0        = ZP_OBJECT + 24
+scratch1        = ZP_OBJECT + 25
+scratch2        = ZP_OBJECT + 26
+scratch3        = ZP_OBJECT + 27
+scratch4        = ZP_OBJECT + 28
+scratch5        = ZP_OBJECT + 29
 
 ; Phase 1 (projection) aliases
-vtx_idx         = scratch0
+vtx_idx         = ZP_OBJECT + 30    ; projection loop counter (separate from scratch0)
 local_x         = scratch1
 local_y         = scratch2
 local_z         = scratch3
@@ -44,28 +46,27 @@ dy2             = scratch3
 cross_lo        = scratch4
 cross_hi        = scratch5
 
-; Phase 2 (face iteration) aliases — reuse scratch0-5 AFTER backface test
-face_n_edges    = $86       ; edge counter for current face
-face_color_val  = $8B       ; face color for clip-boundary edges
-
-; Polygon vertex ring for N-gon clip walk (up to 15 vertices + wraparound copy)
-poly_ring       = $60
+; Phase 2 (face iteration) aliases
+face_n_edges    = obj_n_vtx         ; edge counter (reuses obj_n_vtx, free in phase 2)
+face_color_val  = scratch5          ; face color for clip-boundary edges
 
 ; Phase 1 (pitch rotation) — reused in phase 2
-roll_sin       = $8D       ; precomputed sin(pitch) (phase 1 only)
-roll_cos       = $8E       ; precomputed cos(pitch) (phase 1 only)
+roll_sin        = ZP_OBJECT + 31    ; precomputed sin(pitch) / isect0_sx
+roll_cos        = ZP_OBJECT + 32    ; precomputed cos(pitch) / isect0_sy
 
-; Phase 2 (polygon clip walk) — $8C-$8F
-poly_vtx_idx    = $8C       ; polygon walk index (0, 1, 2) / outcode temp
-clip_isect0_sx  = $8D       ; first intersection screen X
-clip_isect0_sy  = $8E       ; first intersection screen Y
-clip_has_isect  = $8F       ; flag ($00=none, $FF=have first)
+; Phase 2 (polygon clip walk)
+poly_vtx_idx    = vtx_idx           ; polygon walk index (reuses vtx_idx in phase 2)
+clip_isect0_sx  = roll_sin          ; first intersection screen X (reuses roll_sin)
+clip_isect0_sy  = roll_cos          ; first intersection screen Y (reuses roll_cos)
+clip_has_isect  = ZP_OBJECT + 33    ; flag ($00=none, $FF=have first)
+
+; Edge-drawn bitmap (moved from BUFFERS)
+obj_edge_drawn  = ZP_OBJECT + 34    ; 4 bytes — 32-bit drawn bitmap
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"
 obj_proj_sx:    .res MAX_OBJ_VERTICES   ; projected screen X (0..127)
 obj_proj_sy:    .res MAX_OBJ_VERTICES   ; projected screen Y (0..159)
-obj_edge_drawn: .res 4                   ; 32-bit drawn bitmap
 obj_vx_lo:      .res MAX_OBJ_VERTICES   ; view-space X lo
 obj_vx_hi:      .res MAX_OBJ_VERTICES   ; view-space X hi
 obj_vy_lo:      .res MAX_OBJ_VERTICES   ; view-space Y lo
@@ -73,7 +74,6 @@ obj_vy_hi:      .res MAX_OBJ_VERTICES   ; view-space Y hi
 obj_vz_lo:      .res MAX_OBJ_VERTICES   ; view-space Z lo
 obj_vz_hi:      .res MAX_OBJ_VERTICES   ; view-space Z hi
 obj_vtx_clip:   .res MAX_OBJ_VERTICES   ; per-vertex 4-bit outcode
-obj_clip_flags: .res 1                   ; object flags byte (bit 7 = skip clip)
 .segment "CODE"
 
 ; ── Bit mask table for edge bit testing ──

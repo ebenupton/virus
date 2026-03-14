@@ -3,11 +3,7 @@
 ; Provides: init_screen, clear_screen, wait_vsync, flip_buffers
 ; Requires: raster_zp.inc (for raster_page)
 
-.include "raster_zp.inc"
-
-; ── Video workspace ($10-$11) ───────────────────────────────────────
-; back_buf_idx = $10 declared in game.s (forward reference for ZP addressing)
-frame_count     = $11       ; vsync frame counter
+.include "video_zp.inc"
 
 ; ── Hardware registers ──────────────────────────────────────────────
 ; (also defined in game.s; safe to reference since these are constants)
@@ -106,9 +102,6 @@ flip_buffers:
 ; =====================================================================
 ; Patches the BNE operand to skip clean stripes on iterations 1..255.
 ; First iteration (X=0) always falls through all STZs.
-
-dirty_top_buf0: .byte 0
-dirty_top_buf1: .byte 0
 
 ; BNE offset LUT indexed by page_index (0..40)
 ; page_index p: N = max(0, p-2) pages to skip

@@ -55,9 +55,9 @@
 
 .include "math_zp.inc"
 
-; ── Math workspace ($60-$61) ────────────────────────────────────────
-norm_k          = $60       ; normalisation shift count (used by urecip15)
-delta_val       = $61       ; interpolation delta (used by urecip15)
+; ── Math workspace (ZP_MATH internal) ──────────────────────────────
+norm_k          = ZP_MATH + 8       ; normalisation shift count (used by urecip15)
+delta_val       = ZP_MATH + 9       ; interpolation delta (used by urecip15)
 
 ; =====================================================================
 ; umul8x8 — Unsigned 8x8 -> 16-bit multiply (quarter-square)

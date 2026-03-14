@@ -1,10 +1,11 @@
-; grid_zp.inc — Grid dimension constants
+; grid_zp.inc — Grid dimension constants and external ZP API
 ;
 ; Include-guarded: safe to .include from multiple files.
-; No ZP variables — all grid workspace is declared in grid.s.
 
 .ifndef GRID_ZP_INC
 GRID_ZP_INC = 1
+
+.include "zp_layout.inc"
 
 ; ── Grid dimensions (cells, not vertices) ───────────────────────────
 GRID_COLS       = 8             ; cells across (X direction)
@@ -16,8 +17,8 @@ HALF_ROWS       = GRID_ROWS / 2  ; half-depth in cells
 ROW_STRIDE      = GRID_VTX_X * 4  ; bytes per vertex row in v_buf
 
 ; ── Outputs (set by project_grid, read by game.s) ────────────────
-grid_min_sy     = $BE           ; minimum screen Y across all grid vertices
-terrain_y       = $BF           ; terrain height at ship pos (height*8, 8.8 lo)
+grid_min_sy     = ZP_GRID + 0   ; minimum screen Y across all grid vertices
+terrain_y       = ZP_GRID + 1   ; terrain height at ship pos (height*8, 8.8 lo)
 
 ; ── Derived geometry constants ──────────────────────────────────────
 HALF_GRID_X     = (GRID_COLS - 1) * $20   ; X half-extent in 8.8

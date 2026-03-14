@@ -29,22 +29,13 @@ SYS_VIA_DDRA = $FE43
 SYS_VIA_ORA  = $FE4F
 
 ; === Include ZP API files ===
+.include "zp_layout.inc"
+.include "video_zp.inc"
+.include "game_zp.inc"
 .include "raster_zp.inc"
 .include "math_zp.inc"
 .include "grid_zp.inc"
 .include "object_zp.inc"
-
-; === Zero page: NMOS scratch (used by INC A/DEC A replacements) ===
-nmos_tmp        = $0F       ; 1 byte — scratch for NMOS carry-preserving INC A
-
-; === Zero page: video (forward-declared for ZP addressing) ===
-back_buf_idx    = $10
-
-; === Zero page: camera state ($20-$23) ===
-cam_x_lo        = $20       ; 8.8 fixed-point X position (low byte)
-cam_x_hi        = $21       ; 8.8 fixed-point X position (high byte)
-cam_z_lo        = $22       ; 8.8 fixed-point Z position (low byte)
-cam_z_hi        = $23       ; 8.8 fixed-point Z position (high byte)
 
 ; === Constants ===
 SCREEN_W    = 128            ; pixels wide (4bpp, 2 pixels per byte)
@@ -70,29 +61,32 @@ MAX_POS_Y_LO    = $40
 GRAVITY_ACCEL   = 52          ; 0.5 cells/s²
 THRUST_ACCEL    = 104         ; 2× gravity
 
-; Ship orientation state
-ship_yaw        = $24        ; Y-axis rotation angle
-ship_roll      = $25        ; X-axis roll angle
+; === Game internal workspace (ZP_GAME internal) ===
+ship_yaw        = ZP_GAME + 8      ; Y-axis rotation angle
+ship_roll       = ZP_GAME + 9      ; X-axis roll angle
 
-; Velocity: 24-bit signed (hi:lo:frac) per axis
-vel_x_hi        = $26
-vel_x_lo        = $27
-vel_x_frac      = $28
-vel_y_hi        = $29
-vel_y_lo        = $2A
-vel_y_frac      = $2B
-vel_z_hi        = $2C
-vel_z_lo        = $2D
-vel_z_frac      = $2E
+; Velocity: 24-bit signed (hi:lo:frac) per axis (contiguous for loop zeroing)
+vel_x_hi        = ZP_GAME + 10
+vel_x_lo        = ZP_GAME + 11
+vel_x_frac      = ZP_GAME + 12
+vel_y_hi        = ZP_GAME + 13
+vel_y_lo        = ZP_GAME + 14
+vel_y_frac      = ZP_GAME + 15
+vel_z_hi        = ZP_GAME + 16
+vel_z_lo        = ZP_GAME + 17
+vel_z_frac      = ZP_GAME + 18
 
-; Sub-pixel position accumulators
-pos_x_frac      = $43       ; spaced 2 apart for Y-indexed update_pos
-pos_y_frac      = $45
-pos_z_frac      = $47
+; Sub-pixel position accumulators (stride-2 for Y-indexed update_pos)
+pos_x_frac      = ZP_GAME + 19
+pos_y_frac      = ZP_GAME + 21
+pos_z_frac      = ZP_GAME + 23
 
-; Camera Y (8.8 fixed-point, computed = ship_y + 1.5)
-cam_y_lo        = $57
-cam_y_hi        = $58
+; Game scratch (ZP_SHARED spares, used only during thrust/drag)
+gm_scratch_0    = ZP_SHARED + 1
+gm_scratch_1    = ZP_SHARED + 2
+gm_scratch_2    = ZP_SHARED + 3
+gm_scratch_3    = ZP_SHARED + 4
+gm_scratch_4    = ZP_SHARED + 5
 
 ; =====================================================================
 ; Entry point ($0600)
@@ -262,18 +256,18 @@ update_physics:
     LDA SYS_VIA_ORA
     BPL @no_thrust
 
-    ; Precompute trig values into $80-$83
+    ; Precompute trig values into scratch
     LDX ship_roll
     JSR sincos
-    STA $81                   ; sin(roll)
-    STX $80                   ; cos(roll)
+    STA gm_scratch_1          ; sin(roll)
+    STX gm_scratch_0          ; cos(roll)
     LDX ship_yaw
     JSR sincos
-    STA $83                   ; sin(yaw)
-    STX $82                   ; cos(yaw)
+    STA gm_scratch_3          ; sin(yaw)
+    STX gm_scratch_2          ; cos(yaw)
 
     ; thrust_y = (cos(roll) * THRUST_ACCEL) >> 7
-    LDA $80
+    LDA gm_scratch_0
     STA math_a
     LDA #THRUST_ACCEL
     STA math_b
@@ -282,23 +276,23 @@ update_physics:
     JSR add_accel
 
     ; horiz = (sin(roll) * THRUST_ACCEL) >> 7
-    LDA $81
+    LDA gm_scratch_1
     STA math_a
     ; math_b still = THRUST_ACCEL from above
     JSR smul_shr7
-    STA $84                  ; save horiz
+    STA gm_scratch_4          ; save horiz
 
     ; thrust_x = (sin(yaw) * horiz) >> 7
-    LDA $83
+    LDA gm_scratch_3
     STA math_a
-    LDA $84
+    LDA gm_scratch_4
     STA math_b
     JSR smul_shr7
     LDX #0                   ; X axis
     JSR add_accel
 
     ; thrust_z = (cos(yaw) * horiz) >> 7
-    LDA $82
+    LDA gm_scratch_2
     STA math_a
     ; math_b still = $84 (horiz) from above
     JSR smul_shr7
@@ -471,7 +465,7 @@ add_accel:
 ; apply_drag — Subtract vel>>6 from 24-bit velocity
 ; =====================================================================
 ; Input:  X = velocity axis offset (0=X, 3=Y, 6=Z)
-; Clobbers: A, $80-$82
+; Clobbers: A, gm_scratch_0-2
 
 apply_drag:
     ; drag_frac = (vel_lo << 2) | (vel_frac >> 6)
@@ -480,12 +474,12 @@ apply_drag:
     ROL A
     ROL A
     AND #$03                 ; vel_frac >> 6
-    STA $80
+    STA gm_scratch_0
     LDA vel_x_lo,X
     ASL A
     ASL A                    ; vel_lo << 2
-    ORA $80
-    STA $80                  ; drag_frac
+    ORA gm_scratch_0
+    STA gm_scratch_0         ; drag_frac
 
     ; drag_lo = (vel_hi << 2) | (vel_lo >> 6)
     LDA vel_x_lo,X
@@ -493,32 +487,32 @@ apply_drag:
     ROL A
     ROL A
     AND #$03                 ; vel_lo >> 6
-    STA $81
+    STA gm_scratch_1
     LDA vel_x_hi,X
     TAY                      ; cache vel_hi in Y
     ASL A
     ASL A                    ; vel_hi << 2
-    ORA $81
-    STA $81                  ; drag_lo
+    ORA gm_scratch_1
+    STA gm_scratch_1         ; drag_lo
 
     ; drag_hi = sign of vel_hi (correct for |vel_hi| < 64)
     LDA #0
-    STA $82                  ; assume positive (drag_hi = 0)
+    STA gm_scratch_2         ; assume positive (drag_hi = 0)
     TYA                      ; restore vel_hi for sign check
     BPL @ad_sub
-    DEC $82                  ; negative: drag_hi = $FF
+    DEC gm_scratch_2         ; negative: drag_hi = $FF
 @ad_sub:
 
     ; vel -= drag (24-bit)
     LDA vel_x_frac,X
     SEC
-    SBC $80
+    SBC gm_scratch_0
     STA vel_x_frac,X
     LDA vel_x_lo,X
-    SBC $81
+    SBC gm_scratch_1
     STA vel_x_lo,X
     TYA                      ; restore vel_hi from cache
-    SBC $82
+    SBC gm_scratch_2
     STA vel_x_hi,X
     RTS
 

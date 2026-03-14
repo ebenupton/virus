@@ -10,9 +10,10 @@
 .include "grid_zp.inc"
 .include "clip_zp.inc"
 
-; ── Internal workspace ($D4-$D5, extends clip_zp.inc) ─────────────
-clip_q      = $D4       ; 1 byte  — t quotient (0.8)
-clip_out    = $D5       ; 1 byte  — sign flag for lerp
+; ── Internal workspace (ZP_CLIP internal) ─────────────────────────
+clip_d      = ZP_CLIP + 18    ; 2 bytes — scratch / division denominator
+clip_q      = ZP_CLIP + 20    ; 1 byte  — t quotient (0.8)
+clip_out    = ZP_CLIP + 21    ; 1 byte  — sign flag for lerp
 
 ; ── Clip plane constants ──────────────────────────────────────────
 ; Left: -HALF_GRID_X

@@ -5,10 +5,14 @@
 ;
 .include "raster_zp.inc"
 
-; ── Workspace (not shared) ──────────────────────────────────────────
-delta_minor = $40
-delta_major = $41
-pixel_count = $42
+; ── Internal workspace (ZP_RASTER internal) ────────────────────────
+raster_base         = ZP_RASTER + 9    ; 2 bytes — screen cell pointer (lo/hi)
+raster_color_right  = ZP_RASTER + 11   ; colour in right-pixel format (bits 4,2,0)
+raster_color_left   = ZP_RASTER + 12   ; colour in left-pixel format (bits 5,3,1)
+raster_color_both   = ZP_RASTER + 13   ; colour with both pixels set (left | right)
+delta_minor         = ZP_RASTER + 14   ; Bresenham minor delta
+delta_major         = ZP_RASTER + 15   ; Bresenham major delta
+pixel_count         = ZP_RASTER + 16   ; remaining pixel count
 
 ; ── MODE 2 screen layout ──────────────────────────────────────────────
 ; 128×160 pixels, 4bpp (2 pixels per byte), 64 byte-columns.

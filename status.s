@@ -8,11 +8,11 @@
 ; draw_status: redraws score only when changed, updates fuel bar by ±1 pixel.
 ; All operations are double-buffer aware.
 
-.include "raster_zp.inc"
+.include "zp_layout.inc"
 
-; === Zero page (reuse $90-$93, safe after grid drawing) ===
-status_ptr = $90    ; 2 bytes — screen destination pointer
-status_src = $92    ; 2 bytes — font data source pointer
+; === Zero page (ZP_STATUS internal) ===
+status_ptr = ZP_STATUS + 0    ; 2 bytes — screen destination pointer
+status_src = ZP_STATUS + 2    ; 2 bytes — font data source pointer
 
 ; === Constants ===
 FUEL_MAX = 64                ; max fuel level (32 byte columns × 2 pixels)

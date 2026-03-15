@@ -310,11 +310,10 @@ draw_grid:
 
     ; --- sx_running = $4000 - run_factor * recip [- recip*256] ---
     ; run_factor and run_sub_recip precomputed before the loop.
-    ; Also sets math_b = recip_val for inline qsm + interp_height.
-    LDA run_factor
-    STA math_a
+    ; Also sets math_b = recip_val for umul8x8 + interp_height.
     LDA recip_val
     STA math_b
+    LDA run_factor
     JSR umul8x8
     LDA #0
     SEC
@@ -434,47 +433,11 @@ draw_grid:
     BNE @z_interp_go          ; boundary row → interpolate
     ; (A already = h*8, fall through)
     ; Fall through to @do_height_mul
-    ; --- Combined height-to-pixel multiplication ---
-    ; Computes sy = 16 + cam_y_hi*recip + hi((cam_y_lo - h*8) * recip),
-    ; with borrow correction when cam_y_lo < h*8. Uses an inlined
-    ; quarter-square multiply (the hot path, so avoiding a JSR).
+    ; --- Height-to-pixel multiplication ---
     ; Flat/sea cells enter with A=0 and get base sy naturally.
 
 @do_height_mul:
-    ; A = h*8 (0 for flat cells)
-    STA seg_count             ; save h*8 for borrow check
-    LDA cam_y_lo
-    SEC
-    SBC seg_count             ; A = cam_y_lo - h*8 (unsigned)
-    ; Inline umul8x8 hi-byte: A * math_b (= recip_val, set by clamp)
-    TAX                       ; save A
-    SEC
-    SBC math_b
-    BCS @hm_dp
-    EOR #$FF
-    ADC #1                    ; C=0 from BCS not-taken
-@hm_dp:
-    TAY                       ; Y = |A - math_b|
-    TXA                       ; restore A
-    CLC
-    ADC math_b
-    TAX                       ; X = (A + math_b) & $FF
-    BCC @hm_no
-    SEC
-    LDA sqr2_lo,X
-    SBC sqr_lo,Y
-    LDA sqr2_hi,X
-    SBC sqr_hi,Y
-    BCS @hm_end               ; always (quarter-square never borrows)
-@hm_no:
-    SEC
-    LDA sqr_lo,X
-    SBC sqr_lo,Y
-    LDA sqr_hi,X
-    SBC sqr_hi,Y
-@hm_end:
-    ; A = hi((cam_y_lo - h*8) * recip)
-    JSR add_cam_y_offset      ; → A = sy, clamped ≥ 0
+    JSR height_to_sy          ; A = sy, clamped ≥ 0
 
 @sy_store:
     STA offset_tmp+1          ; save adjusted sy (borrow $A4 briefly)
@@ -736,6 +699,21 @@ draw_v_col:
 
 
 ; =====================================================================
+; height_to_sy — Convert h*8 to screen-y via multiply + cam_y offset
+; =====================================================================
+; Input:  A = h*8 (0..248), math_b = recip_val
+; Output: A = screen-y (clamped ≥ 0)
+; Clobbers: A, X, Y, seg_count, math_res
+
+height_to_sy:
+    STA seg_count             ; save h*8 for borrow check
+    LDA cam_y_lo
+    SEC
+    SBC seg_count             ; A = cam_y_lo - h*8 (unsigned)
+    JSR umul8x8               ; A * math_b (= recip_val); A = hi byte
+    ; fall through to add_cam_y_offset
+
+; =====================================================================
 ; add_cam_y_offset — Add cam_y integer part and correct for borrow
 ; =====================================================================
 ; Input:  A = hi(combined * recip), seg_count = h*8
@@ -931,14 +909,7 @@ interp_height:
     CMP chain_idx
     BEQ @ih_done              ; same height → no change
     JSR lerp_height           ; A = pre-scaled h*8 (0..248)
-    STA seg_count             ; save for borrow check
-    LDA cam_y_lo
-    SEC
-    SBC seg_count
-    STA math_a
-    JSR umul8x8               ; math_b = recip_val
-    LDA math_res_hi
-    JSR add_cam_y_offset
+    JSR height_to_sy          ; A = sy
     STA offset_tmp+1
 @ih_done:
     RTS

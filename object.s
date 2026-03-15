@@ -559,21 +559,18 @@ draw_object:
 
     ; cross = dx1*dy2 - dy1*dx2
     ; Term 1: smul8x8(dx1, dy2)
-    LDA dx1
-    STA math_a
     LDA dy2
     STA math_b
+    LDA dx1
     JSR smul8x8
+    STA cross_hi              ; A = math_res_hi
     LDA math_res_lo
     STA cross_lo
-    LDA math_res_hi
-    STA cross_hi
 
     ; Term 2: smul8x8(dy1, dx2)
-    LDA dy1
-    STA math_a
     LDA dx2
     STA math_b
+    LDA dy1
     JSR smul8x8
 
     ; cross = term1 - term2
@@ -919,31 +916,26 @@ check_and_mark_edge:
 
 rotate_y:
     ; ── 1. sin * lx → push 16-bit result ──
-    LDA sin_val
-    STA math_a
     LDA local_x
     STA math_b
-    JSR smul8x8
-    ; Result: A = res_hi, math_res_lo = res_lo
+    LDA sin_val
+    JSR smul8x8                 ; A = res_hi
     PHA                         ; push sin*lx hi
     LDA math_res_lo
     PHA                         ; push sin*lx lo
 
     ; ── 2. cos * lx → save in vcoord_lo/hi ──
     LDA cos_val
-    STA math_a
     ; math_b still = local_x from call 1
-    JSR smul8x8
+    JSR smul8x8                 ; A = cos*lx hi
+    STA vcoord_hi               ; cos*lx hi
     LDA math_res_lo
     STA vcoord_lo               ; cos*lx lo
-    LDA math_res_hi
-    STA vcoord_hi               ; cos*lx hi
 
     ; ── 3. sin * lz → add to cos*lx, shift >>7 → lx' ──
-    LDA sin_val
-    STA math_a
     LDA local_z
     STA math_b
+    LDA sin_val
     JSR smul8x8
     ; lx' = (cos*lx + sin*lz) >> 7
     LDA vcoord_lo               ; cos*lx lo
@@ -959,7 +951,6 @@ rotate_y:
 
     ; ── 4. cos * lz → subtract stacked sin*lx, shift >>7 → lz' ──
     LDA cos_val
-    STA math_a
     ; math_b still = local_z from call 3
     JSR smul8x8
     ; lz' = (cos*lz - sin*lx) >> 7
@@ -992,30 +983,26 @@ rotate_y:
 
 rotate_x:
     ; ── 1. sin * ly → push 16-bit result ──
-    LDA roll_sin
-    STA math_a
     LDA local_y
     STA math_b
-    JSR smul8x8
+    LDA roll_sin
+    JSR smul8x8                 ; A = res_hi
     PHA                         ; push sin*ly hi
     LDA math_res_lo
     PHA                         ; push sin*ly lo
 
     ; ── 2. cos * ly → save in vcoord_lo/hi ──
     LDA roll_cos
-    STA math_a
     ; math_b still = local_y from call 1
-    JSR smul8x8
+    JSR smul8x8                 ; A = cos*ly hi
+    STA vcoord_hi               ; cos*ly hi
     LDA math_res_lo
     STA vcoord_lo               ; cos*ly lo
-    LDA math_res_hi
-    STA vcoord_hi               ; cos*ly hi
 
     ; ── 3. sin * lz → subtract from cos*ly, shift >>7 → ly' ──
-    LDA roll_sin
-    STA math_a
     LDA local_z
     STA math_b
+    LDA roll_sin
     JSR smul8x8
     ; ly' = (cos*ly - sin*lz) >> 7
     LDA vcoord_lo               ; cos*ly lo
@@ -1030,7 +1017,6 @@ rotate_x:
 
     ; ── 4. cos * lz → add stacked sin*ly, shift >>7 → lz' ──
     LDA roll_cos
-    STA math_a
     ; math_b still = local_z from call 3
     JSR smul8x8
     ; lz' = (cos*lz + sin*ly) >> 7

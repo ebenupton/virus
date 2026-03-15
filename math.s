@@ -43,8 +43,11 @@
 ; Register and ZP conventions
 ; =====================================================================
 ;
-;   Zero page:  math_a, math_b (inputs), math_res_lo/hi (outputs)
+;   Zero page:  math_b (input), math_res_lo/hi (outputs)
 ;               — defined in math_zp.inc.
+;
+;   First arg:  passed in A (not math_a).
+;   High byte:  returned in A (= math_res_hi) for all multiply functions.
 ;
 ;   Y register: preserved by smul8x8 and umul8x8 (PHY/PLY around body).
 ;               NOT preserved by recip8.
@@ -57,17 +60,17 @@
 ; umul8x8 — Unsigned 8x8 -> 16-bit multiply (quarter-square)
 ; =====================================================================
 ;
-; Inputs:   math_a = unsigned multiplier  (0..255)
+; Inputs:   A      = unsigned multiplier  (0..255)
 ;           math_b = unsigned multiplicand (0..255)
-; Outputs:  math_res_hi:math_res_lo = 16-bit unsigned product
+; Outputs:  A = math_res_hi (high byte of product)
+;           math_res_hi:math_res_lo = 16-bit unsigned product
 ; Clobbers: A, X, Y
 ;
 ; Cycles: ~57 including JSR/RTS.
 
 umul8x8:
     ; -- Compute |a - b| --
-    LDA math_a
-    TAX                     ; cache math_a in X
+    TAX                     ; cache A (first arg) in X
     SEC
     SBC math_b
     BCS @u_diff_pos
@@ -77,7 +80,7 @@ umul8x8:
     TAY                     ; Y = |a - b|
 
     ; -- Compute (a + b) mod 256 --
-    TXA                     ; restore math_a from X (1 cycle faster than LDA zp)
+    TXA                     ; restore first arg from X
     CLC
     ADC math_b
     TAX
@@ -89,7 +92,7 @@ umul8x8:
     STA math_res_lo
     LDA sqr_hi,X
     SBC sqr_hi,Y
-    STA math_res_hi
+    STA math_res_hi          ; A = math_res_hi
     RTS
 
 @u_sum_overflow:
@@ -99,25 +102,25 @@ umul8x8:
     STA math_res_lo
     LDA sqr2_hi,X
     SBC sqr_hi,Y
-    STA math_res_hi
+    STA math_res_hi          ; A = math_res_hi
     RTS
 
 ; =====================================================================
 ; smul8x8 — Signed 8x8 -> 16-bit multiply (quarter-square)
 ; =====================================================================
 ;
-; Inputs:   math_a = signed multiplier  (-128..+127)
+; Inputs:   A      = signed multiplier  (-128..+127)
 ;           math_b = signed multiplicand (-128..+127)
-; Outputs:  math_res_hi:math_res_lo = signed 16-bit product
-;           A = math_res_hi (for quick sign checks)
+; Outputs:  A = math_res_hi (high byte of product)
+;           math_res_hi:math_res_lo = signed 16-bit product
 ; Clobbers: A, X, Y
 ;
 ; Cycles: ~62.
 
 smul8x8:
     ; -- Compute |a - b| --
-    LDA math_a
-    TAX                     ; cache math_a in X
+    STA math_a              ; store for sign correction
+    TAX                     ; cache first arg in X
     SEC
     SBC math_b
     BCS @diff_pos
@@ -127,7 +130,7 @@ smul8x8:
     TAY
 
     ; -- Compute (a + b) mod 256 --
-    TXA                     ; restore math_a from X (1 cycle faster than LDA zp)
+    TXA                     ; restore first arg from X
     CLC
     ADC math_b
     TAX

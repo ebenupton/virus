@@ -267,34 +267,30 @@ update_physics:
     STX gm_scratch_2          ; cos(yaw)
 
     ; thrust_y = (cos(roll) * THRUST_ACCEL) >> 7
-    LDA gm_scratch_0
-    STA math_a
     LDA #THRUST_ACCEL
     STA math_b
+    LDA gm_scratch_0
     JSR smul_shr7
     LDX #3                   ; Y axis
     JSR add_accel
 
     ; horiz = (sin(roll) * THRUST_ACCEL) >> 7
     LDA gm_scratch_1
-    STA math_a
     ; math_b still = THRUST_ACCEL from above
     JSR smul_shr7
     STA gm_scratch_4          ; save horiz
 
     ; thrust_x = (sin(yaw) * horiz) >> 7
-    LDA gm_scratch_3
-    STA math_a
     LDA gm_scratch_4
     STA math_b
+    LDA gm_scratch_3
     JSR smul_shr7
     LDX #0                   ; X axis
     JSR add_accel
 
     ; thrust_z = (cos(yaw) * horiz) >> 7
     LDA gm_scratch_2
-    STA math_a
-    ; math_b still = $84 (horiz) from above
+    ; math_b still = horiz from above
     JSR smul_shr7
     LDX #6                   ; Z axis
     JSR add_accel
@@ -379,13 +375,12 @@ update_physics:
 ; =====================================================================
 ; smul_shr7 — Signed multiply then shift right 7
 ; =====================================================================
-; Input:  math_a, math_b set
-; Output: A = (math_a * math_b) >> 7
+; Input:  A = first arg, math_b set
+; Output: A = (A * math_b) >> 7
 
 smul_shr7:
-    JSR smul8x8
+    JSR smul8x8             ; A = math_res_hi
     ASL math_res_lo
-    LDA math_res_hi
     ROL A
     RTS
 

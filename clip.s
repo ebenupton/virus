@@ -454,26 +454,25 @@ lerp_coord:
 
     ; correction = umul8x8(t, |delta_hi|) + hi(umul8x8(t, |delta_lo|))
     ; Step 1: hi(t * |delta_lo|)
-    LDA clip_q
-    STA math_a
     LDA clip_n              ; |delta_lo|
     STA math_b
-    JSR umul8x8
-    LDA math_res_hi
+    LDA clip_q
+    JSR umul8x8             ; A = hi(t * |delta_lo|)
     PHA                     ; save hi byte on stack
 
     ; Step 2: t * |delta_hi| (full 16-bit)
-    ; math_a still = clip_q (umul8x8 reads but doesn't write math_a)
     LDA clip_n+1            ; |delta_hi|
     STA math_b
-    JSR umul8x8
+    LDA clip_q
+    JSR umul8x8             ; A = hi(t * |delta_hi|)
 
     ; correction = result + stacked hi byte
-    PLA
+    TAX                     ; save hi in X
+    PLA                     ; hi(t * |delta_lo|)
     CLC
     ADC math_res_lo
     STA clip_n              ; correction lo
-    LDA math_res_hi
+    TXA
     ADC #0
     STA clip_n+1            ; correction hi
 
@@ -509,22 +508,21 @@ lerp_coord:
 ; Clobbers: A, X, math_a, math_b, math_res
 
 project_coord:
-    STX nmos_tmp            ; save coord_hi (umul8x8 clobbers X)
-    STA math_a
-    LDA clip_n
-    STA math_b
-    JSR umul8x8
-    LDA math_res_hi         ; hi(lo * recip)
+    STX nmos_tmp            ; save coord_hi
+    ; A = coord_lo (first arg to umul8x8)
+    LDX clip_n
+    STX math_b
+    JSR umul8x8             ; A = hi(lo * recip)
     LDX nmos_tmp            ; restore coord_hi
-    STX math_a
     PHA                     ; save hi(lo * recip)
+    TXA                     ; A = coord_hi (first arg to smul8x8)
     ; math_b still = clip_n
-    JSR smul8x8
-    STA clip_d+1            ; offset_hi
+    JSR smul8x8             ; A = offset_hi
+    STA clip_d+1
     PLA
     CLC
     ADC math_res_lo         ; + lo(smul), carry pending
-    STA clip_d              ; offset_lo
+    STA clip_d
     RTS
 
 ; =====================================================================

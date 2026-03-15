@@ -376,7 +376,6 @@ draw_grid:
 
     ; Reset heightmap column for this row
     LDA base_x
-    AND #$1F
     STA hmap_col
 
     ; --- Init v_off for this row ---

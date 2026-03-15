@@ -618,27 +618,20 @@ project_grid:
     CLC
     ADC proj_row
     AND #$1F
-    ; hmap_ptr = height_map + hmap_z * 32
-    TAX
-    LSR A
-    LSR A
-    LSR A                     ; hmap_z >> 3
-    CLC
-    ADC #>height_map
+    ; hmap_ptr = height_map + hmap_z * 32, via (hmap_z:$00) >> 3
+    ; height_map is page-aligned so lo byte of base is 0
     STA hmap_ptr+1
-    TXA
-    AND #$07
-    ASL A
-    ASL A
-    ASL A
-    ASL A
-    ASL A                     ; (hmap_z & 7) << 5
-    CLC
-    ADC #<height_map
+    LDA #0
+    LSR hmap_ptr+1
+    ROR A
+    LSR hmap_ptr+1
+    ROR A
+    LSR hmap_ptr+1
+    ROR A                     ; hmap_ptr+1:A = hmap_z * 32
     STA hmap_ptr
-    BCC @no_hmap_carry
-    INC hmap_ptr+1
-@no_hmap_carry:
+    LDA hmap_ptr+1
+    ADC #>height_map          ; C=0 from shifts
+    STA hmap_ptr+1
 
     ; Reset heightmap column for this row
     LDA base_x
@@ -666,13 +659,11 @@ project_grid:
     LDY hmap_col
     LDA (hmap_ptr),Y
     STA div_tmp1              ; save full byte for color extraction
-    AND #$1F                  ; height 0..31
+    AND #$F8                  ; h*8 directly
     BEQ @use_sy_val           ; flat → use row's base sy
 
     ; Δsy = hi_byte(h*8 * recip) = h * recip / 32
-    ASL A
-    ASL A
-    ASL A                     ; h * 8 (max 248, fits in byte)
+    ; (A already = h*8)
     STA math_a
     LDA recip_val
     STA math_b
@@ -720,11 +711,7 @@ project_grid:
     STA (v_ptr),Y
     ; Extract colour from heightmap byte (top 3 bits → 0..7)
     LDA div_tmp1
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
+    AND #$07
     TAX
     LDA color_unpack,X
     LDY #2

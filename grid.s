@@ -5,7 +5,7 @@
 ;
 ; Provides: draw_grid
 ; Requires: raster_zp.inc, math_zp.inc, grid_zp.inc
-; Ext refs: cam_x_lo/hi, cam_z_lo/hi, height_map, urecip15, umul8x8,
+; Ext refs: cam_x_lo/hi, cam_z_lo/hi, height_map, recip8, umul8x8,
 ;           init_base, draw_line
 
 .include "raster_zp.inc"
@@ -13,13 +13,14 @@
 .include "grid_zp.inc"
 
 ; ── Grid internal workspace (ZP_GRID internal) ────────────────────
+h_chain_sub_y   = ZP_GRID + 1      ; saved sub_y for inline h-chain drawing
+v_off           = ZP_GRID + 2      ; v_buf byte offset (single-byte, max 188)
 ; Pointers
-grid_ptr        = ZP_GRID + 7      ; 2 bytes — prev-row ptr (v-chain draw)
+grid_ptr        = ZP_GRID + 7      ; 2 bytes — v-chain post-pass column ptr
 hmap_ptr        = ZP_GRID + 9      ; 2 bytes — heightmap row pointer
-hmap_next_ptr   = ZP_GRID + 11     ; 2 bytes — next heightmap row pointer
+next_hmap_ptr   = ZP_GRID + 11     ; 2 bytes — next heightmap row pointer
 interp_z_ptr    = ZP_GRID + 13     ; 2 bytes — inner row heightmap pointer for Z interp
 prev_hmap_ptr   = ZP_GRID + 15     ; 2 bytes — previous row's hmap_ptr (for far row)
-v_ptr           = ZP_GRID + 17     ; 2 bytes — V buffer write pointer
 ; Z / step / run
 z_cam_lo        = ZP_GRID + 19     ; z_cam low byte (8.8 fractional part, running)
 z_cam_hi        = ZP_GRID + 20     ; z_cam high byte (8.8 integer part, running)
@@ -31,7 +32,7 @@ run_hi          = ZP_GRID + 24     ; sx running accumulator high byte
 proj_row        = ZP_GRID + 25     ; outer loop counter (row index)
 proj_col        = ZP_GRID + 26     ; inner loop counter (vertices remaining)
 recip_val       = ZP_GRID + 27     ; recip for current row (≈ 64/z_cam)
-sy_val          = ZP_GRID + 28     ; sy for current row (constant per row)
+run_factor      = ZP_GRID + 28     ; precomputed sx_running multiply factor
 base_x          = ZP_GRID + 29     ; heightmap column base for column 0
 base_z          = ZP_GRID + 30     ; heightmap row base for row 0
 hmap_col        = ZP_GRID + 31     ; current heightmap column index (0..31)
@@ -40,11 +41,9 @@ hmap_row        = ZP_GRID + 32     ; current heightmap row index (0..31)
 n_vtx           = ZP_GRID + 33     ; vertices per row this frame
 n_rows          = ZP_GRID + 34     ; vertex rows this frame
 n_rows_m1       = ZP_GRID + 35     ; n_rows-1, precomputed for V-chain final pixel check
-chain_state_idx = ZP_GRID + 36     ; index into chain_state[] for v-chain
-clamp_left      = ZP_GRID + 37     ; left edge screen x clamp
-clamp_right     = ZP_GRID + 38     ; right edge screen x clamp
-clamp_near_sy   = ZP_GRID + 39     ; screen-y of near grid edge
-clamp_far_sy    = ZP_GRID + 40     ; screen-y of far grid edge
+pending_h_color = ZP_GRID + 36     ; h_color from previous vertex for h-chain
+edge_offset     = ZP_GRID + 37     ; hi($E0 * recip), used for edge sx
+run_sub_recip   = ZP_GRID + 38     ; flag: subtract recip from run_hi (0 or 1)
 ; Interpolation
 interp_offset_l    = ZP_GRID + 41  ; left-edge interpolation offset (0..63)
 interp_offset_r    = ZP_GRID + 42  ; right-edge interpolation offset (0..63)
@@ -70,9 +69,7 @@ saved_color     = scratch_4        ; colour for current segment
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"
-v_buf:        .res GRID_VTX_Z * ROW_STRIDE + 3 ; row-major, 3 bytes/vertex (+3 pad for h_color lookahead)
-v_color_buf:  .res GRID_VTX_X                  ; v-chain colour line buffer
-chain_state:  .res GRID_VTX_X * 3              ; v-chain state per column
+v_buf:        .res GRID_VTX_Z * ROW_STRIDE     ; row-major, 3 bytes/vertex (sx, sy, v_color)
 .segment "CODE"
 
 ; Row offset lookup (avoids ×44 multiply)
@@ -80,32 +77,15 @@ v_row_offset_lo:
     .byte <(0*ROW_STRIDE), <(1*ROW_STRIDE), <(2*ROW_STRIDE)
     .byte <(3*ROW_STRIDE), <(4*ROW_STRIDE), <(5*ROW_STRIDE)
     .byte <(6*ROW_STRIDE)
-v_row_offset_hi:
-    .byte >(0*ROW_STRIDE), >(1*ROW_STRIDE), >(2*ROW_STRIDE)
-    .byte >(3*ROW_STRIDE), >(4*ROW_STRIDE), >(5*ROW_STRIDE)
-    .byte >(6*ROW_STRIDE)
-
-; Edge colour LUTs: index = (bits7-5 << 1) | sea_flag
+; Edge colour LUTs: index = (bits2-0 << 1) | sea_flag
 ; Split tables avoid runtime bit extraction (h=bits 4,2,0; v=bits 5,3,1)
 h_color_lut:
     .byte $05,$14,$15,$14,$04,$10,$00,$10,$15,$14,$15,$14,$04,$10,$00,$10
 v_color_lut:
     .byte $05,$14,$15,$14,$15,$14,$15,$14,$04,$10,$00,$10,$04,$10,$00,$10
 
-; Step low-byte lookup: (recip & 3) << 6
-step_lo_tbl:
-    .byte $00, $40, $80, $C0
-
-; Reciprocal table: recip_tbl[i] = floor(32768 / (Z_NEAR_BOUND + i))
-; 321 entries covering z_cam = Z_NEAR_BOUND ($01E0) to Z_FAR_BOUND ($0320)
-; Bakes in the ×2 so callers don't need to shift z_cam before lookup.
-recip_tbl:
-.repeat 321, i
-    .byte 32768 / (Z_NEAR_BOUND + i)
-.endrepeat
-
 ; =====================================================================
-; draw_grid — Project grid + draw v-chains inline + draw h-chains
+; draw_grid — Project grid + draw h-chains inline + draw v-chains
 ; =====================================================================
 ;
 ; Grid: GRID_COLS × GRID_ROWS cells, 0.25-unit spacing, centred on camera.
@@ -113,9 +93,8 @@ recip_tbl:
 ; Projection: vx = 64·x_cam/z_cam, vy = 64·y_cam/z_cam,
 ;             screen centre (64, 16).
 ;
-; Per-row: one urecip15 call gives recip ≈ 64/z_cam.
-; sy_val = base sy from camera height (constant per row).
-; Per-vertex height modulation: Δsy = h*recip/32 via umul8x8(h*8, recip).hi.
+; Per-row: one recip8 call gives recip ≈ 64/z_cam.
+; Per-vertex sy: combined multiply of (cam_y_lo - h*8) * recip, plus cam_y_hi offset.
 ; sx advances by a constant step = recip·0.25 per vertex (16-bit add).
 
 ; --- Init & z_cam setup ---
@@ -226,27 +205,44 @@ draw_grid:
     STX interp_offset_near
     STA interp_offset_far
 
-    ; --- Screen-y clamps ---
-    ; Pre-computes the screen-y values where the near and far grid
-    ; boundaries should appear. These are compile-time-constant Z
-    ; distances, so their reciprocals are known. Used to clamp per-row
-    ; sy so the grid edges align with exact world boundaries.
-    ; === Compute clamp_near_sy from constant Z_NEAR_BOUND ===
-    ; recip = 65536 / (Z_NEAR_BOUND * 2), compile-time constant
-    RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 2)
-    LDA #RECIP_NEAR
-    JSR mul_cam_y             ; A = recip * cam_y
+    ; --- Precompute run_factor for sx_running ---
+    ; sx_running = $4000 - K*recip, where K = 256 ± sub_x correction.
+    ; sub_x in [0,$1F]: K = 256+sub_x → run_factor=sub_x, run_sub_recip=1
+    ; sub_x in [$20,$3F]: K = $C0+sub_x → run_factor=$C0+sub_x, flag=0
+    LDA sub_x
+    CMP #$20
+    BCS @rf_wrap
+    STA run_factor
+    LDX #1
+    BCC @rf_done              ; always
+@rf_wrap:
     CLC
-    ADC #16
-    STA clamp_near_sy
+    ADC #$C0
+    STA run_factor
+    LDX #0
+@rf_done:
+    STX run_sub_recip
 
-    ; === Compute clamp_far_sy (far boundary screen-y) ===
-    RECIP_FAR = 65536 / (Z_FAR_BOUND * 2)
-    LDA #RECIP_FAR
-    JSR mul_cam_y             ; A = recip * cam_y
-    CLC
-    ADC #16                   ; sy (can't overflow for far boundary)
-    STA clamp_far_sy
+    ; --- Initial hmap_ptr from base_z (inline set_hmap_ptr) ---
+    ; hmap_ptr = height_map + hmap_row * 32, via (hmap_row:$00) >> 3
+    ; height_map is page-aligned so lo byte of base is 0
+    LDA base_z
+    STA hmap_row
+    STA hmap_ptr+1
+    LDA #0
+    LSR hmap_ptr+1
+    ROR A
+    LSR hmap_ptr+1
+    ROR A
+    LSR hmap_ptr+1
+    ROR A                     ; hmap_ptr+1:A = hmap_row * 32
+    STA hmap_ptr
+    LDA hmap_ptr+1
+    ADC #>height_map          ; C=0 from shifts
+    STA hmap_ptr+1
+
+    RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 2)
+    RECIP_FAR  = 65536 / (Z_FAR_BOUND * 2)
 
     ; === Row loop: j = 0..GRID_VTX_Z-1 ===
     LDA #0
@@ -273,174 +269,79 @@ draw_grid:
     LDA #RECIP_FAR
     BNE @have_recip           ; always (RECIP_FAR != 0)
 @use_table:
-    ; recip = recip_tbl[z_cam - Z_NEAR_BOUND], 2× baked into table
     LDA z_cam_lo
-    SEC
-    SBC #<Z_NEAR_BOUND
-    TAY
+    STA math_b
     LDA z_cam_hi
-    SBC #>Z_NEAR_BOUND        ; page 0 or 1
-    BNE @recip_page1
-    LDA recip_tbl,Y
-    BNE @have_recip           ; always (recip > 0)
-@recip_page1:
-    LDA recip_tbl + 256,Y
+    JSR recip8
 @have_recip:
     STA recip_val
 
-    ; --- sy computation ---
-    ; sy = 16 + recip * cam_y, clamped between clamp_far_sy and
-    ; clamp_near_sy. This is constant for the entire row (flat ground).
-    ; Height modulation adjusts it per-vertex later. The +16 is the
-    ; screen-y centre offset.
-    ; --- sy = 16 + recip * cam_y, clamped to [clamp_far_sy, clamp_near_sy] ---
-    JSR mul_cam_y             ; A = recip * cam_y
-    BCS @sy_near_clamp        ; overflow → exceeds near clamp
-    CLC
-    ADC #16
-    BCS @sy_near_clamp        ; overflow → exceeds near clamp
-    CMP clamp_near_sy
-    BCC @check_far_sy
-@sy_near_clamp:
-    LDA clamp_near_sy
-@check_far_sy:
-    CMP clamp_far_sy
-    BCS @sy_ok
-    LDA clamp_far_sy
-@sy_ok:
-    STA sy_val
-
     ; --- Step & sx_running ---
     ; step = recip * 64 is the screen-x distance between adjacent
-    ; vertices (one cell = 0.25 world units). It's a 16-bit value,
-    ; self-modifying-coded into the inner loop's ADC immediates for
-    ; speed.
+    ; vertices (one cell = 0.25 world units). It's a 16-bit value
+    ; stored in step_lo/step_hi.
     ;
     ; sx_running starts at $4000 - 4*step, which places the leftmost
     ; vertex 4 cells left of centre (screen x = 64). The high byte is
     ; the screen-x coordinate.
     ; --- Step = recip * 64 (16-bit), the screen-x increment per cell ---
+    ; recip << 6 = (recip:$00) >> 2
     LDA recip_val
     LSR A
-    LSR A                     ; step_hi = recip >> 2
     STA step_hi
-    STA @run_add_hi + 1      ; SMC: embed step_hi as immediate
-    LDA recip_val
-    AND #$03
-    TAX
-    LDA step_lo_tbl,X        ; (recip & 3) << 6
-    STA step_lo
-    STA @run_add_lo + 1      ; SMC: embed step_lo as immediate
-
-    ; --- sx_running = $4000 - 4*step ---
-    ; 4*step = 4*recip*64 = recip*256 → hi byte only, lo cancels
     LDA #0
-    STA run_lo
-    LDA #$40
+    ROR A
+    LSR step_hi
+    ROR A
+    STA step_lo
+
+    ; --- edge_offset = floor(recip * 7/8) = recip - ceil(recip/8) ---
+    LDA recip_val
+    CLC
+    ADC #7
+    LSR A
+    LSR A
+    LSR A                     ; ceil(recip/8)
+    STA offset_tmp
+    LDA recip_val
     SEC
-    SBC recip_val
-    STA run_hi
-    ; --- Edge clamps ---
-    ; Computes the screen-x boundaries where the grid edges should
-    ; appear. Vertices beyond these get clamped so the grid fills
-    ; exactly to its world-space boundaries.
-    ; --- Compute edge clamps ---
-    ; offset = HALF_GRID_X * recip / 256 = hi($E0 * recip)
-    LDA #HALF_GRID_X_LO
+    SBC offset_tmp
+    STA edge_offset
+
+    ; --- sx_running = $4000 - run_factor * recip [- recip*256] ---
+    ; run_factor and run_sub_recip precomputed before the loop.
+    ; Also sets math_b = recip_val for inline qsm + interp_height.
+    LDA run_factor
     STA math_a
     LDA recip_val
     STA math_b
     JSR umul8x8
-    LDA math_res_hi           ; hi($E0 * recip)
-    STA offset_tmp
-
-    ; clamp_right = min(127, 64 + offset)
-    CLC
-    ADC #64
-    BCS @cr_clamp             ; overflow → clamp
-    CMP #128
-    BCC @cr_ok
-@cr_clamp:
-    LDA #127
-@cr_ok:
-    STA clamp_right
-
-    ; clamp_left = max(0, 64 - offset)
-    LDA #64
-    SEC
-    SBC offset_tmp
-    BCS @cl_ok
     LDA #0
-@cl_ok:
-    STA clamp_left
-
-    ; --- sub_x offset ---
-    ; Adjusts sx_running for the camera's fractional position within
-    ; its heightmap cell. This shifts the grid left/right so vertices
-    ; track the camera smoothly rather than snapping to cell boundaries.
-    ; --- sub_x offset: adjust run for fractional camera position ---
-    LDA cam_x_lo
-    AND #$3F                  ; sub_x (0..63)
-    BEQ @cam_x_done           ; sub_x == 0 → no offset
-    CMP #$20
-    BCS @x_wrap
-
-    ; sub_x in [1,$1F]: run -= sub_x * recip
-    STA math_a
-    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
-    LDA run_lo
     SEC
     SBC math_res_lo
     STA run_lo
-    LDA run_hi
+    LDA #$40
     SBC math_res_hi
-    STA run_hi
-    JMP @cam_x_done
-
-@x_wrap:
-    ; sub_x in [$20,$3F]: run += ($40 - sub_x) * recip
-    EOR #$3F
-    ADC #0                    ; C=1 from BCS, so A = ~lo6 + 1 = $40 - sub_x
-    STA math_a
-    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
-    LDA run_lo
-    CLC
-    ADC math_res_lo
-    STA run_lo
-    LDA run_hi
-    ADC math_res_hi
-    STA run_hi
-@cam_x_done:
-
-    ; --- Heightmap pointers ---
-    ; Sets up hmap_ptr for the current row's heightmap data, and
-    ; hmap_next_ptr for the row behind it (wrapping at row 31 since
-    ; the map is toroidal).
-    ; --- Heightmap row pointer for this row ---
-    LDA base_z
-    CLC
-    ADC proj_row
-    AND #$1F
-    STA hmap_row
-    ; hmap_ptr = height_map + hmap_z * 32
-    JSR set_hmap_ptr
+    LDX run_sub_recip
+    BEQ :+
+    SEC
+    SBC recip_val
+:   STA run_hi
 
     ; --- Heightmap next-row pointer: hmap_ptr + 32, wrapping at row 31 ---
     CLC
     LDA hmap_ptr
     ADC #32
-    STA hmap_next_ptr
+    STA next_hmap_ptr
     LDA hmap_ptr+1
     ADC #0
-    STA hmap_next_ptr+1
-    LDA hmap_row
-    CMP #31
+    LDY hmap_row
+    CPY #31
     BNE @no_hmap_wrap
-    LDA hmap_next_ptr+1
     SEC
     SBC #4                    ; subtract $0400 (1024 bytes = 32 rows)
-    STA hmap_next_ptr+1
 @no_hmap_wrap:
+    STA next_hmap_ptr+1
 
     ; --- Z interpolation setup ---
     ; On boundary rows (near or far), heights need interpolating
@@ -455,9 +356,9 @@ draw_grid:
     LDA interp_offset_near
     BEQ @z_setup_done             ; offset 0 → skip
     STA z_interp_offset
-    LDA hmap_next_ptr
+    LDA next_hmap_ptr
     STA interp_z_ptr
-    LDA hmap_next_ptr+1
+    LDA next_hmap_ptr+1
     STA interp_z_ptr+1
     BNE @z_setup_done         ; always (hmap hi byte > 0)
 @z_not_near:
@@ -479,42 +380,18 @@ draw_grid:
     AND #$1F
     STA hmap_col
 
-    ; --- v_ptr and grid_ptr init ---
-    ; v_ptr points to the current row in v_buf (where we'll write
-    ; projected vertices). grid_ptr points to the *previous* row in
-    ; v_buf (where we'll read previous vertices for v-chain drawing).
-    ; Skipped on row 0 since there's no previous row.
-    ; --- Init v_ptr for this row ---
+    ; --- Init v_off for this row ---
     LDX proj_row
     LDA v_row_offset_lo,X
-    CLC
-    ADC #<v_buf
-    STA v_ptr
-    LDA v_row_offset_hi,X
-    ADC #>v_buf
-    STA v_ptr+1
-
-    ; --- Init grid_ptr = v_ptr - ROW_STRIDE (prev row, for V-chains) ---
-    TXA                       ; set Z flag from proj_row (1 byte vs CPX #0)
-    BEQ @skip_grid_init
-    LDA v_ptr
-    SEC
-    SBC #ROW_STRIDE
-    STA grid_ptr
-    LDA v_ptr+1
-    SBC #0
-    STA grid_ptr+1
-@skip_grid_init:
+    STA v_off
 
     ; --- Column loop preamble ---
-    ; Sets proj_col as a countdown from n_vtx, resets chain_state_idx,
-    ; then jumps into the inner loop. The uncommon @sea_cell path is
-    ; placed before the hot loop so branch targets stay in range.
+    ; Sets proj_col as a countdown from n_vtx, then jumps into the
+    ; inner loop. The uncommon @sea_cell path is placed before the
+    ; hot loop so branch targets stay in range.
     ; --- Column loop: n_vtx vertices ---
     LDA n_vtx
     STA proj_col
-    LDA #0
-    STA chain_state_idx
     JMP @col_loop
 
     ; --- Uncommon paths (placed before hot loop for branch reach) ---
@@ -522,23 +399,21 @@ draw_grid:
     INC saved_color           ; set sea flag (odd LUT index)
     LDX z_interp_offset
     BNE @z_interp_go
-    JMP @use_sy_val
+    JMP @do_height_mul        ; A=0 → flat sea
 @z_interp_go:
     JSR z_interp_vertex       ; A = pre-scaled h*8
-    BEQ @z_flat               ; zero → clear stale height, use sy_val
+    BEQ @z_flat               ; zero → clear stale height, use flat sy
     ; Save Z-interpolated height in offset_tmp for edge interp corners
-    TAX
-    LSR A
-    LSR A
-    LSR A                     ; h (0..31)
-    STA offset_tmp
-    TXA
-    BNE @do_height_mul        ; always (h*8 > 0 from BEQ check)
+    STA offset_tmp            ; h*8
+    BNE @do_height_mul        ; always
+@z_flat:
+    STA offset_tmp            ; A=0 — clear stale height for edge interp
+    JMP @do_height_mul        ; A=0 → z-interp gave flat
 
     ; --- Height lookup & colour ---
-    ; Reads the heightmap cell at hmap_col. The cell byte packs 5 bits
-    ; of height (0–31) and 3 bits of colour. The colour bits are
-    ; shifted into a LUT index (saved_color). Height 0 means sea —
+    ; Reads the heightmap cell at hmap_col. The cell byte packs height
+    ; in bits 7–3 and colour in bits 2–0. The colour bits are shifted
+    ; into a LUT index (saved_color). Height 0 means sea —
     ; branches to @sea_cell which sets the sea flag (odd LUT index).
 
 @col_loop:
@@ -546,34 +421,31 @@ draw_grid:
     LDY hmap_col
     LDA (hmap_ptr),Y
     STA offset_tmp            ; save full byte for z_interp_vertex
-    ; Precompute color LUT index: (offset_tmp >> 4) & $0E | sea_flag
-    LSR A
-    LSR A
-    LSR A
-    LSR A
+    ; Precompute color LUT index: (offset_tmp << 1) & $0E | sea_flag
+    ASL A
     AND #$0E
     STA saved_color           ; color base index (even=land, odd=sea)
     ; Extract height
     LDA offset_tmp
-    AND #$1F                  ; height 0..31
+    AND #$F8                  ; h*8 directly
     BEQ @sea_cell             ; flat → set sea flag, check z_interp
     ; Land cell, height > 0
     LDX z_interp_offset
     BNE @z_interp_go          ; boundary row → interpolate
-    ASL A
-    ASL A
-    ASL A                     ; h * 8 (max 248, fits in byte)
+    ; (A already = h*8, fall through)
     ; Fall through to @do_height_mul
-    ; --- Height-to-pixel multiplication ---
-    ; For non-zero height, computes hi(h*8 * recip_val) — the pixel
-    ; offset for this height at this depth. This is an inlined
-    ; quarter-square multiply (the hot path, so avoiding a JSR). The
-    ; result is subtracted from sy_val to lift the vertex:
-    ; sy = sy_val - height_offset, clamped to 0.
-    ;
-    ; Flat/sea cells skip the multiply and use sy_val directly.
+    ; --- Combined height-to-pixel multiplication ---
+    ; Computes sy = 16 + cam_y_hi*recip + hi((cam_y_lo - h*8) * recip),
+    ; with borrow correction when cam_y_lo < h*8. Uses an inlined
+    ; quarter-square multiply (the hot path, so avoiding a JSR).
+    ; Flat/sea cells enter with A=0 and get base sy naturally.
 
 @do_height_mul:
+    ; A = h*8 (0 for flat cells)
+    STA seg_count             ; save h*8 for borrow check
+    LDA cam_y_lo
+    SEC
+    SBC seg_count             ; A = cam_y_lo - h*8 (unsigned)
     ; Inline umul8x8 hi-byte: A * math_b (= recip_val, set by clamp)
     TAX                       ; save A
     SEC
@@ -601,18 +473,8 @@ draw_grid:
     LDA sqr_hi,X
     SBC sqr_hi,Y
 @hm_end:
-    ; A = hi(h*8 * recip_val); sy = sy_val - A, clamp ≥ 0
-    EOR #$FF
-    SEC
-    ADC sy_val
-    BCS @sy_store
-    LDA #0
-    BCC @sy_store
-
-@z_flat:
-    STA offset_tmp            ; A=0 — clear stale height for edge interp
-@use_sy_val:
-    LDA sy_val
+    ; A = hi((cam_y_lo - h*8) * recip)
+    JSR add_cam_y_offset      ; → A = sy, clamped ≥ 0
 
 @sy_store:
     STA offset_tmp+1          ; save adjusted sy (borrow $A4 briefly)
@@ -620,7 +482,7 @@ draw_grid:
     ; --- sx computation & edge clamping ---
     ; For middle vertices, sx is just run_hi (the running accumulator).
     ; The first and last vertices in the row are clamped to
-    ; clamp_left/clamp_right and get height interpolation via
+    ; edge_offset boundaries and get height interpolation via
     ; interp_height — blending between the outer and inner heightmap
     ; cells so the grid edge matches the exact world boundary.
     ; --- sx: only first/last vertices need clamping ---
@@ -639,8 +501,10 @@ draw_grid:
     TAY                       ; Y = inner column
     LDA interp_offset_r
     JSR interp_height
-    LDA clamp_right
-    BNE @sx_done              ; always (clamp_right >= 64)
+    LDA edge_offset
+    CLC
+    ADC #64                   ; clamp_right = 64 + offset
+    BNE @sx_done              ; always (>= 64)
 @do_left_clamp:
     ; Interpolate height at left screen edge
     LDA hmap_col
@@ -650,123 +514,78 @@ draw_grid:
     TAY                       ; Y = inner column
     LDA interp_offset_l
     JSR interp_height
-    LDA clamp_left
+    LDA #64
+    SEC
+    SBC edge_offset           ; clamp_left = 64 - offset
 @sx_done:
     ; --- v_buf store & colour output ---
-    ; Writes sx (+0) and sy (+1) to the current v_buf slot. h_color is
-    ; written at v_ptr+5 (the *next* vertex's +2 slot, ready for
-    ; h-chain drawing). v_color goes into v_color_buf — reads the old
-    ; value (previous row's colour for v-chain drawing) before writing
-    ; the new one.
+    ; Writes sx (+0) and sy (+1) to the current v_buf slot via v_off.
+    ; v_color is stored at +2. h_color goes to pending_h_color for
+    ; the next vertex's h-chain draw.
     ; A = final sx for this vertex
-    STA raster_x1             ; cache for V-chain endpoint
-    ; Store (sx, sy) to v_buf; h_color to next vertex's +2
-    LDY #0
-    STA (v_ptr),Y             ; sx at offset 0
+    STA raster_x1             ; cache for h-chain endpoint
+    ; Store (sx, sy) to v_buf
+    LDY v_off
+    STA v_buf,Y               ; sx at offset 0
     LDA offset_tmp+1          ; final sy for this vertex
-    STA raster_y1             ; cache for V-chain endpoint
+    STA raster_y1             ; cache for h-chain endpoint
     CMP grid_min_sy
     BCS @no_dirty_upd
     STA grid_min_sy
 @no_dirty_upd:
-    LDY #1
-    STA (v_ptr),Y
-    ; --- Edge colours from precomputed index ---
-    LDX saved_color
-    LDA h_color_lut,X
-    LDY #5
-    STA (v_ptr),Y             ; store at next vertex's +2 slot
-    LDA v_color_lut,X         ; new v_color
-    LDX proj_col
-    LDY v_color_buf - 1,X     ; read old v_color (prev row)
-    STA v_color_buf - 1,X     ; write new v_color
-    STY saved_color           ; old v_color ready for v-chain draw
+    INY
+    STA v_buf,Y               ; sy at offset 1
+    STY v_off                 ; save (h-chain clobbers Y)
 
-    ; --- Inline v-chain drawing ---
-    ; Skipped on row 0 (no previous row to connect to). For rows 1+:
-    ;
-    ; - Reads the previous row's vertex from grid_ptr (sx, sy →
-    ;   raster start point)
-    ; - On row 1, calls init_base to establish the chain's raster
-    ;   state. On rows 2+, restores saved chain state (sub-pixel Y
-    ;   position and base pointer) from chain_state[]
-    ; - saved_color holds the old v_color (read from v_color_buf
-    ;   earlier). If black, skips drawing and repositions the chain at
-    ;   the endpoint via init_base. Otherwise calls draw_line
-    ; - Saves chain state (3 bytes: sub_y, raster_base lo/hi) for the
-    ;   next row
-    ; - Advances grid_ptr by 3 to the next column's previous-row vertex
-    ; --- Inline vertical chain drawing ---
-    LDA proj_row
-    BEQ @no_v_draw
-
-    ; grid_ptr already points to prev row vertex (init at row start)
-
-    ; Start point = previous row vertex
-    LDY #0
-    LDA (grid_ptr),Y          ; prev sx
-    STA raster_x0
-    LDY #1
-    LDA (grid_ptr),Y          ; prev sy
-    STA raster_y0
-
-    ; Chain state: init_base on row 1, restore on row 2+
-    LDX chain_state_idx
-    LDA proj_row
-    CMP #1                    ; Z=1 iff proj_row==1
-    BNE @v_restore
-    JSR init_base             ; Y = sub_y
-    JMP @v_ready
-@v_restore:
-    LDY chain_state,X
-    LDA chain_state+1,X
-    STA raster_base
-    LDA chain_state+2,X
-    STA raster_base+1
-@v_ready:
-    ; Endpoint = current vertex (raster_x1/y1 cached from v_buf write)
-
-    ; Draw (skip black lines)
-    LDA saved_color           ; v_color
-    BEQ @v_skip_black
-    JSR draw_line             ; Y = sub_y
-    JMP @v_drawn
-@v_skip_black:
+    ; --- Inline h-chain drawing ---
+    ; First vertex: init raster state. Subsequent: draw from previous
+    ; vertex using pending_h_color. Raster state (base, sub_y) is
+    ; preserved between columns — no save/restore needed.
+    LDA proj_col
+    CMP n_vtx
+    BNE @not_first_h
+    ; First vertex: init raster at this position
     LDA raster_x1
     STA raster_x0
     LDA raster_y1
     STA raster_y0
-    JSR init_base             ; reposition at endpoint
-@v_drawn:
+    JSR init_base
+    JMP @h_chain_done
+@not_first_h:
+    LDA pending_h_color
+    BEQ @h_black
+    LDY h_chain_sub_y
+    JSR draw_line
+    JMP @h_drawn
+@h_black:
+    LDA raster_x1
+    STA raster_x0
+    LDA raster_y1
+    STA raster_y0
+    JSR init_base
+    JMP @h_chain_done
+@h_drawn:
+    LDA raster_x1
+    STA raster_x0
+    LDA raster_y1
+    STA raster_y0
+@h_chain_done:
+    STY h_chain_sub_y
 
-    ; Save chain state
-    LDX chain_state_idx
-    TYA
-    STA chain_state,X
-    LDA raster_base
-    STA chain_state+1,X
-    LDA raster_base+1
-    STA chain_state+2,X
-    ; Advance chain_state_idx
-    INX
-    INX
-    INX
-    STX chain_state_idx
-
-    ; Advance grid_ptr for next column's V-chain
-    LDA grid_ptr
-    CLC
-    ADC #3
-    STA grid_ptr
-    BCC :+
-    INC grid_ptr+1
-:
-@no_v_draw:
+    ; --- Edge colours from precomputed index ---
+    LDX saved_color
+    LDA v_color_lut,X        ; v_color for this vertex
+    LDY v_off                 ; restore (= off+1)
+    INY
+    STA v_buf,Y               ; v_color at off+2
+    INY                       ; off+3 = next vertex
+    STY v_off                 ; advance done
+    LDA h_color_lut,X
+    STA pending_h_color       ; for next vertex's h-chain draw
 
     ; --- Column loop advance ---
-    ; Increments hmap_col (wrapping at 31), advances v_ptr by 3, and
-    ; adds step to sx_running (SMC'd 16-bit add). Decrements proj_col
-    ; and loops until all vertices are done.
+    ; Increments hmap_col (wrapping at 31) and adds step to
+    ; sx_running. Decrements proj_col and loops until done.
 
     ; Advance heightmap column
     LDA hmap_col
@@ -775,24 +594,13 @@ draw_grid:
     AND #$1F
     STA hmap_col
 
-    ; Advance v_ptr += 3
-    LDA v_ptr
-    CLC
-    ADC #3
-    STA v_ptr
-    BCC @no_vpc
-    INC v_ptr+1
-@no_vpc:
-
-    ; sx_running += step (SMC: immediate operands)
+    ; sx_running += step
     LDA run_lo
     CLC
-@run_add_lo:
-    ADC #$00                  ; SMC'd to step_lo
+    ADC step_lo
     STA run_lo
     LDA run_hi
-@run_add_hi:
-    ADC #$00                  ; SMC'd to step_hi
+    ADC step_hi
     STA run_hi
 
     DEC proj_col
@@ -806,11 +614,21 @@ draw_grid:
     ; proj_row and loops.
 
 @col_done:
-    ; Save hmap_ptr for far-row Z interpolation
+    ; Rotate hmap pointers: prev = current, current = next
     LDA hmap_ptr
     STA prev_hmap_ptr
     LDA hmap_ptr+1
     STA prev_hmap_ptr+1
+    LDA next_hmap_ptr
+    STA hmap_ptr
+    LDA next_hmap_ptr+1
+    STA hmap_ptr+1
+    ; Advance hmap_row (wrapping at 32)
+    LDA hmap_row
+    CLC
+    ADC #1
+    AND #$1F
+    STA hmap_row
 
     ; z_cam += 64 ($0040 = 0.25 units in 8.8)
     LDA z_cam_lo
@@ -826,57 +644,50 @@ draw_grid:
     CMP n_rows
     BCS @proj_done
     JMP @row_loop
-    ; --- H-chain drawing ---
-    ; After all rows are projected and v-chains drawn, h-chains are
-    ; drawn back-to-front (far row first, near row last) so nearer
-    ; lines overwrite farther ones.
-    ;
-    ; For each row, grid_ptr is set to the row's v_buf start and
-    ; seg_count = n_vtx - 1.
+    ; --- V-chain drawing ---
+    ; After all rows are projected and h-chains drawn inline, v-chains
+    ; are drawn column by column. For each column, grid_ptr walks down
+    ; v_buf by ROW_STRIDE, reading v_color from +2.
 
 @proj_done:
-    ; --- Post-projection: draw h-chains row by row (back-to-front) ---
-    LDA n_rows_m1
-    STA proj_row
-@h_row_loop:
-    ; grid_ptr = v_buf + row offset
-    LDX proj_row
-    LDA v_row_offset_lo,X
+    ; --- Post-projection: draw v-chains column by column ---
+    LDA #0
+    STA proj_col
+@v_col_loop:
+    ; grid_ptr = v_buf + proj_col * 3
+    LDA proj_col
+    ASL A
+    CLC
+    ADC proj_col              ; A = col * 3
     CLC
     ADC #<v_buf
     STA grid_ptr
-    LDA v_row_offset_hi,X
-    ADC #>v_buf
+    LDA #>v_buf
+    ADC #0
     STA grid_ptr+1
 
-    LDX n_vtx
-    DEX
-    STX seg_count
-    JSR draw_h_row
+    LDA n_rows
+    SEC
+    SBC #1
+    STA seg_count
+    JSR draw_v_col
 
-    DEC proj_row
-    BPL @h_row_loop
+    INC proj_col
+    LDA proj_col
+    CMP n_vtx
+    BCC @v_col_loop
     RTS
 
 ; =====================================================================
-; draw_h_row — Draw one horizontal chain from grid_ptr (3-byte stride)
+; draw_v_col — Draw one vertical chain from grid_ptr (ROW_STRIDE stride)
 ; =====================================================================
-; Input:  grid_ptr = row start, seg_count = segments (n_vtx - 1)
+; Input:  grid_ptr = column start (row 0), seg_count = segments (n_rows - 1)
 ;
-; Reads the first vertex's sx/sy and calls init_base to establish the
-; chain's raster state. Then for each segment:
-;
-; - Advances grid_ptr by 3 to the next vertex
-; - Reads endpoint sx (+0), sy (+1), and h_color (+2) sequentially.
-;   The h_color at +2 was written there during projection by the
-;   *previous* vertex (at its v_ptr+5)
-; - If h_color is black (0), skips drawing — repositions the chain at
-;   the endpoint via init_base (breaking the chain)
-; - Otherwise calls draw_line, then copies endpoint to start point for
-;   the next segment
-; - After the last segment, returns (no final pixel)
+; Reads the first vertex's sx/sy and calls init_base. Then for each
+; segment, advances grid_ptr by ROW_STRIDE, reads endpoint sx (+0),
+; sy (+1), and v_color (+2). Black segments reposition via init_base.
 
-draw_h_row:
+draw_v_col:
     LDY #0
     LDA (grid_ptr),Y          ; sx
     STA raster_x0
@@ -884,12 +695,12 @@ draw_h_row:
     LDA (grid_ptr),Y          ; sy
     STA raster_y0
     JSR init_base             ; Y = sub_y
-@h_seg:
+@v_seg:
     STY saved_y
-    ; Advance grid_ptr to next vertex
+    ; Advance grid_ptr by ROW_STRIDE
     LDA grid_ptr
     CLC
-    ADC #3
+    ADC #ROW_STRIDE
     STA grid_ptr
     BCC :+
     INC grid_ptr+1
@@ -900,92 +711,56 @@ draw_h_row:
     LDA (grid_ptr),Y          ; endpoint sy
     STA raster_y1
     INY
-    LDA (grid_ptr),Y          ; h_color (stored here by prev vertex)
-    BEQ @h_skip_black
+    LDA (grid_ptr),Y          ; v_color
+    BEQ @v_skip_black
     LDY saved_y
     JSR draw_line
-    JMP @h_drawn
-@h_skip_black:
-    ; Black segment: reposition at endpoint without drawing
+    JMP @v_drawn
+@v_skip_black:
     LDA raster_x1
     STA raster_x0
     LDA raster_y1
     STA raster_y0
-    JSR init_base             ; reposition chain at next vertex
+    JSR init_base
     DEC seg_count
-    BNE @h_seg
-    RTS                       ; last segment was black, no final pixel
-@h_drawn:
+    BNE @v_seg
+    RTS
+@v_drawn:
     LDA raster_x1
     STA raster_x0
     LDA raster_y1
     STA raster_y0
     DEC seg_count
-    BNE @h_seg
+    BNE @v_seg
     RTS
 
-; =====================================================================
-; set_hmap_ptr — Set hmap_ptr from heightmap row index
-; =====================================================================
-; Input:  A = hmap row index (0..31)
-; Output: hmap_ptr set, X = input A (preserved for caller)
 
-set_hmap_ptr:
-    TAX
-    LSR A
-    LSR A
-    LSR A                     ; hmap_z >> 3
+; =====================================================================
+; add_cam_y_offset — Add cam_y integer part and correct for borrow
+; =====================================================================
+; Input:  A = hi(combined * recip), seg_count = h*8
+; Output: A = screen-y (clamped ≥ 0)
+
+add_cam_y_offset:
     CLC
-    ADC #>height_map
-    STA hmap_ptr+1
-    TXA
-    AND #$07
-    ASL A
-    ASL A
-    ASL A
-    ASL A
-    ASL A                     ; (hmap_z & 7) << 5, C=0 (max 224)
-    ADC #<height_map
-    STA hmap_ptr
-    BCC :+
-    INC hmap_ptr+1
-:   RTS
-
-; =====================================================================
-; mul_cam_y — Multiply recip by cam_y (8.8), return pixel offset
-; =====================================================================
-; Input:  A = recip (8-bit unsigned)
-; Output: A = recip * cam_y (integer part), C set if overflow
-; Clobbers: math_a, math_b, math_res, offset_tmp
-
-mul_cam_y:
-    STA math_a
-    ; Integer part: recip * cam_y_hi via adds (cam_y_hi is 0-2)
+    ADC #16
     LDX cam_y_hi
-    BEQ @mcy_int_zero
-    DEX
-    BEQ @mcy_int_done         ; cam_y_hi == 1: A = recip
-    ASL A                     ; cam_y_hi == 2: A = 2*recip
-    BCS @mcy_overflow
-    DEX
-    BEQ @mcy_int_done
-    BCC @mcy_overflow         ; cam_y_hi >= 3: overflow
-@mcy_int_zero:
-    LDA #0
-@mcy_int_done:
-    PHA                       ; save integer contribution
-    ; Fractional part: (recip * cam_y_lo) >> 8
-    LDA cam_y_lo
-    STA math_b
-    JSR umul8x8
-    PLA                       ; integer contribution
+    BEQ @aco_borrow
     CLC
-    ADC math_res_hi           ; + fractional high byte
-    BCC @mcy_done
-@mcy_overflow:
-    LDA #$FF                  ; saturate
+    ADC recip_val
+    DEX
+    BEQ @aco_borrow
+    CLC
+    ADC recip_val
+@aco_borrow:
+    LDX cam_y_lo
+    CPX seg_count             ; was cam_y_lo >= h*8?
+    BCS @aco_done             ; no borrow → done
     SEC
-@mcy_done:
+    SBC recip_val             ; correct for 256-wrap
+    BCS @aco_done
+    LDA #0                    ; clamp to 0
+@aco_done:
     RTS
 
 ; =====================================================================
@@ -1098,18 +873,22 @@ compute_interp_offsets:
 ; =====================================================================
 ; z_interp_vertex — Z-interpolate height in offset_tmp
 ; =====================================================================
-; Interpolates offset_tmp's height (bits 0–4) between outer row (hmap_ptr)
+; Interpolates offset_tmp's height (bits 3–7) between outer row (hmap_ptr)
 ; and inner row (interp_z_ptr) using z_interp_offset.
-; Preserves colour bits (5–7) in offset_tmp.
+; Preserves colour bits (0–2) in offset_tmp.
 
 z_interp_vertex:
     STX seg_count             ; X = z_interp_offset from caller
     LDY hmap_col
     LDA (interp_z_ptr),Y      ; inner row cell byte
-    AND #$1F                  ; h_inner_z
+    LSR A
+    LSR A
+    LSR A                     ; h_inner_z
     STA chain_idx
     LDA offset_tmp
-    AND #$1F                  ; h_outer_z
+    LSR A
+    LSR A
+    LSR A                     ; h_outer_z
     JMP lerp_height            ; tail call — A = pre-scaled (0..248)
 
 ; =====================================================================
@@ -1122,14 +901,18 @@ z_interp_vertex:
 interp_height:
     PHA                       ; push X offset to stack
     LDA (hmap_ptr),Y          ; inner cell byte at inner column
-    AND #$1F                  ; h_inner
+    LSR A
+    LSR A
+    LSR A                     ; h_inner
     ; Z-interpolate h_inner if on boundary row (corner case)
     LDX z_interp_offset
     BEQ @ih_z_done
     STA saved_y               ; save h_inner_outer_row
     STX seg_count             ; Z offset
     LDA (interp_z_ptr),Y      ; inner row at inner column
-    AND #$1F
+    LSR A
+    LSR A
+    LSR A
     STA chain_idx             ; h_to
     LDA saved_y               ; h_from
     JSR lerp_height            ; A = pre-scaled Z-interpolated
@@ -1142,25 +925,21 @@ interp_height:
     PLA                       ; recover X offset
     STA seg_count
     LDA offset_tmp
-    AND #$1F                  ; h_outer (already Z-interpolated)
+    LSR A
+    LSR A
+    LSR A                     ; h_outer (already Z-interpolated)
     CMP chain_idx
     BEQ @ih_done              ; same height → no change
-    JSR lerp_height            ; A = pre-scaled (0..248)
-    ; Convert interpolated height to sy
-    BEQ @ih_base_sy
-    STA math_a                ; already world-coord scale
-    JSR umul8x8               ; math_b = recip_val (set by clamp, preserved)
-    LDA sy_val
+    JSR lerp_height           ; A = pre-scaled h*8 (0..248)
+    STA seg_count             ; save for borrow check
+    LDA cam_y_lo
     SEC
-    SBC math_res_hi
-    BCS @ih_sy_ok
-    LDA #0
-@ih_sy_ok:
+    SBC seg_count
+    STA math_a
+    JSR umul8x8               ; math_b = recip_val
+    LDA math_res_hi
+    JSR add_cam_y_offset
     STA offset_tmp+1
 @ih_done:
-    RTS
-@ih_base_sy:
-    LDA sy_val
-    STA offset_tmp+1
     RTS
 

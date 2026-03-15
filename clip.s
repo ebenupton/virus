@@ -3,7 +3,7 @@
 ; Provides: clip_line_left, clip_line_right, clip_line_near, clip_line_far,
 ;           project_and_draw
 ; Requires: raster_zp.inc, math_zp.inc, grid_zp.inc
-;           urecip15, umul8x8, smul8x8, init_base, draw_line
+;           recip8, umul8x8, smul8x8, init_base, draw_line
 
 .include "raster_zp.inc"
 .include "math_zp.inc"
@@ -607,7 +607,7 @@ project_and_draw:
     ; init_base for P0
     JSR init_base
     TYA
-    PHA                         ; save sub-row Y (urecip15 clobbers Y)
+    PHA                         ; save sub-row Y (recip8 clobbers Y)
 
     ; -- Project P1 --
     LDA clip_z1
@@ -667,21 +667,16 @@ plot_final_pixel:
     RTS
 
 ; =====================================================================
-; compute_recip_z2 — Compute recip from z << 2 via urecip15
+; compute_recip_z2 — Compute recip ≈ floor(16384/z) via recip8
 ; =====================================================================
 ; Input:  A = z_lo, X = z_hi
-; Output: clip_n = lo(urecip15(z << 2))
-; Clobbers: A, X, Y, math_a, math_b, math_res
+; Output: clip_n = floor(32768/z) >> 1 ≈ floor(16384/z)
+; Clobbers: A, X, Y, math_b
 
 compute_recip_z2:
-    ASL A
     STA math_b
     TXA
-    ROL A
-    ASL math_b
-    ROL A
-    STA math_a
-    JSR urecip15
-    LDA math_res_lo
+    JSR recip8
+    LSR A
     STA clip_n
     RTS

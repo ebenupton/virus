@@ -2,7 +2,7 @@
 ;
 ; Provides: draw_object
 ; Requires: object_zp.inc, raster_zp.inc, math_zp.inc
-; Ext refs: sin_table, cos_table, urecip15, umul8x8, smul8x8,
+; Ext refs: sin_table, cos_table, recip8, umul8x8, smul8x8,
 ;           init_base, draw_line, clip_line_left, clip_line_right,
 ;           clip_line_near, clip_line_far, project_and_draw
 
@@ -345,15 +345,11 @@ draw_object:
     JMP @vtx_clamp
 @vz_nz:
 
-    ; recip = urecip15(vz << 1)
+    ; recip = recip8(vz)
     LDA vcoord_lo
-    ASL A
     STA math_b
     LDA vcoord_hi
-    ROL A
-    STA math_a
-    JSR urecip15
-    LDA math_res_lo
+    JSR recip8
     STA clip_n
 
     ; -- view_x = obj_view_x + sign_extend(local_x) --

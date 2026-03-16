@@ -15,6 +15,7 @@
 ; ── Grid internal workspace (ZP_GRID internal) ────────────────────
 h_chain_sub_y   = ZP_GRID + 1      ; saved sub_y for inline h-chain drawing
 v_off           = ZP_GRID + 2      ; v_buf byte offset (single-byte, max 188)
+saved_h_color   = ZP_GRID + 3      ; pre-resolved h_color for current vertex
 ; Pointers
 grid_ptr        = ZP_GRID + 7      ; 2 bytes — v-chain post-pass column ptr
 hmap_ptr        = ZP_GRID + 9      ; 2 bytes — heightmap row pointer
@@ -62,10 +63,14 @@ sub_x           = scratch_1        ; ship fractional X within cell
 sub_z           = scratch_2        ; ship fractional Z within cell
 ; Aliases — projection / draw
 offset_tmp      = scratch_0        ; various temporary uses
-seg_count       = scratch_1        ; segments remaining / lerp offset
-chain_idx       = scratch_2        ; chain byte offset / lerp h_b
-saved_y         = scratch_3        ; saved sub-row Y / lerp h_a
+seg_count       = scratch_1        ; segments remaining
+chain_idx       = scratch_2        ; chain byte offset
+saved_y         = scratch_3        ; saved sub-row Y
 saved_color     = scratch_4        ; colour for current segment
+; Aliases — interpolation (same ZP, different context)
+lerp_t          = scratch_1        ; interpolation offset (0..63)
+h_to            = scratch_2        ; target height
+h_from          = scratch_3        ; source height
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "BUFFERS"
@@ -392,15 +397,13 @@ draw_grid:
 
     ; --- Left edge vertex ---
     JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
-    JSR height_to_sy          ; A = sy
-    STA offset_tmp+1
-    LDA hmap_col
-    CLC
-    ADC #1
+    LDY hmap_col
+    INY
+    TYA
     AND #$1F
     TAY                       ; Y = inner column
     LDA interp_offset_l
-    JSR interp_height         ; may update offset_tmp+1
+    JSR interp_height         ; sets offset_tmp+1
     LDA #64
     SEC
     SBC edge_offset           ; A = sx
@@ -418,15 +421,13 @@ draw_grid:
 
     ; --- Right edge vertex ---
     JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
-    JSR height_to_sy          ; A = sy
-    STA offset_tmp+1
-    LDA hmap_col
-    SEC
-    SBC #1
+    LDY hmap_col
+    DEY
+    TYA
     AND #$1F
     TAY                       ; Y = inner column
     LDA interp_offset_r
-    JSR interp_height         ; may update offset_tmp+1
+    JSR interp_height         ; sets offset_tmp+1
     LDA edge_offset
     CLC
     ADC #64                   ; A = sx
@@ -449,9 +450,9 @@ draw_grid:
     LDA next_hmap_ptr+1
     STA hmap_ptr+1
     ; Advance hmap_row (wrapping at 32)
-    LDA hmap_row
-    CLC
-    ADC #1
+    LDY hmap_row
+    INY
+    TYA
     AND #$1F
     STA hmap_row
 
@@ -606,7 +607,7 @@ add_cam_y_offset:
 ; =====================================================================
 ; lut_lookup — Look up interpolation LUT value
 ; =====================================================================
-; Input:  A = diff (1..31), seg_count = offset (0..63)
+; Input:  A = diff (1..31), lerp_t = offset (0..63)
 ; Output: A = LUT value (pre-scaled delta)
 
 lut_lookup:
@@ -614,11 +615,11 @@ lut_lookup:
     BCS @ll_big               ; diff > 4 → multiply path
     SEC
     SBC #1                    ; diff - 1 (0..3)
-    STA chain_idx
-    LDA seg_count
+    STA h_to
+    LDA lerp_t
     ASL A
     ASL A                     ; offset * 4
-    ORA chain_idx             ; + (diff-1)
+    ORA h_to                  ; + (diff-1)
     TAX
     LDA interp_lut,X
     RTS
@@ -626,61 +627,61 @@ lut_lookup:
     ; diff > 4: compute diff * offset / 8 via repeated addition
     TAX                       ; X = diff (loop counter)
     LDA #0
-    STA chain_idx             ; hi byte of accumulator
+    STA h_to                  ; hi byte of accumulator
 @ll_add:
     CLC
-    ADC seg_count
+    ADC lerp_t
     BCC @ll_nc
-    INC chain_idx
+    INC h_to
 @ll_nc:
     DEX
     BNE @ll_add
-    ; chain_idx:A = diff * offset; shift right 3
-    LSR chain_idx
+    ; h_to:A = diff * offset; shift right 3
+    LSR h_to
     ROR A
-    LSR chain_idx
+    LSR h_to
     ROR A
-    LSR chain_idx
+    LSR h_to
     ROR A
     RTS
 
 ; =====================================================================
 ; lerp_height — Interpolate from h_a towards h_b by offset
 ; =====================================================================
-; Input:  A = h_a (0..31), chain_idx = h_b (0..31), seg_count = offset (0..63)
+; Input:  A = h_a (0..31), h_to = h_b (0..31), lerp_t = offset (0..63)
 ; Output: A = pre-scaled interpolated height (0..248)
-; Clobbers: saved_y, chain_idx, X
+; Clobbers: h_from, h_to, X
 
 lerp_height:
-    CMP chain_idx
+    CMP h_to
     BEQ @lh_same              ; same → return h_a × 8
-    STA saved_y               ; save h_a
+    STA h_from                ; save h_a
     BCC @lh_b_higher
     ; h_a > h_b: result = h_a×8 − delta_scaled
     SEC
-    SBC chain_idx             ; diff (1..4)
+    SBC h_to                  ; diff (1..4)
     JSR lut_lookup            ; A = pre-scaled delta
-    STA chain_idx
-    LDA saved_y
+    STA h_to
+    LDA h_from
     ASL A
     ASL A
     ASL A                     ; h_a × 8
     SEC
-    SBC chain_idx
+    SBC h_to
     RTS
 @lh_b_higher:
     ; h_b > h_a: result = h_a×8 + delta_scaled
-    LDA chain_idx
+    LDA h_to
     SEC
-    SBC saved_y               ; diff (1..4)
+    SBC h_from                ; diff (1..4)
     JSR lut_lookup            ; A = pre-scaled delta
-    STA chain_idx
-    LDA saved_y
+    STA h_to
+    LDA h_from
     ASL A
     ASL A
     ASL A                     ; h_a × 8
     CLC
-    ADC chain_idx
+    ADC h_to
     RTS
 @lh_same:
     ASL A
@@ -718,13 +719,13 @@ compute_interp_offsets:
 ; Preserves colour bits (0–2) in offset_tmp.
 
 z_interp_vertex:
-    STX seg_count             ; X = z_interp_offset from caller
+    STX lerp_t                ; X = z_interp_offset from caller
     LDY hmap_col
     LDA (interp_z_ptr),Y      ; inner row cell byte
     LSR A
     LSR A
     LSR A                     ; h_inner_z
-    STA chain_idx
+    STA h_to
     LDA offset_tmp
     LSR A
     LSR A
@@ -747,33 +748,38 @@ interp_height:
     ; Z-interpolate h_inner if on boundary row (corner case)
     LDX z_interp_offset
     BEQ @ih_z_done
-    STA saved_y               ; save h_inner_outer_row
-    STX seg_count             ; Z offset
+    STA h_from                ; save h_inner_outer_row
+    STX lerp_t                ; Z offset
     LDA (interp_z_ptr),Y      ; inner row at inner column
     LSR A
     LSR A
     LSR A
-    STA chain_idx             ; h_to
-    LDA saved_y               ; h_from
+    STA h_to
+    LDA h_from
     JSR lerp_height            ; A = pre-scaled Z-interpolated
     LSR A
     LSR A
     LSR A                     ; → height units
 @ih_z_done:
-    STA chain_idx             ; h_inner (Z-interpolated if corner)
+    STA h_to                  ; h_inner (Z-interpolated if corner)
     ; X-interpolate between h_outer and h_inner
     PLA                       ; recover X offset
-    STA seg_count
+    STA lerp_t
     LDA offset_tmp
     LSR A
     LSR A
     LSR A                     ; h_outer (already Z-interpolated)
-    CMP chain_idx
-    BEQ @ih_done              ; same height → no change
+    CMP h_to
+    BEQ @ih_same              ; same height → use h_outer directly
     JSR lerp_height           ; A = pre-scaled h*8 (0..248)
+    JMP @ih_store
+@ih_same:
+    ASL A
+    ASL A
+    ASL A                     ; h_outer * 8
+@ih_store:
     JSR height_to_sy          ; A = sy
     STA offset_tmp+1
-@ih_done:
     RTS
 
 ; =====================================================================
@@ -790,18 +796,20 @@ lookup_and_color:
     STA offset_tmp            ; full cell byte for z_interp_vertex
     ASL A
     AND #$0E
-    STA saved_color           ; color base index (even=land, odd=sea)
+    TAX                       ; X = color LUT index (land)
     LDA offset_tmp
-    AND #$F8                  ; h*8 directly
-    BEQ @lc_sea
+    AND #$F8                  ; A = h*8
+    BNE @lc_land
+    INX                       ; sea flag (odd LUT index)
+@lc_land:
+    PHA                       ; save h*8
+    LDA v_color_lut,X
+    STA saved_color           ; pre-resolved v_color
+    LDA h_color_lut,X
+    STA saved_h_color         ; pre-resolved h_color
+    PLA                       ; restore h*8
     LDX z_interp_offset
     BEQ @lc_done
-    BNE @lc_zinterp           ; always
-@lc_sea:
-    INC saved_color           ; set sea flag (odd LUT index)
-    LDX z_interp_offset
-    BEQ @lc_done
-@lc_zinterp:
     JSR z_interp_vertex       ; A = z-interp h*8
     STA offset_tmp            ; update for edge interp
 @lc_done:
@@ -824,18 +832,24 @@ do_middle_vertex:
 do_vertex_tail:
     ; --- v_buf store ---
     ; A = sx for this vertex
-    STA raster_x1
     LDY v_off
+    STA raster_x1
     STA v_buf,Y               ; sx at offset 0
+    INY
     LDA offset_tmp+1          ; sy
     STA raster_y1
+    STA v_buf,Y               ; sy at offset 1
+    INY
+    LDA saved_color           ; v_color (pre-resolved)
+    STA v_buf,Y               ; v_color at offset 2
+    INY
+    STY v_off                 ; advance past all 3 bytes
+
+    LDA offset_tmp+1          ; reload sy
     CMP grid_min_sy
     BCS @vt_no_dirty
     STA grid_min_sy
 @vt_no_dirty:
-    INY
-    STA v_buf,Y               ; sy at offset 1
-    STY v_off
 
     ; --- Inline h-chain drawing ---
     ; pending_h_color = 0 for first vertex (pre-cleared) or black
@@ -855,21 +869,14 @@ do_vertex_tail:
 @vt_h_done:
     STY h_chain_sub_y
 
-    ; --- Edge colours from precomputed index ---
-    LDX saved_color
-    LDA v_color_lut,X        ; v_color for this vertex
-    LDY v_off                 ; restore (= off+1)
-    INY
-    STA v_buf,Y               ; v_color at off+2
-    INY                       ; off+3 = next vertex
-    STY v_off                 ; advance done
-    LDA h_color_lut,X
+    ; --- Update h-chain color for next vertex ---
+    LDA saved_h_color
     STA pending_h_color       ; for next vertex's h-chain draw
 
     ; --- Column advance ---
-    LDA hmap_col
-    CLC
-    ADC #1
+    LDX hmap_col
+    INX
+    TXA
     AND #$1F
     STA hmap_col
 

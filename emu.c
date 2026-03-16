@@ -86,7 +86,7 @@ static const uint32_t mode2_palette[16] = {
 
 /* ── Profiling ─────────────────────────────────────────────────────── */
 
-#define PROFILE_RANGE_LO 0x0600
+#define PROFILE_RANGE_LO 0x0400
 #define PROFILE_RANGE_HI 0x3000
 #define PROFILE_SIZE     (PROFILE_RANGE_HI - PROFILE_RANGE_LO)
 
@@ -681,8 +681,8 @@ int main(int argc, char *argv[])
     }
 
     /* Load binary */
-    uint16_t load_addr = boot_mode ? 0x3000 : 0x0600;
-    long max_size = boot_mode ? 0x5000 : 0x2A00;
+    uint16_t load_addr = boot_mode ? 0x3000 : 0x0400;
+    long max_size = boot_mode ? 0x5000 : 0x2C00;
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);

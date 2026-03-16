@@ -15,9 +15,9 @@
 ; ── Grid internal workspace (ZP_GRID internal) ────────────────────
 h_chain_sub_y   = ZP_GRID + 1      ; saved sub_y for inline h-chain drawing
 v_off           = ZP_GRID + 2      ; v_buf byte offset (single-byte, max 188)
-saved_h_color   = ZP_GRID + 3      ; pre-resolved h_color for current vertex
+h_color         = ZP_GRID + 3      ; pre-resolved h_color for current vertex
 ; Pointers
-grid_ptr        = ZP_GRID + 7      ; 2 bytes — v-chain post-pass column ptr
+grid_ptr        = ZP_GRID + 7      ; 1 byte — v_buf offset for v-chain pass
 hmap_ptr        = ZP_GRID + 9      ; 2 bytes — heightmap row pointer
 next_hmap_ptr   = ZP_GRID + 11     ; 2 bytes — next heightmap row pointer
 interp_z_ptr    = ZP_GRID + 13     ; 2 bytes — inner row heightmap pointer for Z interp
@@ -39,15 +39,14 @@ base_z          = ZP_GRID + 30     ; heightmap row base for row 0
 hmap_col        = ZP_GRID + 31     ; current heightmap column index (0..31)
 hmap_row        = ZP_GRID + 32     ; current heightmap row index (0..31)
 ; Grid dimensions / clamps
-n_vtx           = ZP_GRID + 33     ; vertices per row this frame
+n_cols           = ZP_GRID + 33     ; vertices per row this frame
 n_rows          = ZP_GRID + 34     ; vertex rows this frame
-n_rows_m1       = ZP_GRID + 35     ; n_rows-1, precomputed for V-chain final pixel check
 pending_h_color = ZP_GRID + 36     ; h_color from previous vertex for h-chain
 edge_offset     = ZP_GRID + 37     ; hi($E0 * recip), used for edge sx
 run_sub_recip   = ZP_GRID + 38     ; flag: subtract recip from run_hi (0 or 1)
 ; Interpolation
-interp_offset_l    = ZP_GRID + 41  ; left-edge interpolation offset (0..63)
-interp_offset_r    = ZP_GRID + 42  ; right-edge interpolation offset (0..63)
+interp_offset_left    = ZP_GRID + 41  ; left-edge interpolation offset (0..63)
+interp_offset_right    = ZP_GRID + 42  ; right-edge interpolation offset (0..63)
 interp_offset_near = ZP_GRID + 43  ; near-row Z interpolation offset (0..63)
 interp_offset_far  = ZP_GRID + 44  ; far-row Z interpolation offset (0..64, 64=skip)
 z_interp_offset    = ZP_GRID + 45  ; current row's Z offset (0 = no Z interp)
@@ -62,18 +61,17 @@ scratch_4       = ZP_GRID + 51     ; scratch
 sub_x           = scratch_1        ; ship fractional X within cell
 sub_z           = scratch_2        ; ship fractional Z within cell
 ; Aliases — projection / draw
-offset_tmp      = scratch_0        ; various temporary uses
+vtx_cell        = scratch_0        ; cell byte (byte 0), sy (byte +1)
 seg_count       = scratch_1        ; segments remaining
-chain_idx       = scratch_2        ; chain byte offset
 saved_y         = scratch_3        ; saved sub-row Y
-saved_color     = scratch_4        ; colour for current segment
+v_color         = scratch_4        ; pre-resolved v_color for current vertex
 ; Aliases — interpolation (same ZP, different context)
 lerp_t          = scratch_1        ; interpolation offset (0..63)
 h_to            = scratch_2        ; target height
 h_from          = scratch_3        ; source height
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
-.segment "BUFFERS"
+.segment "GRIDBUF"
 v_buf:        .res GRID_VTX_Z * ROW_STRIDE     ; row-major, 3 bytes/vertex (sx, sy, v_color)
 .segment "CODE"
 
@@ -129,12 +127,12 @@ draw_grid:
     TXA
     CLC
     ADC #<($20 - HALF_COLS * $40)         ; + $20
-    STA offset_tmp
+    STA scratch_0
     LDA obj_world_pos+OBJ_WORLD_SHIP+1   ; x hi
     ADC #>($20 - HALF_COLS * $40)         ; + $FF + carry
-    ASL offset_tmp
+    ASL scratch_0
     ROL A
-    ASL offset_tmp
+    ASL scratch_0
     ROL A
     AND #$1F
     STA base_x
@@ -150,12 +148,12 @@ draw_grid:
     CLC
     ADC #<($20 - (HALF_ROWS - 1) * $40)  ; + $A0
     TAX                                    ; save biased lo
-    STA offset_tmp
+    STA scratch_0
     LDA obj_world_pos+OBJ_WORLD_SHIP+5   ; z hi
     ADC #>($20 - (HALF_ROWS - 1) * $40)  ; + $FF + carry
-    ASL offset_tmp
+    ASL scratch_0
     ROL A
-    ASL offset_tmp
+    ASL scratch_0
     ROL A
     AND #$1F
     STA base_z
@@ -163,385 +161,164 @@ draw_grid:
     ; lo never borrows ($E0 - max $3F = $A1), so hi is constant
     TXA
     AND #$3F
-    STA offset_tmp
+    STA scratch_0
     SEC
     LDA #<Z_NEAR_BOUND
-    SBC offset_tmp
+    SBC scratch_0
     STA z_cam_lo
     LDA #>Z_NEAR_BOUND
     STA z_cam_hi
 
-    ; --- Grid dimensions ---
-    ; Sets n_vtx (vertices per row, 8 or 9) and n_rows (vertex rows,
-    ; 6 or 7). When sub_x or sub_z is exactly $20, one column/row is
-    ; dropped because the edge vertices would coincide.
-    ; === Determine n_vtx and n_rows (conditionally omit edge col/row) ===
-    LDX #GRID_VTX_X
-    LDA sub_x
-    CMP #$20
-    BNE @keep_x
-    DEX
-@keep_x:
-    STX n_vtx
-    LDY #GRID_VTX_Z
-    LDA sub_z
-    CMP #$20
-    BNE @keep_z
-    DEY
-@keep_z:
-    STY n_rows
-    DEY
-    STY n_rows_m1
-
-    ; --- Interpolation offsets ---
-    ; The grid edges don't align with heightmap cell boundaries. These
-    ; offsets control how edge-row/column heights are interpolated
-    ; between the two nearest heightmap cells, so the grid edges match
-    ; exact screen boundaries rather than snapping to cell centres.
-    ; === Compute interpolation offsets for edge height correction ===
+    ; --- Interpolation offsets + grid dimensions ---
+    ; compute_interp_offsets returns X = |sub - 32|, so X == 0 iff
+    ; sub == $20 (edge vertices coincide → drop one col/row).
     LDA sub_x
     JSR compute_interp_offsets
-    STX interp_offset_l
-    STA interp_offset_r
+    STX interp_offset_left
+    STA interp_offset_right
+    LDA #GRID_VTX_X - 1
+    CPX #1                    ; C = (sub_x != $20)
+    ADC #0                    ; n_cols = 8 or 9
+    STA n_cols
 
-    ; === Compute Z interpolation offsets (same formula as X, using sub_z) ===
     LDA sub_z
     JSR compute_interp_offsets
     STX interp_offset_near
     STA interp_offset_far
+    LDA #GRID_VTX_Z - 1
+    CPX #1                    ; C = (sub_z != $20)
+    ADC #0                    ; n_rows = 6 or 7
+    STA n_rows
 
     ; --- Precompute run_factor for sx_running ---
-    ; sx_running = $4000 - K*recip, where K = 256 ± sub_x correction.
-    ; sub_x in [0,$1F]: K = 256+sub_x → run_factor=sub_x, run_sub_recip=1
-    ; sub_x in [$20,$3F]: K = $C0+sub_x → run_factor=$C0+sub_x, flag=0
+    ; sx_running = $4000 - K*recip, where K depends on sub_x:
+    ;   sub_x < $20: K = $100+sub_x → factor=sub_x, sub_recip=1
+    ;   sub_x >= $20: K = $C0+sub_x → factor=$C0+sub_x, sub_recip=0
     LDA sub_x
-    CMP #$20
-    BCS @rf_wrap
-    STA run_factor
     LDX #1
-    BCC @rf_done              ; always
-@rf_wrap:
-    CLC
-    ADC #$C0
-    STA run_factor
+    CMP #$20
+    BCC @rf_done
     LDX #0
+    ADC #$BF                  ; + $C0 (C=1 from CMP)
 @rf_done:
+    STA run_factor
     STX run_sub_recip
 
-    ; --- Initial hmap_ptr from base_z (inline set_hmap_ptr) ---
-    ; hmap_ptr = height_map + hmap_row * 32, via (hmap_row:$00) >> 3
-    ; height_map is page-aligned so lo byte of base is 0
+    ; --- Initial hmap_ptr from base_z ---
+    ; hmap_ptr = height_map + hmap_row * 32
+    ; Shift row left 5, with >height_map/4 pre-loaded so ROLs
+    ; accumulate both row bits and base address.
+    LDA #>height_map / 4
+    STA hmap_ptr+1
     LDA base_z
     STA hmap_row
-    STA hmap_ptr+1
-    LDA #0
-    LSR hmap_ptr+1
-    ROR A
-    LSR hmap_ptr+1
-    ROR A
-    LSR hmap_ptr+1
-    ROR A                     ; hmap_ptr+1:A = hmap_row * 32
+    ASL A
+    ASL A
+    ASL A
+    ASL A
+    ROL hmap_ptr+1
+    ASL A
+    ROL hmap_ptr+1
     STA hmap_ptr
-    LDA hmap_ptr+1
-    ADC #>height_map          ; C=0 from shifts
-    STA hmap_ptr+1
 
     RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 2)
     RECIP_FAR  = 65536 / (Z_FAR_BOUND * 2)
 
-    ; === Row loop: j = 0..GRID_VTX_Z-1 ===
-    LDA #0
+    ; === Peeled row loop ===
+    LDA #1
     STA proj_row
 
-    ; --- Row loop start & z_cam adjustment ---
-    ; The main outer loop iterates over vertex rows (near → far). On
-    ; row 0 (near edge), z_cam is nudged forward by interp_offset_near
-    ; so it projects exactly at the near boundary. On the last row (far
-    ; edge), z_cam is nudged backward similarly. These adjustments are
-    ; reversed after the row is processed.
-
-@row_loop:
-    ; --- Reciprocal ---
-    ; Boundary rows use compile-time constants; interior rows use table lookup.
-    ; (Row 0's z_cam is below Z_NEAR_BOUND so can't index the table.)
-    LDA proj_row
-    BNE @not_row0
+    ; --- Near row (row 0): constant recip, Z-interp toward next row ---
+    JSR compute_next_hmap     ; need next_hmap_ptr for interp_z_ptr
     LDA #RECIP_NEAR
-    BNE @have_recip           ; always (RECIP_NEAR != 0)
-@not_row0:
-    CMP n_rows_m1
-    BNE @use_table
-    LDA #RECIP_FAR
-    BNE @have_recip           ; always (RECIP_FAR != 0)
-@use_table:
-    LDA z_cam_lo
-    STA math_b
-    LDA z_cam_hi
-    JSR recip8
-@have_recip:
     STA recip_val
-
-    ; --- Step & sx_running ---
-    ; step = recip * 64 is the screen-x distance between adjacent
-    ; vertices (one cell = 0.25 world units). It's a 16-bit value
-    ; stored in step_lo/step_hi.
-    ;
-    ; sx_running starts at $4000 - 4*step, which places the leftmost
-    ; vertex 4 cells left of centre (screen x = 64). The high byte is
-    ; the screen-x coordinate.
-    ; --- Step = recip * 64 (16-bit), the screen-x increment per cell ---
-    ; recip << 6 = (recip:$00) >> 2
-    LDA recip_val
-    LSR A
-    STA step_hi
-    LDA #0
-    ROR A
-    LSR step_hi
-    ROR A
-    STA step_lo
-
-    ; --- edge_offset = floor(recip * 7/8) = recip - ceil(recip/8) ---
-    LDA recip_val
-    CLC
-    ADC #7
-    LSR A
-    LSR A
-    LSR A                     ; ceil(recip/8)
-    STA offset_tmp
-    LDA recip_val
-    SEC
-    SBC offset_tmp
-    STA edge_offset
-
-    ; --- sx_running = $4000 - run_factor * recip [- recip*256] ---
-    ; run_factor and run_sub_recip precomputed before the loop.
-    ; Also sets math_b = recip_val for umul8x8 + interp_height.
-    LDA recip_val
-    STA math_b
-    LDA run_factor
-    JSR umul8x8
-    LDA #0
-    SEC
-    SBC math_res_lo
-    STA run_lo
-    LDA #$40
-    SBC math_res_hi
-    LDX run_sub_recip
-    BEQ :+
-    SEC
-    SBC recip_val
-:   STA run_hi
-
-    ; --- Heightmap next-row pointer: hmap_ptr + 32, wrapping at row 31 ---
-    CLC
-    LDA hmap_ptr
-    ADC #32
-    STA next_hmap_ptr
-    LDA hmap_ptr+1
-    ADC #0
-    LDY hmap_row
-    CPY #31
-    BNE @no_hmap_wrap
-    SEC
-    SBC #4                    ; subtract $0400 (1024 bytes = 32 rows)
-@no_hmap_wrap:
-    STA next_hmap_ptr+1
-
-    ; --- Z interpolation setup ---
-    ; On boundary rows (near or far), heights need interpolating
-    ; between the boundary row and the adjacent inner row. This sets
-    ; z_interp_offset and interp_z_ptr — the inner row to blend toward.
-    ; Interior rows skip this (offset = 0).
-    LDA #0
-    STA z_interp_offset           ; default: no Z interpolation
-    LDA proj_row
-    BNE @z_not_near
-    ; Near row: inner row = next row
     LDA interp_offset_near
-    BEQ @z_setup_done             ; offset 0 → skip
-    STA z_interp_offset
+    STA z_interp_offset       ; store unconditionally (0 = no interp)
+    BEQ @near_go              ; skip ptr setup if no Z interp
     LDA next_hmap_ptr
     STA interp_z_ptr
     LDA next_hmap_ptr+1
     STA interp_z_ptr+1
-    BNE @z_setup_done         ; always (hmap hi byte > 0)
-@z_not_near:
-    CMP n_rows_m1
-    BNE @z_setup_done
-    ; Far row: inner row = previous row
+@near_go:
+    JSR do_row_body           ; proj_row now 1, hmap advanced
+
+    ; --- Interior rows: table recip, no Z interp ---
+    LDA #0
+    STA z_interp_offset
+@interior:
+    LDA z_cam_lo
+    STA math_b
+    LDA z_cam_hi
+    JSR recip8
+    STA recip_val
+    JSR do_row_body
+    LDA proj_row
+    CMP n_rows
+    BCC @interior             ; loop while proj_row < n_rows
+
+    ; --- Far row (last): constant recip, Z-interp toward prev row ---
+    LDA #RECIP_FAR
+    STA recip_val
     LDA interp_offset_far
     CMP #64
-    BCS @z_setup_done             ; 64 → skip
+    BCS @far_go               ; 64 → no Z interp (z_interp_offset still 0)
     STA z_interp_offset
     LDA prev_hmap_ptr
     STA interp_z_ptr
     LDA prev_hmap_ptr+1
     STA interp_z_ptr+1
-@z_setup_done:
-
-    ; Reset heightmap column for this row
-    LDA base_x
-    STA hmap_col
-
-    ; --- Init v_off for this row ---
-    LDX proj_row
-    LDA v_row_offset_lo,X
-    STA v_off
-
-    ; --- Pre-clear for first-vertex h-chain ---
-    ; With pending_h_color = 0, the first vertex takes the existing
-    ; black-segment path (skip draw, call init_base), eliminating
-    ; the separate first-vertex check from the hot loop.
-    LDA #0
-    STA pending_h_color
-
-    ; --- Left edge vertex ---
-    JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
-    LDY hmap_col
-    INY
-    TYA
-    AND #$1F
-    TAY                       ; Y = inner column
-    LDA interp_offset_l
-    JSR interp_height         ; sets offset_tmp+1
-    LDA #64
-    SEC
-    SBC edge_offset           ; A = sx
-    JSR do_vertex_tail
-
-    ; --- Middle vertices ---
-    LDA n_vtx
-    SEC
-    SBC #2
-    STA proj_col
-@mid_loop:
-    JSR do_middle_vertex
-    DEC proj_col
-    BNE @mid_loop
-
-    ; --- Right edge vertex ---
-    JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
-    LDY hmap_col
-    DEY
-    TYA
-    AND #$1F
-    TAY                       ; Y = inner column
-    LDA interp_offset_r
-    JSR interp_height         ; sets offset_tmp+1
-    LDA edge_offset
-    CLC
-    ADC #64                   ; A = sx
-    JSR do_vertex_tail
-    ; --- Row loop tail ---
-    ; After all columns: saves hmap_ptr as prev_hmap_ptr (needed if
-    ; the next row is the far boundary row for Z interpolation).
-    ; Reverses the near-row z_cam adjustment if this was row 0.
-    ; Advances z_cam by $40 (one cell = 0.25 world units). Increments
-    ; proj_row and loops.
-
-@col_done:
-    ; Rotate hmap pointers: prev = current, current = next
-    LDA hmap_ptr
-    STA prev_hmap_ptr
-    LDA hmap_ptr+1
-    STA prev_hmap_ptr+1
-    LDA next_hmap_ptr
-    STA hmap_ptr
-    LDA next_hmap_ptr+1
-    STA hmap_ptr+1
-    ; Advance hmap_row (wrapping at 32)
-    LDY hmap_row
-    INY
-    TYA
-    AND #$1F
-    STA hmap_row
-
-    ; z_cam += 64 ($0040 = 0.25 units in 8.8)
-    LDA z_cam_lo
-    CLC
-    ADC #$40
-    STA z_cam_lo
-    LDA z_cam_hi
-    ADC #0
-    STA z_cam_hi
-
-    INC proj_row
-    LDA proj_row
-    CMP n_rows
-    BCS @proj_done
-    JMP @row_loop
+@far_go:
+    JSR do_row_body
     ; --- V-chain drawing ---
     ; After all rows are projected and h-chains drawn inline, v-chains
     ; are drawn column by column. For each column, grid_ptr walks down
     ; v_buf by ROW_STRIDE, reading v_color from +2.
 
-@proj_done:
     ; --- Post-projection: draw v-chains column by column ---
-    LDA #0
-    STA proj_col
+    DEC n_rows                ; n_rows → seg count (not needed after this)
+    DEC n_cols                ; pre-decrement for loop counter
 @v_col_loop:
-    ; grid_ptr = v_buf + proj_col * 3
-    LDA proj_col
-    ASL A
-    CLC
-    ADC proj_col              ; A = col * 3
-    CLC
-    ADC #<v_buf
+    ; grid_ptr = n_cols * 3 (v_buf offset; page-aligned so no base add)
+    LDA n_cols
+    ASL A                     ; C=0 (n_cols ≤ 8, bit 7 clear)
+    ADC n_cols                ; A = col * 3
     STA grid_ptr
-    LDA #>v_buf
-    ADC #0
-    STA grid_ptr+1
+    TAX
 
-    LDA n_rows
-    SEC
-    SBC #1
-    STA seg_count
-    JSR draw_v_col
-
-    INC proj_col
-    LDA proj_col
-    CMP n_vtx
-    BCC @v_col_loop
-    RTS
-
-; =====================================================================
-; draw_v_col — Draw one vertical chain from grid_ptr (ROW_STRIDE stride)
-; =====================================================================
-; Input:  grid_ptr = column start (row 0), seg_count = segments (n_rows - 1)
-;
-; Reads the first vertex's sx/sy and calls init_base. Then for each
-; segment, advances grid_ptr by ROW_STRIDE, reads endpoint sx (+0),
-; sy (+1), and v_color (+2). Black segments reposition via init_base.
-
-draw_v_col:
-    LDY #0
-    LDA (grid_ptr),Y          ; sx
+    ; --- Inline v-chain: first vertex init ---
+    LDA v_buf,X               ; sx
     STA raster_x0
-    LDY #1
-    LDA (grid_ptr),Y          ; sy
+    LDA v_buf+1,X             ; sy
     STA raster_y0
     JSR init_base             ; Y = sub_y
+
+    LDA n_rows
+    STA seg_count
 @v_seg:
     STY saved_y
-    ; Advance grid_ptr by ROW_STRIDE
+    ; Advance grid_ptr by ROW_STRIDE (no page cross — single page buffer)
     LDA grid_ptr
     CLC
     ADC #ROW_STRIDE
     STA grid_ptr
-    BCC :+
-    INC grid_ptr+1
-:   LDY #0
-    LDA (grid_ptr),Y          ; endpoint sx
+    TAX
+    LDA v_buf,X               ; endpoint sx
     STA raster_x1
-    INY
-    LDA (grid_ptr),Y          ; endpoint sy
+    LDA v_buf+1,X             ; endpoint sy
     STA raster_y1
-    INY
-    LDA (grid_ptr),Y          ; v_color
+    LDA v_buf+2,X             ; v_color
     BEQ @v_skip_black
     LDY saved_y
     JSR draw_line
-    JMP @v_drawn
+    LDA raster_x1
+    STA raster_x0
+    LDA raster_y1
+    STA raster_y0
+    DEC seg_count
+    BNE @v_seg
+    DEC n_cols
+    BPL @v_col_loop
+    RTS
 @v_skip_black:
     LDA raster_x1
     STA raster_x0
@@ -550,14 +327,8 @@ draw_v_col:
     JSR init_base
     DEC seg_count
     BNE @v_seg
-    RTS
-@v_drawn:
-    LDA raster_x1
-    STA raster_x0
-    LDA raster_y1
-    STA raster_y0
-    DEC seg_count
-    BNE @v_seg
+    DEC n_cols
+    BPL @v_col_loop
     RTS
 
 
@@ -712,11 +483,11 @@ compute_interp_offsets:
     RTS
 
 ; =====================================================================
-; z_interp_vertex — Z-interpolate height in offset_tmp
+; z_interp_vertex — Z-interpolate height in vtx_cell
 ; =====================================================================
-; Interpolates offset_tmp's height (bits 3–7) between outer row (hmap_ptr)
+; Interpolates vtx_cell's height (bits 3–7) between outer row (hmap_ptr)
 ; and inner row (interp_z_ptr) using z_interp_offset.
-; Preserves colour bits (0–2) in offset_tmp.
+; Preserves colour bits (0–2) in vtx_cell.
 
 z_interp_vertex:
     STX lerp_t                ; X = z_interp_offset from caller
@@ -726,7 +497,7 @@ z_interp_vertex:
     LSR A
     LSR A                     ; h_inner_z
     STA h_to
-    LDA offset_tmp
+    LDA vtx_cell
     LSR A
     LSR A
     LSR A                     ; h_outer_z
@@ -736,7 +507,7 @@ z_interp_vertex:
 ; interp_height — Interpolate height between outer and inner cell
 ; =====================================================================
 ; Input:  Y = inner heightmap column, A = X interpolation offset (0..63)
-; Effect: Recomputes offset_tmp+1 (sy) at interpolated height
+; Effect: Recomputes vtx_cell+1 (sy) at interpolated height
 ; Handles corner-case bilinear interpolation (X + Z)
 
 interp_height:
@@ -765,7 +536,7 @@ interp_height:
     ; X-interpolate between h_outer and h_inner
     PLA                       ; recover X offset
     STA lerp_t
-    LDA offset_tmp
+    LDA vtx_cell
     LSR A
     LSR A
     LSR A                     ; h_outer (already Z-interpolated)
@@ -779,39 +550,39 @@ interp_height:
     ASL A                     ; h_outer * 8
 @ih_store:
     JSR height_to_sy          ; A = sy
-    STA offset_tmp+1
+    STA vtx_cell+1
     RTS
 
 ; =====================================================================
 ; lookup_and_color — Read heightmap cell, extract h*8/color, Z-interp
 ; =====================================================================
 ; Input:  hmap_col, hmap_ptr, z_interp_offset
-; Output: A = h*8 (0..248), offset_tmp = cell byte or z-interp h*8,
-;         saved_color = color LUT index
+; Output: A = h*8 (0..248), vtx_cell = cell byte or z-interp h*8,
+;         v_color = color LUT index
 ; Clobbers: X, Y
 
 lookup_and_color:
     LDY hmap_col
     LDA (hmap_ptr),Y
-    STA offset_tmp            ; full cell byte for z_interp_vertex
+    STA vtx_cell            ; full cell byte for z_interp_vertex
     ASL A
     AND #$0E
     TAX                       ; X = color LUT index (land)
-    LDA offset_tmp
+    LDA vtx_cell
     AND #$F8                  ; A = h*8
     BNE @lc_land
     INX                       ; sea flag (odd LUT index)
 @lc_land:
     PHA                       ; save h*8
     LDA v_color_lut,X
-    STA saved_color           ; pre-resolved v_color
+    STA v_color           ; pre-resolved v_color
     LDA h_color_lut,X
-    STA saved_h_color         ; pre-resolved h_color
+    STA h_color         ; pre-resolved h_color
     PLA                       ; restore h*8
     LDX z_interp_offset
     BEQ @lc_done
     JSR z_interp_vertex       ; A = z-interp h*8
-    STA offset_tmp            ; update for edge interp
+    STA vtx_cell            ; update for edge interp
 @lc_done:
     RTS
 
@@ -820,12 +591,12 @@ lookup_and_color:
 ; do_vertex_tail   — Store v_buf + h-chain + advance (entry point 2)
 ; =====================================================================
 ; do_middle_vertex: no input needed (reads hmap state)
-; do_vertex_tail:   A = sx, offset_tmp+1 = sy, saved_color set
+; do_vertex_tail:   A = sx, vtx_cell+1 = sy, v_color set
 
 do_middle_vertex:
     JSR lookup_and_color      ; A = h*8
     JSR height_to_sy          ; A = sy
-    STA offset_tmp+1
+    STA vtx_cell+1
     LDA run_hi                ; A = sx
     ; fall through to do_vertex_tail
 
@@ -836,16 +607,16 @@ do_vertex_tail:
     STA raster_x1
     STA v_buf,Y               ; sx at offset 0
     INY
-    LDA offset_tmp+1          ; sy
+    LDA vtx_cell+1          ; sy
     STA raster_y1
     STA v_buf,Y               ; sy at offset 1
     INY
-    LDA saved_color           ; v_color (pre-resolved)
+    LDA v_color           ; v_color (pre-resolved)
     STA v_buf,Y               ; v_color at offset 2
     INY
     STY v_off                 ; advance past all 3 bytes
 
-    LDA offset_tmp+1          ; reload sy
+    LDA vtx_cell+1          ; reload sy
     CMP grid_min_sy
     BCS @vt_no_dirty
     STA grid_min_sy
@@ -870,7 +641,7 @@ do_vertex_tail:
     STY h_chain_sub_y
 
     ; --- Update h-chain color for next vertex ---
-    LDA saved_h_color
+    LDA h_color
     STA pending_h_color       ; for next vertex's h-chain draw
 
     ; --- Column advance ---
@@ -888,5 +659,156 @@ do_vertex_tail:
     ADC step_hi
     STA run_hi
 
+    RTS
+
+; =====================================================================
+; do_row_body — Process one vertex row (step, edges, vertices, advance)
+; =====================================================================
+; Input:  recip_val, z_interp_offset set by caller
+; Effect: Projects all vertices for this row, draws h-chains inline,
+;         rotates hmap pointers, advances z_cam and proj_row.
+;         Falls through to compute_next_hmap.
+
+do_row_body:
+    ; --- Step = recip * 64 (16-bit), the screen-x increment per cell ---
+    ; recip << 6 = (recip:$00) >> 2
+    LDA recip_val
+    LSR A
+    STA step_hi
+    LDA #0
+    ROR A
+    LSR step_hi
+    ROR A
+    STA step_lo
+
+    ; --- edge_offset = floor(recip * 7/8) = recip - ceil(recip/8) ---
+    LDA recip_val
+    CLC
+    ADC #7
+    LSR A
+    LSR A
+    LSR A                     ; ceil(recip/8)
+    STA scratch_0
+    LDA recip_val
+    SEC
+    SBC scratch_0
+    STA edge_offset
+
+    ; --- sx_running = $4000 - run_factor * recip [- recip*256] ---
+    LDA recip_val
+    STA math_b
+    LDA run_factor
+    JSR umul8x8
+    LDA #0
+    SEC
+    SBC math_res_lo
+    STA run_lo
+    LDA #$40
+    SBC math_res_hi
+    LDX run_sub_recip
+    BEQ @no_sub_recip
+    SEC
+    SBC recip_val
+@no_sub_recip:
+    STA run_hi
+
+    ; Reset heightmap column for this row
+    LDA base_x
+    STA hmap_col
+
+    ; --- Init v_off for this row ---
+    LDX proj_row
+    LDA v_row_offset_lo-1,X
+    STA v_off
+
+    ; --- Pre-clear for first-vertex h-chain ---
+    LDA #0
+    STA pending_h_color
+
+    ; --- Left edge vertex ---
+    JSR lookup_and_color      ; A = h*8, vtx_cell set for interp
+    LDY hmap_col
+    INY
+    TYA
+    AND #$1F
+    TAY                       ; Y = inner column
+    LDA interp_offset_left
+    JSR interp_height         ; sets vtx_cell+1
+    LDA #64
+    SEC
+    SBC edge_offset           ; A = sx
+    JSR do_vertex_tail
+
+    ; --- Middle vertices ---
+    LDA n_cols
+    SEC
+    SBC #2
+    STA proj_col
+@mid_loop:
+    JSR do_middle_vertex
+    DEC proj_col
+    BNE @mid_loop
+
+    ; --- Right edge vertex ---
+    JSR lookup_and_color      ; A = h*8, vtx_cell set for interp
+    LDY hmap_col
+    DEY
+    TYA
+    AND #$1F
+    TAY                       ; Y = inner column
+    LDA interp_offset_right
+    JSR interp_height         ; sets vtx_cell+1
+    LDA edge_offset
+    CLC
+    ADC #64                   ; A = sx
+    JSR do_vertex_tail
+
+    ; --- Row tail: rotate hmap, advance z_cam/proj_row ---
+    ; Rotate hmap pointers: prev = current, current = next
+    LDA hmap_ptr
+    STA prev_hmap_ptr
+    LDA hmap_ptr+1
+    STA prev_hmap_ptr+1
+    LDA next_hmap_ptr
+    STA hmap_ptr
+    LDA next_hmap_ptr+1
+    STA hmap_ptr+1
+    ; Advance hmap_row (wrapping at 32)
+    LDY hmap_row
+    INY
+    TYA
+    AND #$1F
+    STA hmap_row
+
+    ; z_cam += 64 ($0040 = 0.25 units in 8.8)
+    LDA z_cam_lo
+    CLC
+    ADC #$40
+    STA z_cam_lo
+    LDA z_cam_hi
+    ADC #0
+    STA z_cam_hi
+
+    INC proj_row
+    ; fall through to compute_next_hmap
+
+; =====================================================================
+; compute_next_hmap — Compute next_hmap_ptr = hmap_ptr + 32 (with wrap)
+; =====================================================================
+
+compute_next_hmap:
+    CLC
+    LDA hmap_ptr
+    ADC #32
+    STA next_hmap_ptr
+    LDA hmap_ptr+1
+    ADC #0
+    LDY hmap_row
+    CPY #31
+    BNE @no_wrap
+    SEC
+    SBC #4                    ; subtract $0400 (1024 bytes = 32 rows)
+@no_wrap:
+    STA next_hmap_ptr+1
     RTS
 

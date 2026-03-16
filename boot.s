@@ -83,9 +83,9 @@ boot_entry:
     INX
     BNE @zp
 
-    ; ── Zero $0200-$05FF (4 pages: page 2 + BSS) ──
+    ; ── Zero $0200-$03FF (2 pages: BSS) ──
     ; A=0, X=0, Y=0 at this point (from loops above)
-    LDX #4
+    LDX #2
 @bss:
     STA $0200,Y             ; SMC: high byte patched by INC below
     INY
@@ -94,7 +94,7 @@ boot_entry:
     DEX
     BNE @bss
 
-    JMP $0600               ; enter game
+    JMP $0400               ; enter game
 
 ; ── CRTC register table (indexed R0..R13) ──
 ; MODE 2 with R1=64 (128 pixels), R6=20 (160 scanlines), centered

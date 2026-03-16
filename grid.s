@@ -383,191 +383,54 @@ draw_grid:
     LDA v_row_offset_lo,X
     STA v_off
 
-    ; --- Column loop preamble ---
-    ; Sets proj_col as a countdown from n_vtx, then jumps into the
-    ; inner loop. The uncommon @sea_cell path is placed before the
-    ; hot loop so branch targets stay in range.
-    ; --- Column loop: n_vtx vertices ---
-    LDA n_vtx
-    STA proj_col
-    JMP @col_loop
+    ; --- Pre-clear for first-vertex h-chain ---
+    ; With pending_h_color = 0, the first vertex takes the existing
+    ; black-segment path (skip draw, call init_base), eliminating
+    ; the separate first-vertex check from the hot loop.
+    LDA #0
+    STA pending_h_color
 
-    ; --- Uncommon paths (placed before hot loop for branch reach) ---
-@sea_cell:
-    INC saved_color           ; set sea flag (odd LUT index)
-    LDX z_interp_offset
-    BNE @z_interp_go
-    JMP @do_height_mul        ; A=0 → flat sea
-@z_interp_go:
-    JSR z_interp_vertex       ; A = pre-scaled h*8
-    BEQ @z_flat               ; zero → clear stale height, use flat sy
-    ; Save Z-interpolated height in offset_tmp for edge interp corners
-    STA offset_tmp            ; h*8
-    BNE @do_height_mul        ; always
-@z_flat:
-    STA offset_tmp            ; A=0 — clear stale height for edge interp
-    JMP @do_height_mul        ; A=0 → z-interp gave flat
-
-    ; --- Height lookup & colour ---
-    ; Reads the heightmap cell at hmap_col. The cell byte packs height
-    ; in bits 7–3 and colour in bits 2–0. The colour bits are shifted
-    ; into a LUT index (saved_color). Height 0 means sea —
-    ; branches to @sea_cell which sets the sea flag (odd LUT index).
-
-@col_loop:
-    ; --- Height lookup, color precompute, and sy adjustment ---
-    LDY hmap_col
-    LDA (hmap_ptr),Y
-    STA offset_tmp            ; save full byte for z_interp_vertex
-    ; Precompute color LUT index: (offset_tmp << 1) & $0E | sea_flag
-    ASL A
-    AND #$0E
-    STA saved_color           ; color base index (even=land, odd=sea)
-    ; Extract height
-    LDA offset_tmp
-    AND #$F8                  ; h*8 directly
-    BEQ @sea_cell             ; flat → set sea flag, check z_interp
-    ; Land cell, height > 0
-    LDX z_interp_offset
-    BNE @z_interp_go          ; boundary row → interpolate
-    ; (A already = h*8, fall through)
-    ; Fall through to @do_height_mul
-    ; --- Height-to-pixel multiplication ---
-    ; Flat/sea cells enter with A=0 and get base sy naturally.
-
-@do_height_mul:
-    JSR height_to_sy          ; A = sy, clamped ≥ 0
-
-@sy_store:
-    STA offset_tmp+1          ; save adjusted sy (borrow $A4 briefly)
-
-    ; --- sx computation & edge clamping ---
-    ; For middle vertices, sx is just run_hi (the running accumulator).
-    ; The first and last vertices in the row are clamped to
-    ; edge_offset boundaries and get height interpolation via
-    ; interp_height — blending between the outer and inner heightmap
-    ; cells so the grid edge matches the exact world boundary.
-    ; --- sx: only first/last vertices need clamping ---
-    LDX proj_col
-    LDA run_hi
-    CPX n_vtx                 ; first vertex?
-    BEQ @do_left_clamp        ; always clamp to left boundary
-    DEX                       ; proj_col - 1
-    BNE @sx_done              ; middle vertices: no clamping
-    ; Fall through: right edge (proj_col was 1)
-    ; Interpolate height at right screen edge
-    LDA hmap_col
-    SEC
-    SBC #1
-    AND #$1F
-    TAY                       ; Y = inner column
-    LDA interp_offset_r
-    JSR interp_height
-    LDA edge_offset
-    CLC
-    ADC #64                   ; clamp_right = 64 + offset
-    BNE @sx_done              ; always (>= 64)
-@do_left_clamp:
-    ; Interpolate height at left screen edge
+    ; --- Left edge vertex ---
+    JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
+    JSR height_to_sy          ; A = sy
+    STA offset_tmp+1
     LDA hmap_col
     CLC
     ADC #1
     AND #$1F
     TAY                       ; Y = inner column
     LDA interp_offset_l
-    JSR interp_height
+    JSR interp_height         ; may update offset_tmp+1
     LDA #64
     SEC
-    SBC edge_offset           ; clamp_left = 64 - offset
-@sx_done:
-    ; --- v_buf store & colour output ---
-    ; Writes sx (+0) and sy (+1) to the current v_buf slot via v_off.
-    ; v_color is stored at +2. h_color goes to pending_h_color for
-    ; the next vertex's h-chain draw.
-    ; A = final sx for this vertex
-    STA raster_x1             ; cache for h-chain endpoint
-    ; Store (sx, sy) to v_buf
-    LDY v_off
-    STA v_buf,Y               ; sx at offset 0
-    LDA offset_tmp+1          ; final sy for this vertex
-    STA raster_y1             ; cache for h-chain endpoint
-    CMP grid_min_sy
-    BCS @no_dirty_upd
-    STA grid_min_sy
-@no_dirty_upd:
-    INY
-    STA v_buf,Y               ; sy at offset 1
-    STY v_off                 ; save (h-chain clobbers Y)
+    SBC edge_offset           ; A = sx
+    JSR do_vertex_tail
 
-    ; --- Inline h-chain drawing ---
-    ; First vertex: init raster state. Subsequent: draw from previous
-    ; vertex using pending_h_color. Raster state (base, sub_y) is
-    ; preserved between columns — no save/restore needed.
-    LDA proj_col
-    CMP n_vtx
-    BNE @not_first_h
-    ; First vertex: init raster at this position
-    LDA raster_x1
-    STA raster_x0
-    LDA raster_y1
-    STA raster_y0
-    JSR init_base
-    JMP @h_chain_done
-@not_first_h:
-    LDA pending_h_color
-    BEQ @h_black
-    LDY h_chain_sub_y
-    JSR draw_line
-    JMP @h_drawn
-@h_black:
-    LDA raster_x1
-    STA raster_x0
-    LDA raster_y1
-    STA raster_y0
-    JSR init_base
-    JMP @h_chain_done
-@h_drawn:
-    LDA raster_x1
-    STA raster_x0
-    LDA raster_y1
-    STA raster_y0
-@h_chain_done:
-    STY h_chain_sub_y
-
-    ; --- Edge colours from precomputed index ---
-    LDX saved_color
-    LDA v_color_lut,X        ; v_color for this vertex
-    LDY v_off                 ; restore (= off+1)
-    INY
-    STA v_buf,Y               ; v_color at off+2
-    INY                       ; off+3 = next vertex
-    STY v_off                 ; advance done
-    LDA h_color_lut,X
-    STA pending_h_color       ; for next vertex's h-chain draw
-
-    ; --- Column loop advance ---
-    ; Increments hmap_col (wrapping at 31) and adds step to
-    ; sx_running. Decrements proj_col and loops until done.
-
-    ; Advance heightmap column
-    LDA hmap_col
-    CLC
-    ADC #1
-    AND #$1F
-    STA hmap_col
-
-    ; sx_running += step
-    LDA run_lo
-    CLC
-    ADC step_lo
-    STA run_lo
-    LDA run_hi
-    ADC step_hi
-    STA run_hi
-
+    ; --- Middle vertices ---
+    LDA n_vtx
+    SEC
+    SBC #2
+    STA proj_col
+@mid_loop:
+    JSR do_middle_vertex
     DEC proj_col
-    BEQ @col_done
-    JMP @col_loop
+    BNE @mid_loop
+
+    ; --- Right edge vertex ---
+    JSR lookup_and_color      ; A = h*8, offset_tmp set for interp
+    JSR height_to_sy          ; A = sy
+    STA offset_tmp+1
+    LDA hmap_col
+    SEC
+    SBC #1
+    AND #$1F
+    TAY                       ; Y = inner column
+    LDA interp_offset_r
+    JSR interp_height         ; may update offset_tmp+1
+    LDA edge_offset
+    CLC
+    ADC #64                   ; A = sx
+    JSR do_vertex_tail
     ; --- Row loop tail ---
     ; After all columns: saves hmap_ptr as prev_hmap_ptr (needed if
     ; the next row is the far boundary row for Z interpolation).
@@ -911,5 +774,112 @@ interp_height:
     JSR height_to_sy          ; A = sy
     STA offset_tmp+1
 @ih_done:
+    RTS
+
+; =====================================================================
+; lookup_and_color — Read heightmap cell, extract h*8/color, Z-interp
+; =====================================================================
+; Input:  hmap_col, hmap_ptr, z_interp_offset
+; Output: A = h*8 (0..248), offset_tmp = cell byte or z-interp h*8,
+;         saved_color = color LUT index
+; Clobbers: X, Y
+
+lookup_and_color:
+    LDY hmap_col
+    LDA (hmap_ptr),Y
+    STA offset_tmp            ; full cell byte for z_interp_vertex
+    ASL A
+    AND #$0E
+    STA saved_color           ; color base index (even=land, odd=sea)
+    LDA offset_tmp
+    AND #$F8                  ; h*8 directly
+    BEQ @lc_sea
+    LDX z_interp_offset
+    BEQ @lc_done
+    BNE @lc_zinterp           ; always
+@lc_sea:
+    INC saved_color           ; set sea flag (odd LUT index)
+    LDX z_interp_offset
+    BEQ @lc_done
+@lc_zinterp:
+    JSR z_interp_vertex       ; A = z-interp h*8
+    STA offset_tmp            ; update for edge interp
+@lc_done:
+    RTS
+
+; =====================================================================
+; do_middle_vertex — Lookup + project middle vertex (entry point 1)
+; do_vertex_tail   — Store v_buf + h-chain + advance (entry point 2)
+; =====================================================================
+; do_middle_vertex: no input needed (reads hmap state)
+; do_vertex_tail:   A = sx, offset_tmp+1 = sy, saved_color set
+
+do_middle_vertex:
+    JSR lookup_and_color      ; A = h*8
+    JSR height_to_sy          ; A = sy
+    STA offset_tmp+1
+    LDA run_hi                ; A = sx
+    ; fall through to do_vertex_tail
+
+do_vertex_tail:
+    ; --- v_buf store ---
+    ; A = sx for this vertex
+    STA raster_x1
+    LDY v_off
+    STA v_buf,Y               ; sx at offset 0
+    LDA offset_tmp+1          ; sy
+    STA raster_y1
+    CMP grid_min_sy
+    BCS @vt_no_dirty
+    STA grid_min_sy
+@vt_no_dirty:
+    INY
+    STA v_buf,Y               ; sy at offset 1
+    STY v_off
+
+    ; --- Inline h-chain drawing ---
+    ; pending_h_color = 0 for first vertex (pre-cleared) or black
+    ; segments: skip draw, re-init base. Non-zero: draw h-chain.
+    LDA pending_h_color
+    BEQ @vt_h_skip
+    LDY h_chain_sub_y
+    JSR draw_line
+@vt_h_skip:
+    LDA raster_x1
+    STA raster_x0
+    LDA raster_y1
+    STA raster_y0
+    LDA pending_h_color
+    BNE @vt_h_done
+    JSR init_base
+@vt_h_done:
+    STY h_chain_sub_y
+
+    ; --- Edge colours from precomputed index ---
+    LDX saved_color
+    LDA v_color_lut,X        ; v_color for this vertex
+    LDY v_off                 ; restore (= off+1)
+    INY
+    STA v_buf,Y               ; v_color at off+2
+    INY                       ; off+3 = next vertex
+    STY v_off                 ; advance done
+    LDA h_color_lut,X
+    STA pending_h_color       ; for next vertex's h-chain draw
+
+    ; --- Column advance ---
+    LDA hmap_col
+    CLC
+    ADC #1
+    AND #$1F
+    STA hmap_col
+
+    LDA run_lo
+    CLC
+    ADC step_lo
+    STA run_lo
+    LDA run_hi
+    ADC step_hi
+    STA run_hi
+
     RTS
 

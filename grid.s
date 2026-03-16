@@ -306,7 +306,7 @@ draw_grid:
     STA raster_x1
     LDA v_buf+1,X             ; endpoint sy
     STA raster_y1
-    LDA v_buf+2,X             ; v_color
+    LDA v_buf+2-ROW_STRIDE,X  ; v_color (start vertex, not endpoint)
     BEQ @v_skip_black
     LDY saved_y
     JSR draw_line

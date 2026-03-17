@@ -112,6 +112,7 @@ static int profile_mode = 0;
  */
 #define MAX_CALL_DEPTH 256
 static uint16_t call_stack[MAX_CALL_DEPTH];
+static uint16_t return_stack[MAX_CALL_DEPTH]; /* expected return address per depth */
 static int call_depth = 0;
 static uint64_t fn_self_cycles[PROFILE_SIZE];
 static uint64_t fn_incl_cycles[PROFILE_SIZE];
@@ -785,10 +786,17 @@ int main(int argc, char *argv[])
                     }
 
                     /* Stack manipulation (after attribution) */
-                    if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH)
+                    if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH) {
+                        return_stack[call_depth] = pc + 3; /* expected return addr */
                         call_stack[call_depth++] = jsr_target;
-                    else if (opcode == 0x60 && call_depth > 1)
-                        call_depth--;
+                    } else if (opcode == 0x60 && call_depth > 1) {
+                        /* Only pop if returning to the expected address.
+                         * PHA/PHA/RTS dispatch (e.g. draw_line) jumps elsewhere;
+                         * keep the caller on the shadow stack in that case. */
+                        uint16_t new_pc = w65c02s_reg_get_pc(cpu);
+                        if (new_pc == return_stack[call_depth - 1])
+                            call_depth--;
+                    }
 
                     /* Line statistics */
                     if (line_stats_mode && draw_line_addr && pc == draw_line_addr) {
@@ -993,10 +1001,14 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH)
+                if (opcode == 0x20 && call_depth < MAX_CALL_DEPTH) {
+                    return_stack[call_depth] = pc + 3;
                     call_stack[call_depth++] = jsr_target;
-                else if (opcode == 0x60 && call_depth > 1)
-                    call_depth--;
+                } else if (opcode == 0x60 && call_depth > 1) {
+                    uint16_t new_pc = w65c02s_reg_get_pc(cpu);
+                    if (new_pc == return_stack[call_depth - 1])
+                        call_depth--;
+                }
             }
             profile_frame_count++;
         } else {

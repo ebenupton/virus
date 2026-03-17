@@ -225,3 +225,74 @@ clr1_loop:
 clr1_bne:
     BNE clr1_loop
     RTS
+
+; =====================================================================
+; clear_ship — Clear full stripes for ship region above grid dirty line
+; =====================================================================
+; For each stripe the ship occupied last frame, if that stripe is above
+; the grid dirty line (and thus not cleared by clear_screen), zero the
+; entire 512-byte char row.  Uses ZP_SHARED+1..+5 as scratch.
+
+cs_ptr   = ZP_SHARED + 1      ; 2 bytes — stripe base pointer
+cs_cur   = ZP_SHARED + 3      ; current stripe index
+cs_grid  = ZP_SHARED + 4      ; grid dirty stripe (stripes >= this already cleared)
+cs_bot   = ZP_SHARED + 5      ; ship bottom stripe (inclusive)
+
+clear_ship:
+    LDX back_buf_idx
+    LDA ship_top_buf0,X
+    CMP #20
+    BCS @done                 ; no ship drawn last frame
+
+    STA cs_cur
+    ; Grid dirty stripe = dirty_top >> 3
+    LDA dirty_top_buf0,X
+    LSR A
+    LSR A
+    LSR A
+    STA cs_grid
+    ; Save bot, reset tracking to "no ship"
+    LDA ship_bot_buf0,X
+    STA cs_bot
+    LDA #20
+    STA ship_top_buf0,X
+    STA ship_bot_buf0,X
+
+@loop:
+    LDA cs_cur
+    CMP cs_grid
+    BCS @skip                 ; >= grid dirty → already cleared by main pass
+
+    ; Stripe base + $D8: 20 pixels at screen centre (x=54..73)
+    ; byte_cols 27-36 = offsets $D8-$127 within stripe
+    ASL A                     ; stripe * 2
+    CLC
+    ADC raster_page
+    STA cs_ptr+1
+    LDA #$D8
+    STA cs_ptr
+
+    ; Zero 40 bytes at offsets $D8-$FF (byte_cols 27-31)
+    LDA #0
+    LDY #39
+:   STA (cs_ptr),Y
+    DEY
+    BPL :-
+
+    ; Zero 40 bytes at offsets $100-$127 (byte_cols 32-36)
+    INC cs_ptr+1
+    LDY #0
+    STY cs_ptr                ; lo = $00 (start of odd page)
+    LDY #39
+:   STA (cs_ptr),Y
+    DEY
+    BPL :-
+
+@skip:
+    INC cs_cur
+    LDA cs_cur
+    CMP cs_bot
+    BCC @loop
+    BEQ @loop                 ; inclusive
+@done:
+    RTS

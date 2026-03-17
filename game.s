@@ -119,6 +119,12 @@ entry:
     LDA #160
     STA dirty_top_buf0
     STA dirty_top_buf1
+    ; No ship drawn yet
+    LDA #20
+    STA ship_top_buf0
+    STA ship_top_buf1
+    STA ship_bot_buf0
+    STA ship_bot_buf1
 
     ; Initialize rotation angle and orientation
     LDA #0
@@ -159,7 +165,7 @@ main_loop:
     JSR update_camera
     JSR update_physics
     JSR clear_screen
-    JSR draw_map              ; temporary: redraw map every frame
+    JSR clear_ship
     JSR draw_grid
 
     ; Default bbox: nothing drawn by object (overwritten if draw_object runs)
@@ -181,14 +187,22 @@ main_loop:
     JSR draw_object
 @skip_ship:
 
-    ; Combine grid + object dirty tops → save for this buffer's next clear
+    ; Grid-only dirty top for this buffer
     LDA grid_min_sy
-    CMP obj_bb_min_sy
-    BCC @use_grid
-    LDA obj_bb_min_sy
-@use_grid:
     LDX back_buf_idx
     STA dirty_top_buf0,X
+
+    ; Ship stripe range for this buffer's clear_ship
+    LDA obj_bb_min_sy         ; 0-159 or 160 (no ship)
+    LSR A
+    LSR A
+    LSR A                     ; stripe 0-19 or 20 (none)
+    STA ship_top_buf0,X
+    LDA obj_bb_max_sy
+    LSR A
+    LSR A
+    LSR A
+    STA ship_bot_buf0,X
 
     JSR draw_status
     JSR wait_vsync
@@ -317,17 +331,13 @@ update_physics:
     CPX #9
     BCC @pos_loop
 
-    ; 5. Ground clamp: clamp y to zero (TODO: restore terrain_y clamping)
+    ; 5. Ground clamp: clamp y to zero (position only, keep velocity)
     LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
-    BMI @do_clamp                          ; negative → below ground
-    BNE @above_ground                      ; hi > 0 → above
-    LDA obj_world_pos+OBJ_WORLD_SHIP+2    ; y_lo
-    BNE @above_ground
-@do_clamp:
+    BPL @above_ground                      ; >= 0 → above ground
     LDA #0
     STA obj_world_pos+OBJ_WORLD_SHIP+2
     STA obj_world_pos+OBJ_WORLD_SHIP+3
-    JSR zero_y_vel
+    STA pos_y_frac
 @above_ground:
 
     ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y

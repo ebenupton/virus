@@ -811,4 +811,3 @@ compute_next_hmap:
 @no_wrap:
     STA next_hmap_ptr+1
     RTS
-

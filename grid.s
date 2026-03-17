@@ -80,23 +80,7 @@ v_row_offset_lo:
     .byte <(0*ROW_STRIDE), <(1*ROW_STRIDE), <(2*ROW_STRIDE)
     .byte <(3*ROW_STRIDE), <(4*ROW_STRIDE), <(5*ROW_STRIDE)
     .byte <(6*ROW_STRIDE)
-; Edge colour LUTs: three 8-entry tables, indexed by color bits 0-2
-; Selected by vertex height: 0 = sea, 31 = plateau, other = land
-;           pattern: 000  001  010  011  100  101  110  111
-h_color_sea:
-    .byte          $14, $14, $10, $10, $14, $14, $10, $10
-v_color_sea:                                                   ; Cy   Cy   B    B    Cy   Cy   B    B
-    .byte          $14, $14, $14, $14, $10, $10, $10, $10      ; Cy   Cy   Cy   Cy   B    B    B    B
-
-h_color_plat:
-    .byte          $05, $15, $04, $00, $15, $15, $04, $00
-v_color_plat:                                                  ; Y    W    G    Bk   W    W    G    Bk
-    .byte          $05, $15, $15, $15, $04, $00, $04, $00      ; Y    W    W    W    G    Bk   G    Bk
-
-h_color_land:                                                  ; bit1=0→Y, bit1=1→G
-    .byte          $05, $05, $04, $04, $05, $05, $04, $04      ; Y    Y    G    G    Y    Y    G    G
-v_color_land:                                                  ; bit2=0→Y, bit2=1→G
-    .byte          $05, $05, $05, $05, $04, $04, $04, $04      ; Y    Y    Y    Y    G    G    G    G
+.include "edge_color.inc"
 
 ; =====================================================================
 ; draw_grid — Project grid + draw h-chains inline + draw v-chains

@@ -419,45 +419,40 @@ lut_lookup:
 ; =====================================================================
 ; lerp_height — Interpolate from h_a towards h_b by offset
 ; =====================================================================
-; Input:  A = h_a (0..31), h_to = h_b (0..31), lerp_t = offset (0..63)
-; Output: A = pre-scaled interpolated height (0..248)
+; Input:  A = h_a×8 (0..248), h_to = h_b×8 (0..248), lerp_t = offset (0..63)
+; Output: A = interpolated height h×8 (0..248)
 ; Clobbers: h_from, h_to, X
 
 lerp_height:
     CMP h_to
-    BEQ @lh_same              ; same → return h_a × 8
-    STA h_from                ; save h_a
+    BEQ @lh_done              ; same → A is already h×8
+    STA h_from                ; save h_a (h×8)
     BCC @lh_b_higher
-    ; h_a > h_b: result = h_a×8 − delta_scaled
+    ; h_a > h_b: result = h_a_h8 − delta_scaled
     SEC
-    SBC h_to                  ; diff (1..4)
+    SBC h_to                  ; diff_h8
+    LSR A
+    LSR A
+    LSR A                     ; diff (1..31)
     JSR lut_lookup            ; A = pre-scaled delta
     STA h_to
-    LDA h_from
-    ASL A
-    ASL A
-    ASL A                     ; h_a × 8
+    LDA h_from                ; h_a already h×8
     SEC
     SBC h_to
     RTS
 @lh_b_higher:
-    ; h_b > h_a: result = h_a×8 + delta_scaled
+    ; h_b > h_a: result = h_a_h8 + delta_scaled
     LDA h_to
     SEC
-    SBC h_from                ; diff (1..4)
+    SBC h_from                ; diff_h8
+    LSR A
+    LSR A
+    LSR A                     ; diff (1..31)
     JSR lut_lookup            ; A = pre-scaled delta
-    STA h_to
-    LDA h_from
-    ASL A
-    ASL A
-    ASL A                     ; h_a × 8
     CLC
-    ADC h_to
+    ADC h_from                ; h_a already h×8
     RTS
-@lh_same:
-    ASL A
-    ASL A
-    ASL A                     ; h_a × 8
+@lh_done:
     RTS
 
 ; =====================================================================
@@ -493,15 +488,11 @@ z_interp_vertex:
     STX lerp_t                ; X = z_interp_offset from caller
     LDY hmap_col
     LDA (interp_z_ptr),Y      ; inner row cell byte
-    LSR A
-    LSR A
-    LSR A                     ; h_inner_z
+    AND #$F8                  ; h_inner_z × 8
     STA h_to
     LDA vtx_cell
-    LSR A
-    LSR A
-    LSR A                     ; h_outer_z
-    JMP lerp_height            ; tail call — A = pre-scaled (0..248)
+    AND #$F8                  ; h_outer_z × 8
+    JMP lerp_height            ; tail call — A = h×8 (0..248)
 
 ; =====================================================================
 ; interp_height — Interpolate height between outer and inner cell
@@ -513,42 +504,29 @@ z_interp_vertex:
 interp_height:
     PHA                       ; push X offset to stack
     LDA (hmap_ptr),Y          ; inner cell byte at inner column
-    LSR A
-    LSR A
-    LSR A                     ; h_inner
+    AND #$F8                  ; h_inner × 8
     ; Z-interpolate h_inner if on boundary row (corner case)
     LDX z_interp_offset
     BEQ @ih_z_done
-    STA h_from                ; save h_inner_outer_row
+    STA h_from                ; save h_inner_outer_row (h×8)
     STX lerp_t                ; Z offset
     LDA (interp_z_ptr),Y      ; inner row at inner column
-    LSR A
-    LSR A
-    LSR A
+    AND #$F8                  ; h×8
     STA h_to
     LDA h_from
-    JSR lerp_height            ; A = pre-scaled Z-interpolated
-    LSR A
-    LSR A
-    LSR A                     ; → height units
+    JSR lerp_height            ; A = Z-interpolated h×8
+    AND #$F8                  ; normalize to multiple of 8
 @ih_z_done:
-    STA h_to                  ; h_inner (Z-interpolated if corner)
+    STA h_to                  ; h_inner h×8 (Z-interpolated if corner)
     ; X-interpolate between h_outer and h_inner
     PLA                       ; recover X offset
     STA lerp_t
     LDA vtx_cell
-    LSR A
-    LSR A
-    LSR A                     ; h_outer (already Z-interpolated)
+    AND #$F8                  ; h_outer × 8 (already Z-interpolated)
     CMP h_to
-    BEQ @ih_same              ; same height → use h_outer directly
-    JSR lerp_height           ; A = pre-scaled h*8 (0..248)
-    JMP @ih_store
-@ih_same:
-    ASL A
-    ASL A
-    ASL A                     ; h_outer * 8
-@ih_store:
+    BEQ @ih_done              ; same height → already h×8
+    JSR lerp_height           ; A = interpolated h×8 (0..248)
+@ih_done:
     JSR height_to_sy          ; A = sy
     STA vtx_cell+1
     RTS
@@ -610,17 +588,16 @@ do_vertex_tail:
     LDA vtx_cell+1          ; sy
     STA raster_y1
     STA v_buf,Y               ; sy at offset 1
+    ; --- dirty tracking while A = sy ---
+    CMP grid_min_sy
+    BCS @vt_no_dirty
+    STA grid_min_sy
+@vt_no_dirty:
     INY
     LDA v_color           ; v_color (pre-resolved)
     STA v_buf,Y               ; v_color at offset 2
     INY
     STY v_off                 ; advance past all 3 bytes
-
-    LDA vtx_cell+1          ; reload sy
-    CMP grid_min_sy
-    BCS @vt_no_dirty
-    STA grid_min_sy
-@vt_no_dirty:
 
     ; --- Inline h-chain drawing ---
     ; pending_h_color = 0 for first vertex (pre-cleared) or black

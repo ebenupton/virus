@@ -15,7 +15,8 @@ ZP_STATUS  = $50   ; 1 chunk  (internal scratch)
 ZP_OBJECT  = $58   ; 5 chunks (2 ext + 3 int)
 ZP_GRID    = $80   ; 7 chunks (1 ext + 6 int)
 ZP_CLIP    = $B8   ; 3 chunks (2 ext + 1 int)
-; Total: $D0 used. Free: $D0-$FF (48 bytes)
+ZP_PARTICLE = $D0  ; 1 chunk  (particle system)
+; Total: $D8 used. Free: $D8-$FF (40 bytes)
 
 ; ── Shared scratch ────────────────────────────────────────────────────
 nmos_tmp        = ZP_SHARED + 0     ; NMOS carry-preserving INC A scratch

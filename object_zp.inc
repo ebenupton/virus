@@ -14,10 +14,8 @@ obj_view_x          = ZP_OBJECT + 3    ; 2 bytes — view-space centre X (lo/hi)
 obj_view_y          = ZP_OBJECT + 5    ; 2 bytes — view-space centre Y (lo/hi)
 obj_view_z          = ZP_OBJECT + 7    ; 2 bytes — view-space centre Z (lo/hi)
 obj_roll_angle      = ZP_OBJECT + 9    ; X-axis pitch angle (0-255 = full circle)
-obj_bb_min_sx       = ZP_OBJECT + 10   ; bounding box min screen X
-obj_bb_max_sx       = ZP_OBJECT + 11   ; bounding box max screen X
-obj_bb_min_sy       = ZP_OBJECT + 12   ; bounding box min screen Y
-obj_bb_max_sy       = ZP_OBJECT + 13   ; bounding box max screen Y
+obj_bb_min_sy       = ZP_OBJECT + 10   ; bounding box min screen Y
+obj_bb_max_sy       = ZP_OBJECT + 11   ; bounding box max screen Y
 
 ; ── Constants ───────────────────────────────────────────────────────
 MAX_OBJ_VERTICES    = 24

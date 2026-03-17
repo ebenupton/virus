@@ -14,9 +14,10 @@ Pipeline:
 
 Byte format: [height:5][color:3]
   - Bits 3-7: height (0..31), 0 = sea level
-  - Bits 0-2: edge colour pattern, indexed into edge_color_lut
-    - Land patterns: 000=(Y,Y), 110=(G,G); plateau uses 001,010,011,100,101,111
-    - Sea patterns: 000=(Cy,Cy), 010=(B,Cy), 100=(Cy,B), 110=(B,B)
+  - Bits 0-2: edge colour pattern; separate LUTs for sea/plateau/land
+    - Land (h 1-30): bit1→h-edge (0=Y,1=G), bit2→v-edge (0=Y,1=G)
+    - Plateau (h 31): 001-111 encode outline/internal/outgoing edges
+    - Sea (h 0): bit1→h-edge (0=Cy,1=B), bit2→v-edge (0=Cy,1=B)
 
 Outputs:
   - map_data.inc    : ca65 .byte directives (32×32 = 1024 bytes)
@@ -147,11 +148,16 @@ def main():
             scaled = (grid[y][x] - S) * scale
             heights[y][x] = max(0, min(31, int(round(scaled))))
 
-    # Step 7b: Force plateau to height 31
+    # Step 7b: Force plateau to height 31; cap non-plateau at 30
     plat_h = 31
-    for y in range(PLAT_MIN, PLAT_MAX + 1):
-        for x in range(PLAT_MIN, PLAT_MAX + 1):
-            heights[y][x] = plat_h
+    PLATEAU_CELLS = {(y, x) for y in range(PLAT_MIN, PLAT_MAX + 1)
+                     for x in range(PLAT_MIN, PLAT_MAX + 1)}
+    for y in range(SIZE):
+        for x in range(SIZE):
+            if (y, x) in PLATEAU_CELLS:
+                heights[y][x] = plat_h
+            elif heights[y][x] >= plat_h:
+                heights[y][x] = plat_h - 1
 
     # Step 7c: Pack bytes with colour bits (using clamped heights, original Q for colour)
     rng = random.Random(SEED + 1)
@@ -203,24 +209,8 @@ def main():
                     changed = True
                 packed[y][x] = byte
 
-    # Step 7e: Remap edge colour patterns for LUT compatibility
-    # Patterns 010 and 100 are reserved for plateau boundary edges.
-    # Remap non-plateau land cells: 010 → 000, 100 → 110
-    # Plateau: 4×4 cells = 5×5 vertices centred at (16,16)
-    PLATEAU_CELLS = {(y, x) for y in range(PLAT_MIN, PLAT_MAX + 1)
-                     for x in range(PLAT_MIN, PLAT_MAX + 1)}
-    for y in range(SIZE):
-        for x in range(SIZE):
-            if (y, x) in PLATEAU_CELLS:
-                continue
-            byte = packed[y][x]
-            if (byte >> 3) == 0:
-                continue  # sea cell, patterns fine
-            pattern = byte & 7
-            if pattern == 0b010:  # 010 → 000: clear bit 1
-                packed[y][x] = byte & ~0x02
-            elif pattern == 0b100:  # 100 → 110: set bit 1
-                packed[y][x] = byte | 0x02
+    # Step 7e: (removed — land/plateau now use separate colour tables,
+    #           so land patterns 010/100 no longer collide with plateau)
 
     # Step 7f: Override plateau cells with computed byte values
     # Edge rules: outline=WHITE, internal=BLACK, outgoing=GREEN

@@ -80,12 +80,23 @@ v_row_offset_lo:
     .byte <(0*ROW_STRIDE), <(1*ROW_STRIDE), <(2*ROW_STRIDE)
     .byte <(3*ROW_STRIDE), <(4*ROW_STRIDE), <(5*ROW_STRIDE)
     .byte <(6*ROW_STRIDE)
-; Edge colour LUTs: index = (bits2-0 << 1) | sea_flag
-; Split tables avoid runtime bit extraction (h=bits 4,2,0; v=bits 5,3,1)
-h_color_lut:
-    .byte $05,$14,$15,$14,$04,$10,$00,$10,$15,$14,$15,$14,$04,$10,$00,$10
-v_color_lut:
-    .byte $05,$14,$15,$14,$15,$14,$15,$14,$04,$10,$00,$10,$04,$10,$00,$10
+; Edge colour LUTs: three 8-entry tables, indexed by color bits 0-2
+; Selected by vertex height: 0 = sea, 31 = plateau, other = land
+;           pattern: 000  001  010  011  100  101  110  111
+h_color_sea:
+    .byte          $14, $14, $10, $10, $14, $14, $10, $10
+v_color_sea:                                                   ; Cy   Cy   B    B    Cy   Cy   B    B
+    .byte          $14, $14, $14, $14, $10, $10, $10, $10      ; Cy   Cy   Cy   Cy   B    B    B    B
+
+h_color_plat:
+    .byte          $05, $15, $04, $00, $15, $15, $04, $00
+v_color_plat:                                                  ; Y    W    G    Bk   W    W    G    Bk
+    .byte          $05, $15, $15, $15, $04, $00, $04, $00      ; Y    W    W    W    G    Bk   G    Bk
+
+h_color_land:                                                  ; bit1=0→Y, bit1=1→G
+    .byte          $05, $05, $04, $04, $05, $05, $04, $04      ; Y    Y    G    G    Y    Y    G    G
+v_color_land:                                                  ; bit2=0→Y, bit2=1→G
+    .byte          $05, $05, $05, $05, $04, $04, $04, $04      ; Y    Y    Y    Y    G    G    G    G
 
 ; =====================================================================
 ; draw_grid — Project grid + draw h-chains inline + draw v-chains
@@ -514,26 +525,45 @@ lookup_and_color:
     LDY hmap_col
     LDA (hmap_ptr),Y
     STA vtx_cell            ; full cell byte for z_interp_vertex
-    ASL A
-    AND #$0E
-    TAX                       ; X = color LUT index (land)
+    AND #$07
+    TAX                       ; X = color bits (0-7)
     LDA vtx_cell
     AND #$F8                  ; A = h*8
-    BNE @lc_land
-    INX                       ; sea flag (odd LUT index)
-@lc_land:
-    PHA                       ; save h*8
-    LDA v_color_lut,X
-    STA v_color           ; pre-resolved v_color
-    LDA h_color_lut,X
-    STA h_color         ; pre-resolved h_color
-    PLA                       ; restore h*8
+    BEQ @lc_sea
+    CMP #$F8
+    BEQ @lc_plat
+    ; --- normal land (hot path, fall through) ---
+    PHA
+    LDA v_color_land,X
+    STA v_color
+    LDA h_color_land,X
+    STA h_color
+    PLA
+@lc_z:
     LDX z_interp_offset
     BEQ @lc_done
     JSR z_interp_vertex       ; A = z-interp h*8
     STA vtx_cell            ; update for edge interp
 @lc_done:
     RTS
+
+@lc_sea:
+    PHA                       ; save h*8 = 0
+    LDA v_color_sea,X
+    STA v_color
+    LDA h_color_sea,X
+    STA h_color
+    PLA
+    BEQ @lc_z                ; unconditional (A=0)
+
+@lc_plat:
+    PHA                       ; save h*8 = $F8
+    LDA v_color_plat,X
+    STA v_color
+    LDA h_color_plat,X
+    STA h_color
+    PLA
+    BNE @lc_z                ; unconditional (A=$F8)
 
 ; =====================================================================
 ; do_middle_vertex — Lookup + project middle vertex (entry point 1)

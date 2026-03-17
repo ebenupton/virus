@@ -13,6 +13,7 @@
 .include "clip_zp.inc"
 
 ; ── Object internal workspace (ZP_OBJECT internal) ─────────────────
+obj_color       = ZP_OBJECT + 12    ; single object color, set from header
 sin_val         = ZP_OBJECT + 16    ; precomputed sin(angle) for current frame
 cos_val         = ZP_OBJECT + 17    ; precomputed cos(angle) for current frame
 obj_n_vtx       = ZP_OBJECT + 18    ; vertex count (phase 1); temp in phase 2
@@ -81,30 +82,30 @@ bit_mask_table:
     .byte $01, $02, $04, $08, $10, $20, $40, $80
 
 ; ── World positions (8.8 fixed-point), packed for indexed access ──
-OBJ_WORLD_PYRAMID = 0
+OBJ_WORLD_ENEMY   = 0
 OBJ_WORLD_SHIP    = 6
 obj_world_pos:
-    ; Pyramid: X=1.0, Y=1.0, Z=0.0
-    .byte $00, $01, $00, $01, $00, $00
+    ; Enemy: X=4.0, Y=1.0, Z=2.0
+    .byte $00, $04, $00, $01, $00, $02
     ; Ship: X=4.0, Y=31/32, Z=4.0  (on plateau, height 31)
     .byte $00, $04, $F8, $00, $00, $04
 
 ; ── Object: Octagonal bipyramid (10 vtx, 24 edges, 16 faces) ──
 ;
-; New data format:
-;   Header:   n_vertices, n_edges, flags                (3 bytes)
+; Data format:
+;   Header:   n_vertices, n_edges, flags, color          (4 bytes)
 ;             flags bit 7: skip 3D clipping
 ;   Vertices: n_vertices × (x, y, z)                    (signed bytes)
-;   Edges:    n_edges × (v_from, v_to, color)           (3 bytes each)
-;   Faces:    n, v_0..v_{n-1}, face_color, eid_0..eid_{n-1} ($FF terminated)
+;   Edges:    n_edges × (v_from, v_to, color)             (3 bytes each)
+;   Faces:    n, v_0..v_{n-1}, eid_0..eid_{n-1}          ($FF terminated)
 ;
 ; Edge numbering preserved from chain traversal order:
 ;   e0-e11:  chain 0 (upper star + even base edges)
 ;   e12-e23: chain 1 (lower star + odd base edges)
 
-obj_pyramid:
-    ; Header: n_vertices, n_edges, flags
-    .byte 10, 24, $00
+obj_enemy:
+    ; Header: n_vertices, n_edges, flags, color
+    .byte 10, 24, $00, $01
 
     ; Vertices (x, y, z) — signed bytes, object-local coords
     .byte   0,  38,   0            ; v0: top apex
@@ -119,62 +120,64 @@ obj_pyramid:
     .byte  30,   0, <(-30)         ; v9: base 315°
 
     ; Edge table: 24 edges × (v_from, v_to, color)
-    ; e0-e11: chain 0 order (upper star + even base edges)
-    .byte 0,2,$01                   ; e0:  v0→v2  (red)
-    .byte 2,3,$01                   ; e1:  v2→v3  (red)
-    .byte 3,0,$11                   ; e2:  v3→v0  (magenta)
-    .byte 0,4,$01                   ; e3:  v0→v4  (red)
-    .byte 4,5,$01                   ; e4:  v4→v5  (red)
-    .byte 5,0,$11                   ; e5:  v5→v0  (magenta)
-    .byte 0,6,$01                   ; e6:  v0→v6  (red)
-    .byte 6,7,$01                   ; e7:  v6→v7  (red)
-    .byte 7,0,$11                   ; e8:  v7→v0  (magenta)
-    .byte 0,8,$01                   ; e9:  v0→v8  (red)
-    .byte 8,9,$01                   ; e10: v8→v9  (red)
-    .byte 9,0,$11                   ; e11: v9→v0  (magenta)
-    ; e12-e23: chain 1 order (lower star + odd base edges)
-    .byte 1,2,$01                   ; e12: v1→v2  (red)
-    .byte 2,9,$11                   ; e13: v2→v9  (magenta)
-    .byte 9,1,$11                   ; e14: v9→v1  (magenta)
-    .byte 1,8,$01                   ; e15: v1→v8  (red)
-    .byte 8,7,$11                   ; e16: v8→v7  (magenta)
-    .byte 7,1,$11                   ; e17: v7→v1  (magenta)
-    .byte 1,6,$01                   ; e18: v1→v6  (red)
-    .byte 6,5,$11                   ; e19: v6→v5  (magenta)
-    .byte 5,1,$11                   ; e20: v5→v1  (magenta)
-    .byte 1,4,$01                   ; e21: v1→v4  (red)
-    .byte 4,3,$11                   ; e22: v4→v3  (magenta)
-    .byte 3,1,$11                   ; e23: v3→v1  (magenta)
+    ; Upper star + base edges alternate red ($01) / magenta ($11)
+    ; Lower edges have opposite color to corresponding upper edge
+    ; e0-e11: chain 0 (upper star + even base edges)
+    .byte 0,2, $01                  ; e0:  v0→v2  (red)
+    .byte 2,3, $01                  ; e1:  v2→v3  (red)
+    .byte 3,0, $11                  ; e2:  v3→v0  (magenta)
+    .byte 0,4, $01                  ; e3:  v0→v4  (red)
+    .byte 4,5, $01                  ; e4:  v4→v5  (red)
+    .byte 5,0, $11                  ; e5:  v5→v0  (magenta)
+    .byte 0,6, $01                  ; e6:  v0→v6  (red)
+    .byte 6,7, $01                  ; e7:  v6→v7  (red)
+    .byte 7,0, $11                  ; e8:  v7→v0  (magenta)
+    .byte 0,8, $01                  ; e9:  v0→v8  (red)
+    .byte 8,9, $01                  ; e10: v8→v9  (red)
+    .byte 9,0, $11                  ; e11: v9→v0  (magenta)
+    ; e12-e23: chain 1 (lower star + odd base edges)
+    .byte 1,2, $11                  ; e12: v1→v2  (magenta)
+    .byte 2,9, $11                  ; e13: v2→v9  (magenta)
+    .byte 9,1, $01                  ; e14: v9→v1  (red)
+    .byte 1,8, $11                  ; e15: v1→v8  (magenta)
+    .byte 8,7, $11                  ; e16: v8→v7  (magenta)
+    .byte 7,1, $01                  ; e17: v7→v1  (red)
+    .byte 1,6, $11                  ; e18: v1→v6  (magenta)
+    .byte 6,5, $11                  ; e19: v6→v5  (magenta)
+    .byte 5,1, $01                  ; e20: v5→v1  (red)
+    .byte 1,4, $11                  ; e21: v1→v4  (magenta)
+    .byte 4,3, $11                  ; e22: v4→v3  (magenta)
+    .byte 3,1, $01                  ; e23: v3→v1  (red)
 
-    ; Faces: n, v_0..v_{n-1}, face_color, eid_0..eid_{n-1}
+    ; Faces: n, v_0..v_{n-1}, eid_0..eid_{n-1}
     ; Upper faces (v0, base[k], base[k+1])
-    .byte 3, 0, 2, 3,  $01,  0,  1,  2    ; F0:  v0-v2-v3
-    .byte 3, 0, 3, 4,  $01,  2, 22,  3    ; F1:  v0-v3-v4
-    .byte 3, 0, 4, 5,  $01,  3,  4,  5    ; F2:  v0-v4-v5
-    .byte 3, 0, 5, 6,  $01,  5, 19,  6    ; F3:  v0-v5-v6
-    .byte 3, 0, 6, 7,  $01,  6,  7,  8    ; F4:  v0-v6-v7
-    .byte 3, 0, 7, 8,  $01,  8, 16,  9    ; F5:  v0-v7-v8
-    .byte 3, 0, 8, 9,  $01,  9, 10, 11    ; F6:  v0-v8-v9
-    .byte 3, 0, 9, 2,  $01, 11, 13,  0    ; F7:  v0-v9-v2
+    .byte 3, 0, 2, 3,  0,  1,  2          ; F0:  v0-v2-v3
+    .byte 3, 0, 3, 4,  2, 22,  3          ; F1:  v0-v3-v4
+    .byte 3, 0, 4, 5,  3,  4,  5          ; F2:  v0-v4-v5
+    .byte 3, 0, 5, 6,  5, 19,  6          ; F3:  v0-v5-v6
+    .byte 3, 0, 6, 7,  6,  7,  8          ; F4:  v0-v6-v7
+    .byte 3, 0, 7, 8,  8, 16,  9          ; F5:  v0-v7-v8
+    .byte 3, 0, 8, 9,  9, 10, 11          ; F6:  v0-v8-v9
+    .byte 3, 0, 9, 2, 11, 13,  0          ; F7:  v0-v9-v2
     ; Lower faces (v1, base[k+1], base[k] — reversed winding)
-    .byte 3, 1, 3, 2,  $01, 23,  1, 12    ; F8:  v1-v3-v2
-    .byte 3, 1, 4, 3,  $01, 21, 22, 23    ; F9:  v1-v4-v3
-    .byte 3, 1, 5, 4,  $01, 20,  4, 21    ; F10: v1-v5-v4
-    .byte 3, 1, 6, 5,  $01, 18, 19, 20    ; F11: v1-v6-v5
-    .byte 3, 1, 7, 6,  $01, 17,  7, 18    ; F12: v1-v7-v6
-    .byte 3, 1, 8, 7,  $01, 15, 16, 17    ; F13: v1-v8-v7
-    .byte 3, 1, 9, 8,  $01, 14, 10, 15    ; F14: v1-v9-v8
-    .byte 3, 1, 2, 9,  $01, 12, 13, 14    ; F15: v1-v2-v9
+    .byte 3, 1, 3, 2, 23,  1, 12          ; F8:  v1-v3-v2
+    .byte 3, 1, 4, 3, 21, 22, 23          ; F9:  v1-v4-v3
+    .byte 3, 1, 5, 4, 20,  4, 21          ; F10: v1-v5-v4
+    .byte 3, 1, 6, 5, 18, 19, 20          ; F11: v1-v6-v5
+    .byte 3, 1, 7, 6, 17,  7, 18          ; F12: v1-v7-v6
+    .byte 3, 1, 8, 7, 15, 16, 17          ; F13: v1-v8-v7
+    .byte 3, 1, 9, 8, 14, 10, 15          ; F14: v1-v9-v8
+    .byte 3, 1, 2, 9, 12, 13, 14          ; F15: v1-v2-v9
     .byte $FF                              ; sentinel
 
-; ── Object: Player ship (6 vtx, 12 edges, 8 faces) ──
+; ── Object: Player ship (6 vtx, 9 edges, 5 faces) ──
 ;
 ; Flat trapezoidal body (v0-v3) with two raised rear fins (v4-v5).
 ; Based on Zarch lander_model_ship, scaled ×35, Y negated.
 
 obj_ship:
-    ; Header: n_vertices, n_edges, flags (bit 7 = no clip)
-    .byte 6, 9, $80
+    ; Header: n_vertices, n_edges, flags, color (bit 7 = no clip)
+    .byte 6, 9, $80, $15
 
     ; Vertices (x, y, z) — signed bytes, halved
     .byte <(-28),   0, <(-24)      ; v0: rear left
@@ -185,23 +188,23 @@ obj_ship:
     .byte  10,     18, <(-24)      ; v5: right fin top
 
     ; Edge table: 9 edges × (v_from, v_to, color)
-    .byte 0,1,$15                   ; e0:  rear base (white)
-    .byte 1,2,$15                   ; e1:  right body
-    .byte 2,3,$15                   ; e2:  front
-    .byte 3,0,$15                   ; e3:  left body
-    .byte 4,5,$15                   ; e4:  fin ridge (white)
-    .byte 0,4,$15                   ; e5:  left fin
-    .byte 1,5,$15                   ; e6:  right fin
-    .byte 4,3,$15                   ; e7:  upper left
-    .byte 5,2,$15                   ; e8:  upper right
+    .byte 0,1, $15                  ; e0:  rear base (white)
+    .byte 1,2, $15                  ; e1:  right body (white)
+    .byte 2,3, $15                  ; e2:  front (white)
+    .byte 3,0, $15                  ; e3:  left body (white)
+    .byte 4,5, $15                  ; e4:  fin ridge (white)
+    .byte 0,4, $15                  ; e5:  left fin (white)
+    .byte 1,5, $15                  ; e6:  right fin (white)
+    .byte 4,3, $15                  ; e7:  upper left (white)
+    .byte 5,2, $15                  ; e8:  upper right (white)
 
-    ; Faces: n, v_0..v_{n-1}, face_color, eid_0..eid_{n-1}
+    ; Faces: n, v_0..v_{n-1}, eid_0..eid_{n-1}
     ; Vertex rings reversed vs original to fix Y-negation winding inversion
-    .byte 4, 0,3,2,1,  $11,  3,2,1,0      ; F0: bottom quad
-    .byte 4, 4,5,2,3,  $11,  4,8,2,7      ; F1: top quad
-    .byte 4, 0,1,5,4,  $01,  0,6,4,5      ; F2: rear quad
-    .byte 3, 4,3,0,     $11,  7,3,5       ; F3: left triangle
-    .byte 3, 1,2,5,     $01,  1,8,6       ; F4: right triangle
+    .byte 4, 0,3,2,1,  3,2,1,0            ; F0: bottom quad
+    .byte 4, 4,5,2,3,  4,8,2,7            ; F1: top quad
+    .byte 4, 0,1,5,4,  0,6,4,5            ; F2: rear quad
+    .byte 3, 4,3,0,     7,3,5             ; F3: left triangle
+    .byte 3, 1,2,5,     1,8,6             ; F4: right triangle
     .byte $FF                              ; sentinel
 
 ; ── Object: Tree (single triangle, 60° rotated so flat edge faces camera) ──
@@ -209,7 +212,7 @@ obj_ship:
 ; setup_obj_view — Compute view-space coords from packed world position
 ; =====================================================================
 ;
-; Input:  Y = offset into obj_world_pos (OBJ_WORLD_PYRAMID)
+; Input:  Y = offset into obj_world_pos (OBJ_WORLD_ENEMY)
 ; Output: obj_view_x/y/z set
 ;         On return: N set if view_z < 0 (behind camera)
 ;                    N clear, Z set if view_z == 0 (at camera)
@@ -278,14 +281,14 @@ draw_object:
     LDY #2
     LDA (obj_ptr),Y
     STA obj_clip_flags          ; flags (bit 7 = skip clip)
+    INY                         ; Y=3
+    LDA (obj_ptr),Y             ; color
+    STA obj_color
 
-    ; Init bounding box to empty (group zero-stores)
+    ; Init bounding box to empty
     LDA #0
-    STA obj_bb_max_sx
     STA obj_bb_max_sy
     STA vtx_idx              ; vtx_idx = 0
-    LDA #127
-    STA obj_bb_min_sx
     LDA #160
     STA obj_bb_min_sy
 
@@ -304,10 +307,10 @@ draw_object:
     JMP @proj_done
 
 @proj_vtx:
-    ; Y offset = 3 + vtx_idx * 3
+    ; Y offset = 4 + vtx_idx * 3
     ASL A                       ; vtx_idx*2, C=0 (vtx_idx<128)
     ADC vtx_idx             ; vtx_idx*3, max 69, C=0
-    ADC #3
+    ADC #4
     TAY
 
     ; Load signed local coords
@@ -379,8 +382,6 @@ draw_object:
     JSR clamp_add
     LDX vtx_idx
     STA obj_proj_sx,X
-    LDX #0
-    JSR update_bb
 
     ; -- view_y = obj_view_y - sign_extend(local_y) --
     LDX #obj_view_y
@@ -404,7 +405,6 @@ draw_object:
     JSR clamp_add
     LDX vtx_idx
     STA obj_proj_sy,X
-    LDX #2
     JSR update_bb
 
     INC vtx_idx
@@ -442,13 +442,8 @@ draw_object:
     ; Clamped screen coords
     LDA #64
     STA obj_proj_sx,X
-    STX nmos_tmp
-    LDX #0
-    JSR update_bb
-    LDX nmos_tmp
     LDA #80
     STA obj_proj_sy,X
-    LDX #2
     JSR update_bb
     INC vtx_idx
     JMP @proj_loop
@@ -462,13 +457,13 @@ draw_object:
     STA obj_edge_drawn+2
     STA obj_edge_drawn+3
 
-    ; Compute edge_tab_off = 3 + n_vtx * 3
+    ; Compute edge_tab_off = 4 + n_vtx * 3
     LDY #0
     LDA (obj_ptr),Y             ; n_vertices
     STA obj_n_vtx               ; temp
     ASL A                       ; n_vtx*2, C=0 (n_vtx<128)
     ADC obj_n_vtx               ; n_vtx*3, max 72, C=0
-    ADC #3
+    ADC #4
     STA edge_tab_off
 
     ; Compute face data offset = edge_tab_off + n_edges * 3
@@ -476,7 +471,7 @@ draw_object:
     LDA (obj_ptr),Y             ; n_edges
     STA obj_n_vtx               ; temp
     ASL A                       ; n_edges*2, C=0 (n_edges<128)
-    ADC obj_n_vtx               ; n_edges*3, max 96, C=0
+    ADC obj_n_vtx               ; n_edges*3
     ADC edge_tab_off
     STA data_off
 
@@ -489,9 +484,7 @@ draw_object:
     RTS                         ; all faces processed
 @face_ok:
 
-    ; Read N-gon face: n, v_0..v_{n-1}, face_color
-    ; Vertices stored in poly_ring (safe during backface test)
-    ; face_color in $8F, n pushed on stack
+    ; Read face: n, v_0..v_{n-1}, eid_0..eid_{n-1}
     STA face_n_edges            ; n → $86 (for read loop; clobbered by backface)
 
     ; Read n vertices into poly_ring
@@ -507,11 +500,6 @@ draw_object:
     ; Wraparound: poly_ring[n] = poly_ring[0]
     LDA poly_ring
     STA poly_ring,X
-
-    ; Read face_color
-    INY
-    LDA (obj_ptr),Y
-    STA clip_has_isect          ; face_color → $8F (temp)
 
     ; Push n, advance to first edge ID
     LDA face_n_edges
@@ -585,11 +573,43 @@ draw_object:
     ; ── Front-facing: restore face data from temps ──
     PLA                         ; n from stack
     STA face_n_edges            ; → $86
-    LDA clip_has_isect          ; face_color from $8F
-    STA face_color_val          ; → $8B
 
-    ; ── Draw all edges (face_color always non-zero) ──
-    BNE @all_inside
+    ; If clipping disabled for this object, draw all edges directly
+    BIT obj_clip_flags
+    BMI @all_inside             ; bit 7 set → no clipping
+
+    ; Re-read vertex indices into poly_ring (clobbered by backface test)
+    ; and OR together outcodes to detect mixed inside/outside
+    LDA data_off
+    SEC
+    SBC face_n_edges
+    TAY                         ; Y = obj data offset of first vertex
+    LDA #0
+    STA recip                   ; outcode accumulator
+    LDX #0
+@check_clip:
+    LDA (obj_ptr),Y             ; vertex index
+    STA poly_ring,X
+    TYA
+    PHA                         ; save data offset
+    LDY poly_ring,X
+    LDA obj_vtx_clip,Y          ; vertex outcode
+    ORA recip
+    STA recip
+    PLA
+    TAY                         ; restore data offset
+    INY
+    INX
+    CPX face_n_edges
+    BCC @check_clip
+
+    ; Wraparound: poly_ring[n] = poly_ring[0]
+    LDA poly_ring
+    STA poly_ring,X
+
+    LDA recip
+    BEQ @all_inside             ; all inside → draw all edges
+    JMP @mixed_clip             ; some outside → polygon clip walk
 
 @skip_face:
     ; Back-facing: clean stack and advance past edge IDs
@@ -657,8 +677,11 @@ draw_object:
     JMP @poly_next
 
 @pe_straddle:
-    ; One inside, one outside — mark edge drawn
+    ; One inside, one outside — mark edge drawn, skip if already done
     JSR check_and_mark_edge
+    BCC @pe_not_drawn
+    JMP @poly_next
+@pe_not_drawn:
 
     ; Load P0 = poly_v0 3D coords → clip API
     LDX poly_vtx_idx
@@ -704,13 +727,14 @@ draw_object:
     JSR clip_line_far
     BCS @pe_clip_reject
 
-    ; Look up edge color from table
-    LDA recip                   ; edge_id (0..23, preserved across clip calls)
-    ASL A                       ; eid * 2 (C=0, eid<128)
-    ADC recip                   ; eid * 3 (C=0, max 69)
-    ADC #2                      ; + 2 → color byte offset (C=0)
-    ADC edge_tab_off            ; absolute offset in object data
+    ; Look up edge color from table (recip still = edge_id)
+    LDA recip                   ; edge_id
+    ASL A                       ; eid * 2 (C=0)
+    ADC recip                   ; eid * 3
+    ADC edge_tab_off            ; + table start
     TAY
+    INY                         ; skip v_from
+    INY                         ; skip v_to
     LDA (obj_ptr),Y             ; edge color
     STA clip_color
 
@@ -745,7 +769,7 @@ draw_object:
     STA raster_x1
     LDA clip_proj_sy
     STA raster_y1
-    LDA face_color_val          ; face color for clip boundary
+    LDA obj_color               ; object color for clip boundary
     JSR draw_line
 
     ; Plot final pixel of clip-boundary edge
@@ -839,17 +863,17 @@ draw_edge_dedup:
     ; Look up edge in table: offset = edge_tab_off + eid * 3
     LDA recip                   ; edge_id (0..23)
     ASL A                       ; eid * 2 (C=0, eid<128)
-    ADC recip                   ; eid * 3 (C=0, max 69)
+    ADC recip                   ; eid * 3
     ADC edge_tab_off            ; absolute offset
     TAY
     LDA (obj_ptr),Y             ; v_from
     TAX                         ; X = v_from
     INY
     LDA (obj_ptr),Y             ; v_to
-    STA recip                   ; save v_to → $85
+    STA recip                   ; save v_to
     INY
-    LDA (obj_ptr),Y             ; color
-    PHA                         ; save color on stack
+    LDA (obj_ptr),Y             ; edge color
+    STA face_color_val
 
     ; init_base from v_from
     LDA obj_proj_sx,X
@@ -866,7 +890,7 @@ draw_edge_dedup:
     STA raster_y1
 
     ; Draw (Y preserved from init_base)
-    PLA                         ; color
+    LDA face_color_val          ; per-face color
     JSR draw_line
 
     ; Plot final pixel at (raster_x1, raster_y1)
@@ -1075,17 +1099,17 @@ sign_ext_add:
     RTS
 
 ; =====================================================================
-; update_bb — Update bounding box min/max pair
+; update_bb — Update bounding box min/max for screen Y
 ; =====================================================================
-; Input:  A = value, X = offset (0 = sx, 2 = sy)
-; Output: obj_bb_min/max updated
+; Input:  A = screen Y value
+; Output: obj_bb_min/max_sy updated
 ; Preserves: A, Y
 
 update_bb:
-    CMP obj_bb_min_sx,X
+    CMP obj_bb_min_sy
     BCS :+
-    STA obj_bb_min_sx,X
-:   CMP obj_bb_max_sx,X
+    STA obj_bb_min_sy
+:   CMP obj_bb_max_sy
     BCC :+
-    STA obj_bb_max_sx,X
+    STA obj_bb_max_sy
 :   RTS

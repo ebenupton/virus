@@ -590,13 +590,13 @@ project_and_draw:
     STA raster_x0
     STA clip_proj_sx
 
-    ; sy0 = clamp(80 + offset_y)
+    ; sy0 = clamp(16 + offset_y)
     LDA clip_y0
     LDX clip_y0+1
     JSR project_coord
 
-    ; sy = clamp(80 + offset, 0, 159)
-    LDA #80
+    ; sy = clamp(16 + offset, 0, 159)
+    LDA #16
     LDX #159
     JSR clamp_add
     STA raster_y0
@@ -627,7 +627,7 @@ project_and_draw:
     LDX clip_y1+1
     JSR project_coord
 
-    LDA #80
+    LDA #16
     LDX #159
     JSR clamp_add
     STA raster_y1
@@ -675,6 +675,5 @@ compute_recip_z2:
     STA math_b
     TXA
     JSR recip8
-    LSR A
     STA clip_n
     RTS

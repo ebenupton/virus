@@ -36,6 +36,7 @@ SYS_VIA_ORA  = $FE4F
 .include "math_zp.inc"
 .include "grid_zp.inc"
 .include "object_zp.inc"
+.include "particle_zp.inc"
 
 ; === Constants ===
 SCREEN_W    = 128            ; pixels wide (4bpp, 2 pixels per byte)
@@ -54,32 +55,35 @@ KEY_L       = $56
 CAM_HEIGHT_LO   = $80        ; camera height 1.5 in 8.8 = $0180
 CAM_HEIGHT_HI   = $01
 CAM_Z_BEHIND    = $0240      ; camera 2.25 units behind ship (= grid centre z)
-MAX_POS_Y_HI    = $01        ; max ship altitude = 1.25 units
-MAX_POS_Y_LO    = $40
+MAX_POS_Y_HI    = $28        ; max ship altitude in new scale ($2800 = 1.25 units)
+MAX_POS_Y_LO    = $00
 
-; Physics constants (12.5 fps, 1 grid cell = $40 in 8.8)
-GRAVITY_ACCEL   = 52          ; 0.5 cells/s²
-THRUST_ACCEL    = 104         ; 2× gravity
+; Physics constants (16-bit velocity, 1/8192 world/frame² per unit)
+GRAVITY_ACCEL   = 7           ; ~0.5 cells/s²
+THRUST_ACCEL    = 21          ; 3× gravity
+EXHAUST_SPEED   = 14          ; particle exhaust velocity scale
 
 ; === Game internal workspace (ZP_GAME internal) ===
 ship_yaw        = ZP_GAME + 8      ; Y-axis rotation angle
 ship_roll       = ZP_GAME + 9      ; X-axis roll angle
 
-; Velocity: 24-bit signed (hi:lo:frac) per axis (contiguous for loop zeroing)
+; Velocity: 16-bit signed (hi:lo) per axis, stride 2 for X-indexed access
 vel_x_hi        = ZP_GAME + 10
 vel_x_lo        = ZP_GAME + 11
-vel_x_frac      = ZP_GAME + 12
-vel_y_hi        = ZP_GAME + 13
-vel_y_lo        = ZP_GAME + 14
-vel_y_frac      = ZP_GAME + 15
-vel_z_hi        = ZP_GAME + 16
-vel_z_lo        = ZP_GAME + 17
-vel_z_frac      = ZP_GAME + 18
+vel_y_hi        = ZP_GAME + 12
+vel_y_lo        = ZP_GAME + 13
+vel_z_hi        = ZP_GAME + 14
+vel_z_lo        = ZP_GAME + 15
 
-; Sub-pixel position accumulators (stride-2 for Y-indexed update_pos)
-pos_x_frac      = ZP_GAME + 19
-pos_y_frac      = ZP_GAME + 21
-pos_z_frac      = ZP_GAME + 23
+; Ship position: 16-bit (lo:hi) per axis, new scale (256 hi = 8 world units)
+; Y-indexed stride 2; convert_axis writes old-scale to obj_world_pos for rendering
+ship_x_lo       = ZP_GAME + 16
+ship_x_hi       = ZP_GAME + 17
+ship_y_lo       = ZP_GAME + 18
+ship_y_hi       = ZP_GAME + 19
+ship_z_lo       = ZP_GAME + 20
+ship_z_hi       = ZP_GAME + 21
+enemy_rot       = ZP_GAME + 22     ; enemy Y-axis rotation (increments each frame)
 
 ; Game scratch (ZP_SHARED spares, used only during thrust/drag)
 gm_scratch_0    = ZP_SHARED + 1
@@ -119,34 +123,37 @@ entry:
     LDA #160
     STA dirty_top_buf0
     STA dirty_top_buf1
-    ; No ship drawn yet
-    LDA #20
-    STA ship_top_buf0
-    STA ship_top_buf1
-    STA ship_bot_buf0
-    STA ship_bot_buf1
-
     ; Initialize rotation angle and orientation
     LDA #0
     STA obj_rot_angle
     STA ship_yaw
     STA ship_roll
+    STA enemy_rot
 
-    ; Initialize velocities to zero (vel_x_hi..$2E contiguous)
-    LDX #(vel_z_frac - vel_x_hi)
+    ; Initialize velocities to zero (6 bytes)
+    LDX #(vel_z_lo - vel_x_hi)
 @clr_vel:
     STA vel_x_hi,X
     DEX
     BPL @clr_vel
 
-    ; Initialize position fraction accumulators
-    STA pos_x_frac
-    STA pos_y_frac
-    STA pos_z_frac
+    ; Initialize ship position in new scale
+    ; X=4.0 → $8000, Y=31/32 → $1F00, Z=4.0 → $8000
+    STA ship_x_lo           ; A=0
+    STA ship_y_lo
+    STA ship_z_lo
+    LDA #$80
+    STA ship_x_hi
+    STA ship_z_hi
+    LDA #$1F
+    STA ship_y_hi
+
+    JSR init_particles
 
     ; Initialize camera: follow ship at (4, 0, 4)
+    LDA #0
     STA cam_x_lo
-    LDA #$04                ; ship_x_hi = 4
+    LDA #$04
     STA cam_x_hi
     LDA #<($0400 - CAM_Z_BEHIND)  ; cam_z = ship_z - CAM_Z_BEHIND
     STA cam_z_lo
@@ -165,13 +172,10 @@ main_loop:
     JSR update_camera
     JSR update_physics
     JSR clear_screen
-    JSR clear_ship
+    JSR clear_particles
     JSR draw_grid
 
-    ; Default bbox: nothing drawn by object (overwritten if draw_object runs)
-    LDA #160
-    STA obj_bb_min_sy
-
+    ; Draw ship
     LDA ship_yaw
     STA obj_rot_angle
     LDA ship_roll
@@ -180,29 +184,48 @@ main_loop:
     STA obj_ptr
     LDA #>obj_ship
     STA obj_ptr+1
-
     LDY #OBJ_WORLD_SHIP
     JSR setup_obj_view
     BCS @skip_ship
     JSR draw_object
 @skip_ship:
+    ; Merge ship dirty into grid dirty
+    LDA obj_bb_min_sy
+    CMP grid_min_sy
+    BCS :+
+    STA grid_min_sy
+:
+    ; Draw enemy (spins on axis: 256/64 = 4 per frame)
+    LDA enemy_rot
+    CLC
+    ADC #4
+    STA enemy_rot
+    STA obj_rot_angle
+    LDA #0
+    STA obj_roll_angle
+    LDA #<obj_enemy
+    STA obj_ptr
+    LDA #>obj_enemy
+    STA obj_ptr+1
+    LDY #OBJ_WORLD_ENEMY
+    JSR setup_obj_view
+    BCS @skip_enemy
+    JSR draw_object
+@skip_enemy:
+    ; Merge enemy dirty into grid dirty
+    LDA obj_bb_min_sy
+    CMP grid_min_sy
+    BCS :+
+    STA grid_min_sy
+:
 
-    ; Grid-only dirty top for this buffer
+    JSR update_particles
+    JSR draw_particles
+
+    ; Dirty top for this buffer (covers grid + objects; particles self-clear)
     LDA grid_min_sy
     LDX back_buf_idx
     STA dirty_top_buf0,X
-
-    ; Ship stripe range for this buffer's clear_ship
-    LDA obj_bb_min_sy         ; 0-159 or 160 (no ship)
-    LSR A
-    LSR A
-    LSR A                     ; stripe 0-19 or 20 (none)
-    STA ship_top_buf0,X
-    LDA obj_bb_max_sy
-    LSR A
-    LSR A
-    LSR A
-    STA ship_bot_buf0,X
 
     JSR draw_status
     JSR wait_vsync
@@ -229,7 +252,24 @@ update_camera:
     JSR scan_key_add
     LDA #KEY_M              ; M key → roll right (ship_roll -= 4)
     LDY #<(-4)
-    JMP scan_key_add        ; tail call
+    JSR scan_key_add
+
+    ; Clamp pitch to ±90° (valid: 0..64 and 192..255)
+    LDA ship_roll
+    CMP #65
+    BCC @roll_ok
+    CMP #192
+    BCS @roll_ok
+    CMP #128
+    BCC @clamp_pos
+    LDA #192                ; negative side (128..191) → clamp to -90°
+    BNE @store_roll
+@clamp_pos:
+    LDA #64                 ; positive side (65..127) → clamp to +90°
+@store_roll:
+    STA ship_roll
+@roll_ok:
+    RTS
 
 ; scan_key_add — Check key and add signed delta to ZP variable
 ; Input: A = key code, X = ZP address, Y = signed delta
@@ -245,13 +285,11 @@ scan_key_add:
 @ska_done:
     RTS
 
-; zero_y_vel — Zero Y velocity and position fraction (for ground/ceiling clamp)
+; zero_y_vel — Zero Y velocity (for ground/ceiling clamp)
 zero_y_vel:
     LDA #0
-    STA pos_y_frac
     STA vel_y_hi
     STA vel_y_lo
-    STA vel_y_frac
     RTS
 
 ; =====================================================================
@@ -260,15 +298,17 @@ zero_y_vel:
 
 update_physics:
     ; 1. Gravity (always — subtract from Y velocity)
-    LDA #<(-GRAVITY_ACCEL)   ; #$CC
-    LDX #3                   ; Y axis
+    LDA #<(-GRAVITY_ACCEL)
+    LDX #2                   ; Y axis (stride 2)
     JSR add_accel
 
     ; 2. Thrust (if L key pressed)
     LDA #KEY_L
     STA SYS_VIA_ORA
     LDA SYS_VIA_ORA
-    BPL @no_thrust
+    BMI @do_thrust
+    JMP @no_thrust
+@do_thrust:
 
     ; Precompute trig values into scratch
     LDX ship_roll
@@ -285,7 +325,7 @@ update_physics:
     STA math_b
     LDA gm_scratch_0
     JSR smul_shr7
-    LDX #3                   ; Y axis
+    LDX #2                   ; Y axis
     JSR add_accel
 
     ; horiz = (sin(roll) * THRUST_ACCEL) >> 7
@@ -306,58 +346,203 @@ update_physics:
     LDA gm_scratch_2
     ; math_b still = horiz from above
     JSR smul_shr7
-    LDX #6                   ; Z axis
+    LDX #4                   ; Z axis
     JSR add_accel
+
+    ; ── Emit exhaust particle (opposite thrust direction) ──
+    LDA particle_count
+    CMP #MAX_PARTICLES
+    BCC @emit_ok
+    JMP @no_thrust
+@emit_ok:
+
+    LDX particle_count
+    STX ptl_draw_count          ; save particle index (ptl_draw_count free)
+
+    ; Position = ship world position
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 0
+    STA ptl_x_lo,X
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 1
+    STA ptl_x_hi,X
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 2
+    STA ptl_y_lo,X
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 3
+    STA ptl_y_hi,X
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 4
+    STA ptl_z_lo,X
+    LDA obj_world_pos + OBJ_WORLD_SHIP + 5
+    STA ptl_z_hi,X
+
+    ; Timer
+    LDA #8
+    STA ptl_timer,X
+
+    ; Exhaust vy = -(cos(roll) * EXHAUST_SPEED) >> 7
+    LDA #EXHAUST_SPEED
+    STA math_b
+    LDA gm_scratch_0           ; cos(roll), preserved across add_accel
+    JSR smul_shr7
+    EOR #$FF
+    CLC
+    ADC #1                      ; negate
+    LDX ptl_draw_count
+    STA ptl_vy,X
+
+    ; horiz_neg = -(sin(roll) * EXHAUST_SPEED) >> 7
+    LDA #EXHAUST_SPEED
+    STA math_b
+    LDA gm_scratch_1           ; sin(roll)
+    JSR smul_shr7
+    EOR #$FF
+    CLC
+    ADC #1
+    STA gm_scratch_4           ; save horiz_neg
+
+    ; Exhaust vx = (sin(yaw) * horiz_neg) >> 7
+    STA math_b
+    LDA gm_scratch_3           ; sin(yaw)
+    JSR smul_shr7
+    LDX ptl_draw_count
+    STA ptl_vx,X
+
+    ; Exhaust vz = (cos(yaw) * horiz_neg) >> 7
+    LDA gm_scratch_4
+    STA math_b
+    LDA gm_scratch_2           ; cos(yaw)
+    JSR smul_shr7
+    LDX ptl_draw_count
+    STA ptl_vz,X
+
+    ; Random variation ([-2, +1] on each axis)
+    ; random_byte preserves X, Y
+    JSR random_byte
+    AND #3
+    SEC
+    SBC #2
+    CLC
+    ADC ptl_vx,X
+    STA ptl_vx,X
+
+    JSR random_byte
+    AND #3
+    SEC
+    SBC #2
+    CLC
+    ADC ptl_vy,X
+    STA ptl_vy,X
+
+    JSR random_byte
+    AND #3
+    SEC
+    SBC #2
+    CLC
+    ADC ptl_vz,X
+    STA ptl_vz,X
+
+    ; Add ship velocity (convert new-scale vel to old-scale: (hi<<3)|(lo>>5))
+    ; X axis
+    LDA vel_x_lo
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    STA gm_scratch_0
+    LDA vel_x_hi
+    ASL A
+    ASL A
+    ASL A
+    ORA gm_scratch_0
+    CLC
+    ADC ptl_vx,X
+    STA ptl_vx,X
+
+    ; Y axis
+    LDA vel_y_lo
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    STA gm_scratch_0
+    LDA vel_y_hi
+    ASL A
+    ASL A
+    ASL A
+    ORA gm_scratch_0
+    CLC
+    ADC ptl_vy,X
+    STA ptl_vy,X
+
+    ; Z axis
+    LDA vel_z_lo
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    STA gm_scratch_0
+    LDA vel_z_hi
+    ASL A
+    ASL A
+    ASL A
+    ORA gm_scratch_0
+    CLC
+    ADC ptl_vz,X
+    STA ptl_vz,X
+
+    INC particle_count
 
 @no_thrust:
     ; 3. Drag (all 3 axes)
     LDX #0
     JSR apply_drag
-    LDX #3
+    LDX #2
     JSR apply_drag
-    LDX #6
+    LDX #4
     JSR apply_drag
 
-    ; 4. Position update (24-bit add per axis, X=vel offset, Y=pos offset)
+    ; 4. Position update (16-bit add per axis, X=vel offset, Y=pos offset)
     LDX #0
     LDY #0
 @pos_loop:
     JSR update_pos
     INX
     INX
-    INX
     INY
     INY
-    CPX #9
+    CPX #6
     BCC @pos_loop
 
-    ; 5. Ground clamp: clamp y to zero (position only, keep velocity)
-    LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
-    BPL @above_ground                      ; >= 0 → above ground
+    ; 5. Ground clamp: ship_y < 0 → clamp to 0
+    LDA ship_y_hi
+    BPL @above_ground
     LDA #0
-    STA obj_world_pos+OBJ_WORLD_SHIP+2
-    STA obj_world_pos+OBJ_WORLD_SHIP+3
-    STA pos_y_frac
+    STA ship_y_lo
+    STA ship_y_hi
 @above_ground:
 
-    ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y
-    LDA obj_world_pos+OBJ_WORLD_SHIP+3    ; y_hi
+    ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y ($2800)
+    LDA ship_y_hi
     CMP #MAX_POS_Y_HI
     BCC @below_ceiling
-    BNE @do_ceil_clamp
-    LDA obj_world_pos+OBJ_WORLD_SHIP+2    ; y_lo
-    CMP #MAX_POS_Y_LO
-    BCC @below_ceiling
-@do_ceil_clamp:
     LDA #MAX_POS_Y_LO
-    STA obj_world_pos+OBJ_WORLD_SHIP+2
+    STA ship_y_lo
     LDA #MAX_POS_Y_HI
-    STA obj_world_pos+OBJ_WORLD_SHIP+3
+    STA ship_y_hi
     JSR zero_y_vel
 @below_ceiling:
 
-    ; 6. Camera follow
-    ; cam_x = ship_x
+    ; 5c. Convert new-scale ZP position to old-scale obj_world_pos
+    LDY #0
+@conv:
+    JSR convert_axis
+    INY
+    INY
+    CPY #6
+    BCC @conv
+
+    ; 6. Camera follow (reads old-scale obj_world_pos)
     LDA obj_world_pos+OBJ_WORLD_SHIP+0
     STA cam_x_lo
     LDA obj_world_pos+OBJ_WORLD_SHIP+1
@@ -414,109 +599,117 @@ sincos:
     RTS
 
 ; =====================================================================
-; update_pos — Add velocity to position for one axis
+; update_pos — Add velocity to position for one axis (16-bit ZP)
 ; =====================================================================
-; Input:  X = velocity offset (0=X, 3=Y, 6=Z)
+; Input:  X = velocity offset (0=X, 2=Y, 4=Z)
 ;         Y = position offset (0=X, 2=Y, 4=Z)
 ; Preserves: X, Y
 
 update_pos:
     CLC
-    LDA pos_x_frac,Y
-    ADC vel_x_frac,X
-    STA pos_x_frac,Y
-    LDA obj_world_pos+OBJ_WORLD_SHIP,Y
+    LDA ship_x_lo,Y
     ADC vel_x_lo,X
-    STA obj_world_pos+OBJ_WORLD_SHIP,Y
-    LDA obj_world_pos+OBJ_WORLD_SHIP+1,Y
+    STA ship_x_lo,Y
+    LDA ship_x_hi,Y
     ADC vel_x_hi,X
-    STA obj_world_pos+OBJ_WORLD_SHIP+1,Y
+    STA ship_x_hi,Y
     RTS
 
 ; =====================================================================
-; add_accel — Add signed 8-bit acceleration to 24-bit velocity
+; add_accel — Add signed 8-bit acceleration to 16-bit velocity
 ; =====================================================================
 ; Input:  A = signed acceleration value
-;         X = velocity axis offset (0=X, 3=Y, 6=Z)
+;         X = velocity axis offset (0=X, 2=Y, 4=Z)
 ; Clobbers: A, Y
 
 add_accel:
     TAY                      ; save for sign check
     CLC
-    ADC vel_x_frac,X         ; add to frac byte
-    STA vel_x_frac,X
+    ADC vel_x_lo,X           ; add to lo byte
+    STA vel_x_lo,X
     TYA                      ; N flag = sign of accel, carry preserved
     BPL @aa_pos
-    ; Negative: carry=1 → no change to lo:hi; carry=0 → decrement
+    ; Negative: carry=1 → no borrow; carry=0 → borrow from hi
     BCS @aa_done
-    LDA vel_x_lo,X
-    BNE @aa_dec_lo
     DEC vel_x_hi,X
-@aa_dec_lo:
-    DEC vel_x_lo,X
     RTS
 @aa_pos:
-    ; Positive: carry=0 → no change to lo:hi; carry=1 → increment
+    ; Positive: carry=0 → no overflow; carry=1 → carry into hi
     BCC @aa_done
-    INC vel_x_lo,X
-    BNE @aa_done
     INC vel_x_hi,X
 @aa_done:
     RTS
 
 ; =====================================================================
-; apply_drag — Subtract vel>>6 from 24-bit velocity
+; apply_drag — Subtract vel>>6 from 16-bit velocity
 ; =====================================================================
-; Input:  X = velocity axis offset (0=X, 3=Y, 6=Z)
-; Clobbers: A, gm_scratch_0-2
+; Input:  X = velocity axis offset (0=X, 2=Y, 4=Z)
+; Clobbers: A, Y, gm_scratch_0-1
 
 apply_drag:
-    ; drag_frac = (vel_lo << 2) | (vel_frac >> 6)
-    LDA vel_x_frac,X
-    ASL A
-    ROL A
-    ROL A
-    AND #$03                 ; vel_frac >> 6
-    STA gm_scratch_0
-    LDA vel_x_lo,X
-    ASL A
-    ASL A                    ; vel_lo << 2
-    ORA gm_scratch_0
-    STA gm_scratch_0         ; drag_frac
-
     ; drag_lo = (vel_hi << 2) | (vel_lo >> 6)
     LDA vel_x_lo,X
     ASL A
     ROL A
     ROL A
     AND #$03                 ; vel_lo >> 6
-    STA gm_scratch_1
+    STA gm_scratch_0
     LDA vel_x_hi,X
     TAY                      ; cache vel_hi in Y
     ASL A
     ASL A                    ; vel_hi << 2
-    ORA gm_scratch_1
-    STA gm_scratch_1         ; drag_lo
+    ORA gm_scratch_0
+    STA gm_scratch_0         ; drag_lo
 
-    ; drag_hi = sign of vel_hi (correct for |vel_hi| < 64)
+    ; drag_hi = sign extend vel_hi
     LDA #0
-    STA gm_scratch_2         ; assume positive (drag_hi = 0)
-    TYA                      ; restore vel_hi for sign check
+    STA gm_scratch_1
+    TYA
     BPL @ad_sub
-    DEC gm_scratch_2         ; negative: drag_hi = $FF
+    DEC gm_scratch_1         ; negative: drag_hi = $FF
 @ad_sub:
 
-    ; vel -= drag (24-bit)
-    LDA vel_x_frac,X
+    ; vel -= drag (16-bit)
+    LDA vel_x_lo,X
     SEC
     SBC gm_scratch_0
-    STA vel_x_frac,X
-    LDA vel_x_lo,X
-    SBC gm_scratch_1
     STA vel_x_lo,X
     TYA                      ; restore vel_hi from cache
-    SBC gm_scratch_2
+    SBC gm_scratch_1
     STA vel_x_hi,X
+    RTS
+
+; =====================================================================
+; convert_axis — Convert new-scale ZP position to old-scale obj_world_pos
+; =====================================================================
+; Input:  Y = axis offset (0=X, 2=Y, 4=Z)
+; Output: obj_world_pos+OBJ_WORLD_SHIP lo/hi written
+; Clobbers: A, gm_scratch_0
+
+convert_axis:
+    ; old_lo = (new_hi << 3) | (new_lo >> 5)
+    ; old_hi = new_hi >> 5
+    LDA ship_x_lo,Y
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A                    ; new_lo >> 5
+    STA gm_scratch_0
+    LDA ship_x_hi,Y
+    PHA
+    ASL A
+    ASL A
+    ASL A                    ; new_hi << 3
+    ORA gm_scratch_0
+    STA obj_world_pos+OBJ_WORLD_SHIP,Y
+    PLA
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A                    ; new_hi >> 5
+    STA obj_world_pos+OBJ_WORLD_SHIP+1,Y
     RTS
 
 ; =====================================================================
@@ -529,6 +722,7 @@ apply_drag:
 .include "grid.s"
 .include "object.s"
 .include "clip.s"
+.include "particle.s"
 .include "map.s"
 .include "status.s"
 .include "tables.inc"

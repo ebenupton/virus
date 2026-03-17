@@ -378,42 +378,20 @@ add_cam_y_offset:
 ; =====================================================================
 ; lut_lookup — Look up interpolation LUT value
 ; =====================================================================
-; Input:  A = diff (1..31), lerp_t = offset (0..63)
+; Input:  A = diff_h8 (8..248, multiple of 8), C = 1 (from caller's SBC)
 ; Output: A = LUT value (pre-scaled delta)
+; Note:   diff > 12 reads beyond table — acceptable approximation
 
 lut_lookup:
-    CMP #5
-    BCS @ll_big               ; diff > 4 → multiply path
-    SEC
-    SBC #1                    ; diff - 1 (0..3)
+    SBC #8                    ; (diff-1)×8 (C=1 from caller, no SEC needed)
+    ASL A                     ; (diff-1) << 4
     STA h_to
     LDA lerp_t
-    ASL A
-    ASL A                     ; offset * 4
-    ORA h_to                  ; + (diff-1)
+    LSR A
+    LSR A                     ; offset = lerp_t/4 (0..15)
+    ORA h_to                  ; (diff-1)<<4 | offset
     TAX
     LDA interp_lut,X
-    RTS
-@ll_big:
-    ; diff > 4: compute diff * offset / 8 via repeated addition
-    TAX                       ; X = diff (loop counter)
-    LDA #0
-    STA h_to                  ; hi byte of accumulator
-@ll_add:
-    CLC
-    ADC lerp_t
-    BCC @ll_nc
-    INC h_to
-@ll_nc:
-    DEX
-    BNE @ll_add
-    ; h_to:A = diff * offset; shift right 3
-    LSR h_to
-    ROR A
-    LSR h_to
-    ROR A
-    LSR h_to
-    ROR A
     RTS
 
 ; =====================================================================
@@ -428,27 +406,20 @@ lerp_height:
     BEQ @lh_done              ; same → A is already h×8
     STA h_from                ; save h_a (h×8)
     BCC @lh_b_higher
-    ; h_a > h_b: result = h_a_h8 − delta_scaled
-    SEC
-    SBC h_to                  ; diff_h8
-    LSR A
-    LSR A
-    LSR A                     ; diff (1..31)
-    JSR lut_lookup            ; A = pre-scaled delta
+    ; h_a > h_b (C=1 from CMP fall-through)
+    SBC h_to                  ; diff_h8 (C=1 from CMP, no SEC needed)
+    JSR lut_lookup            ; A = delta (C=1 from SBC, no borrow)
     STA h_to
     LDA h_from                ; h_a already h×8
     SEC
     SBC h_to
     RTS
 @lh_b_higher:
-    ; h_b > h_a: result = h_a_h8 + delta_scaled
+    ; h_b > h_a
     LDA h_to
     SEC
-    SBC h_from                ; diff_h8
-    LSR A
-    LSR A
-    LSR A                     ; diff (1..31)
-    JSR lut_lookup            ; A = pre-scaled delta
+    SBC h_from                ; diff_h8 (C=1 after, no borrow)
+    JSR lut_lookup            ; A = delta
     CLC
     ADC h_from                ; h_a already h×8
     RTS

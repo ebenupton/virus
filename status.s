@@ -34,7 +34,7 @@ score_drawn: .byte $FF, $FF, $FF, $FF   ; buffer 0
 init_status:
     ; Clear char row 0 of both buffers (512 bytes each)
     LDX #0
-    LDA #0
+    TXA
 @clear_row0:
     STA $3000,X
     STA $3100,X

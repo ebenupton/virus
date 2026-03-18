@@ -129,7 +129,7 @@ clr_got_buf:
 
 clear_buf0:
     LDX #0
-    LDA #0
+    TXA
 clr0_loop:
     ; Skip char row 0 ($3000-$31FF) — preserved for status bar
     STA $3200,X
@@ -179,8 +179,7 @@ clr_do_buf1:
     STA clr1_bne + 1         ; SMC: patch buf1 BNE
 
 clear_buf1:
-    LDX #0
-    LDA #0
+    TXA                       ; X=0 from clr_do_buf1 path
 clr1_loop:
     ; Skip char row 0 ($5800-$59FF) — preserved for status bar
     STA $5A00,X

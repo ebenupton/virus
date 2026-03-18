@@ -39,16 +39,15 @@ CLIP_FAR_HI = (Z_FAR_BOUND >> 8) & $FF
 ; Clobbers: A, X, Y
 
 clip_swap:
-    LDX #0
+    LDX #5
 @loop:
     LDA clip_x0,X
     LDY clip_x1,X
     STA clip_x1,X
     TYA
     STA clip_x0,X
-    INX
-    CPX #6
-    BCC @loop
+    DEX
+    BPL @loop
     RTS
 
 ; =====================================================================

@@ -98,18 +98,7 @@ gm_scratch_4    = ZP_SHARED + 5
 
 entry:
     SEI
-
-    ; Zero status bar rows that clear_screen skips (real hardware init)
-    LDY #0
-    TYA
-@clr_status:
-    STA $3000,Y
-    STA $3100,Y
-    STA $5800,Y
-    STA $5900,Y
-    INY
-    BNE @clr_status
-
+    ; (status rows zeroed by init_status below, no separate clear needed)
     JSR init_screen
     JSR init_status
     JSR draw_map              ; blit minimap to buf1 (raster_page=$58 from init)
@@ -137,22 +126,25 @@ entry:
     DEX
     BPL @clr_vel
 
-    ; Initialize ship position in new scale
-    ; X=4.0 → $8000, Y=31/32 → $1F00, Z=4.0 → $8000
+    ; Initialize ship position + particles + cam_x_lo (share A=0 from vel clear)
     STA ship_x_lo           ; A=0
     STA ship_y_lo
     STA ship_z_lo
+    STA particle_count
+    STA ptl_clr_count
+    STA ptl_clr_count+1
+    STA cam_x_lo
     LDA #$80
     STA ship_x_hi
     STA ship_z_hi
     LDA #$1F
     STA ship_y_hi
-
-    JSR init_particles
+    LDA #$42
+    STA particle_rng_lo
+    LDA #$7E
+    STA particle_rng_hi
 
     ; Initialize camera: follow ship at (4, 0, 4)
-    LDA #0
-    STA cam_x_lo
     LDA #$04
     STA cam_x_hi
     LDA #<($0400 - CAM_Z_BEHIND)  ; cam_z = ship_z - CAM_Z_BEHIND
@@ -285,11 +277,40 @@ scan_key_add:
 @ska_done:
     RTS
 
-; zero_y_vel — Zero Y velocity (for ground/ceiling clamp)
-zero_y_vel:
-    LDA #0
-    STA vel_y_hi
-    STA vel_y_lo
+; =====================================================================
+; random_adj — Random value in [-2, +1], carry clear for subsequent ADC
+; =====================================================================
+; Output: A = random[-2..+1], C=0
+; Preserves: X, Y
+
+random_adj:
+    JSR random_byte
+    AND #3
+    SEC
+    SBC #2
+    CLC
+    RTS
+
+; =====================================================================
+; vel_to_old_scale — Convert 16-bit new-scale velocity to 8-bit old-scale
+; =====================================================================
+; Input:  Y = axis offset (0=X, 2=Y, 4=Z) into vel_x_hi/vel_x_lo
+; Output: A = (vel_hi << 3) | (vel_lo >> 5)
+; Preserves: X
+
+vel_to_old_scale:
+    LDA vel_x_lo,Y
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    STA gm_scratch_0
+    LDA vel_x_hi,Y
+    ASL A
+    ASL A
+    ASL A
+    ORA gm_scratch_0
     RTS
 
 ; =====================================================================
@@ -414,79 +435,31 @@ update_physics:
     STA ptl_vz,X
 
     ; Random variation ([-2, +1] on each axis)
-    ; random_byte preserves X, Y
-    JSR random_byte
-    AND #3
-    SEC
-    SBC #2
-    CLC
+    JSR random_adj
     ADC ptl_vx,X
     STA ptl_vx,X
-
-    JSR random_byte
-    AND #3
-    SEC
-    SBC #2
-    CLC
+    JSR random_adj
     ADC ptl_vy,X
     STA ptl_vy,X
-
-    JSR random_byte
-    AND #3
-    SEC
-    SBC #2
-    CLC
+    JSR random_adj
     ADC ptl_vz,X
     STA ptl_vz,X
 
     ; Add ship velocity (convert new-scale vel to old-scale: (hi<<3)|(lo>>5))
-    ; X axis
-    LDA vel_x_lo
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    STA gm_scratch_0
-    LDA vel_x_hi
-    ASL A
-    ASL A
-    ASL A
-    ORA gm_scratch_0
+    LDY #0
+    JSR vel_to_old_scale
     CLC
     ADC ptl_vx,X
     STA ptl_vx,X
 
-    ; Y axis
-    LDA vel_y_lo
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    STA gm_scratch_0
-    LDA vel_y_hi
-    ASL A
-    ASL A
-    ASL A
-    ORA gm_scratch_0
+    LDY #2
+    JSR vel_to_old_scale
     CLC
     ADC ptl_vy,X
     STA ptl_vy,X
 
-    ; Z axis
-    LDA vel_z_lo
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    STA gm_scratch_0
-    LDA vel_z_hi
-    ASL A
-    ASL A
-    ASL A
-    ORA gm_scratch_0
+    LDY #4
+    JSR vel_to_old_scale
     CLC
     ADC ptl_vz,X
     STA ptl_vz,X
@@ -494,23 +467,26 @@ update_physics:
     INC particle_count
 
 @no_thrust:
-    ; 3. Drag (all 3 axes)
-    LDX #0
-    JSR apply_drag
-    LDX #2
-    JSR apply_drag
+    ; 3. Drag (all 3 axes, reverse order — independent)
     LDX #4
+@drag_loop:
     JSR apply_drag
+    DEX
+    DEX
+    BPL @drag_loop
 
-    ; 4. Position update (16-bit add per axis, X=vel offset, Y=pos offset)
+    ; 4. Position update (16-bit add per axis, all X-indexed)
     LDX #0
-    LDY #0
 @pos_loop:
-    JSR update_pos
+    CLC
+    LDA ship_x_lo,X
+    ADC vel_x_lo,X
+    STA ship_x_lo,X
+    LDA ship_x_hi,X
+    ADC vel_x_hi,X
+    STA ship_x_hi,X
     INX
     INX
-    INY
-    INY
     CPX #6
     BCC @pos_loop
 
@@ -520,26 +496,48 @@ update_physics:
     LDA #0
     STA ship_y_lo
     STA ship_y_hi
+    BEQ @below_ceiling        ; A=0 from LDA, always taken
 @above_ground:
 
     ; 5b. Ceiling clamp: cap ship_y at MAX_POS_Y ($2800)
-    LDA ship_y_hi
+    ; A = ship_y_hi (from initial LDA, no reload needed)
     CMP #MAX_POS_Y_HI
     BCC @below_ceiling
-    LDA #MAX_POS_Y_LO
+    LDA #0                    ; = MAX_POS_Y_LO
     STA ship_y_lo
+    STA vel_y_hi              ; inlined zero_y_vel
+    STA vel_y_lo
     LDA #MAX_POS_Y_HI
     STA ship_y_hi
-    JSR zero_y_vel
 @below_ceiling:
 
     ; 5c. Convert new-scale ZP position to old-scale obj_world_pos
-    LDY #0
+    LDX #0
 @conv:
-    JSR convert_axis
-    INY
-    INY
-    CPY #6
+    LDA ship_x_lo,X
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A                    ; new_lo >> 5
+    STA gm_scratch_0
+    LDA ship_x_hi,X
+    PHA
+    ASL A
+    ASL A
+    ASL A                    ; new_hi << 3
+    ORA gm_scratch_0
+    STA obj_world_pos+OBJ_WORLD_SHIP,X
+    PLA
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    LSR A                    ; new_hi >> 5
+    STA obj_world_pos+OBJ_WORLD_SHIP+1,X
+    INX
+    INX
+    CPX #6
     BCC @conv
 
     ; 6. Camera follow (reads old-scale obj_world_pos)
@@ -587,33 +585,15 @@ smul_shr7:
 ; Clobbers: none besides A, X
 
 sincos:
-    LDA sin_table,X
-    TAY                     ; Y = sin (3 cycles faster than PHA/PLA)
     TXA
     CLC
     ADC #64
-    TAX
-    LDA sin_table,X         ; cos
-    TAX                     ; X = cos
-    TYA                     ; A = sin
+    TAY                     ; Y = cos index
+    LDA sin_table,X         ; A = sin(angle)
+    LDX sin_table,Y         ; X = cos(angle)
     RTS
 
-; =====================================================================
-; update_pos — Add velocity to position for one axis (16-bit ZP)
-; =====================================================================
-; Input:  X = velocity offset (0=X, 2=Y, 4=Z)
-;         Y = position offset (0=X, 2=Y, 4=Z)
-; Preserves: X, Y
-
-update_pos:
-    CLC
-    LDA ship_x_lo,Y
-    ADC vel_x_lo,X
-    STA ship_x_lo,Y
-    LDA ship_x_hi,Y
-    ADC vel_x_hi,X
-    STA ship_x_hi,Y
-    RTS
+; (update_pos inlined into position loop)
 
 ; =====================================================================
 ; add_accel — Add signed 8-bit acceleration to 16-bit velocity
@@ -661,56 +641,21 @@ apply_drag:
     ORA gm_scratch_0
     STA gm_scratch_0         ; drag_lo
 
-    ; drag_hi = sign extend vel_hi
-    LDA #0
-    STA gm_scratch_1
-    TYA
-    BPL @ad_sub
-    DEC gm_scratch_1         ; negative: drag_hi = $FF
-@ad_sub:
-
-    ; vel -= drag (16-bit)
+    ; vel -= drag (16-bit); drag_hi = 0 (vel>=0) or $FF (vel<0)
     LDA vel_x_lo,X
     SEC
     SBC gm_scratch_0
     STA vel_x_lo,X
-    TYA                      ; restore vel_hi from cache
-    SBC gm_scratch_1
+    TYA                      ; A = vel_hi (carry preserved)
+    BPL @ad_pos
+    SBC #$FF                 ; negative: A = vel_hi - $FF - borrow = vel_hi + C
+    .byte $2C                ; BIT abs — skip next 2 bytes (SBC #0)
+@ad_pos:
+    SBC #0                   ; positive: A = vel_hi - 0 - borrow
     STA vel_x_hi,X
     RTS
 
-; =====================================================================
-; convert_axis — Convert new-scale ZP position to old-scale obj_world_pos
-; =====================================================================
-; Input:  Y = axis offset (0=X, 2=Y, 4=Z)
-; Output: obj_world_pos+OBJ_WORLD_SHIP lo/hi written
-; Clobbers: A, gm_scratch_0
-
-convert_axis:
-    ; old_lo = (new_hi << 3) | (new_lo >> 5)
-    ; old_hi = new_hi >> 5
-    LDA ship_x_lo,Y
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                    ; new_lo >> 5
-    STA gm_scratch_0
-    LDA ship_x_hi,Y
-    PHA
-    ASL A
-    ASL A
-    ASL A                    ; new_hi << 3
-    ORA gm_scratch_0
-    STA obj_world_pos+OBJ_WORLD_SHIP,Y
-    PLA
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    LSR A                    ; new_hi >> 5
-    STA obj_world_pos+OBJ_WORLD_SHIP+1,Y
-    RTS
+; (convert_axis inlined into conversion loop)
 
 ; =====================================================================
 ; Included modules

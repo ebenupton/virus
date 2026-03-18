@@ -92,6 +92,7 @@ umul8x8:
     STA math_res_lo
     LDA sqr_hi,X
     SBC sqr_hi,Y
+@u_done:
     STA math_res_hi          ; A = math_res_hi
     RTS
 
@@ -102,8 +103,7 @@ umul8x8:
     STA math_res_lo
     LDA sqr2_hi,X
     SBC sqr_hi,Y
-    STA math_res_hi          ; A = math_res_hi
-    RTS
+    BCS @u_done               ; C=1 always; share STA+RTS
 
 ; =====================================================================
 ; smul8x8 — Signed 8x8 -> 16-bit multiply (quarter-square)
@@ -142,7 +142,7 @@ smul8x8:
     STA math_res_lo
     LDA sqr2_hi,X
     SBC sqr_hi,Y
-    JMP @sign_correct
+    BCS @sign_correct         ; C=1 always (quarter-square never borrows)
 
 @no_overflow:
     SEC

@@ -309,6 +309,7 @@ draw_grid:
     STA raster_x0
     LDA raster_y1
     STA raster_y0
+@v_seg_tail:
     DEC seg_count
     BNE @v_seg
     DEC n_cols
@@ -320,11 +321,7 @@ draw_grid:
     LDA raster_y1
     STA raster_y0
     JSR init_base
-    DEC seg_count
-    BNE @v_seg
-    DEC n_cols
-    BPL @v_col_loop
-    RTS
+    JMP @v_seg_tail
 
 
 ; =====================================================================
@@ -408,6 +405,7 @@ lerp_height:
     LDA h_from                ; h_a already h×8
     SEC
     SBC h_to
+@lh_done:
     RTS
 @lh_b_higher:
     ; h_b > h_a
@@ -417,8 +415,6 @@ lerp_height:
     JSR lut_lookup            ; A = delta
     CLC
     ADC h_from                ; h_a already h×8
-    RTS
-@lh_done:
     RTS
 
 ; =====================================================================

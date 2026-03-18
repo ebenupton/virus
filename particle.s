@@ -33,20 +33,7 @@ ptl_clr_a0_hi:  .res 32   ; pixel byte addr hi
 ptl_clr_mask:   .res 32   ; AND mask ($D5 left / $EA right)
 ptl_clr_count:  .res 2    ; [0]=buf0 drawn count, [1]=buf1 drawn count
 
-; =====================================================================
-; init_particles — Zero particle count, seed RNG
-; =====================================================================
-
-init_particles:
-    LDA #0
-    STA particle_count
-    STA ptl_clr_count
-    STA ptl_clr_count+1
-    LDA #$42
-    STA particle_rng_lo
-    LDA #$7E
-    STA particle_rng_hi
-    RTS
+; (init_particles inlined into game.s entry)
 
 ; =====================================================================
 ; random_byte — 16-bit Galois LFSR, returns random byte in A
@@ -120,54 +107,33 @@ update_particles:
 
     ; Y axis: sign-extend ptl_vy and add to ptl_y_lo:ptl_y_hi
     LDA ptl_vy,X
-    BPL @vy_pos
     CLC
     ADC ptl_y_lo,X
     STA ptl_y_lo,X
-    LDA ptl_y_hi,X
-    ADC #$FF
-    STA ptl_y_hi,X
-    JMP @vy_done
-@vy_pos:
-    CLC
-    ADC ptl_y_lo,X
-    STA ptl_y_lo,X
+    LDY ptl_vy,X           ; reload sign (LDY preserves C)
+    BMI @vy_neg
     BCC @vy_done
     INC ptl_y_hi,X
 @vy_done:
 
     ; X axis: sign-extend ptl_vx and add to ptl_x_lo:ptl_x_hi
     LDA ptl_vx,X
-    BPL @vx_pos
     CLC
     ADC ptl_x_lo,X
     STA ptl_x_lo,X
-    LDA ptl_x_hi,X
-    ADC #$FF
-    STA ptl_x_hi,X
-    JMP @vx_done
-@vx_pos:
-    CLC
-    ADC ptl_x_lo,X
-    STA ptl_x_lo,X
+    LDY ptl_vx,X
+    BMI @vx_neg
     BCC @vx_done
     INC ptl_x_hi,X
 @vx_done:
 
     ; Z axis: sign-extend ptl_vz and add to ptl_z_lo:ptl_z_hi
     LDA ptl_vz,X
-    BPL @vz_pos
     CLC
     ADC ptl_z_lo,X
     STA ptl_z_lo,X
-    LDA ptl_z_hi,X
-    ADC #$FF
-    STA ptl_z_hi,X
-    JMP @vz_done
-@vz_pos:
-    CLC
-    ADC ptl_z_lo,X
-    STA ptl_z_lo,X
+    LDY ptl_vz,X
+    BMI @vz_neg
     BCC @vz_done
     INC ptl_z_hi,X
 @vz_done:
@@ -176,6 +142,23 @@ update_particles:
     BPL @loop
 @done:
     RTS
+
+    ; Outlined negative velocity handlers (C preserved from ADC above)
+@vy_neg:
+    LDA ptl_y_hi,X
+    ADC #$FF
+    STA ptl_y_hi,X
+    JMP @vy_done
+@vx_neg:
+    LDA ptl_x_hi,X
+    ADC #$FF
+    STA ptl_x_hi,X
+    JMP @vx_done
+@vz_neg:
+    LDA ptl_z_hi,X
+    ADC #$FF
+    STA ptl_z_hi,X
+    JMP @vz_done
 
 @gc:
     ; Swap-and-pop: copy last particle to slot X, decrement count
@@ -376,12 +359,9 @@ draw_particles:
     ; Store drawn count = ptl_draw_count - buf_off
     LDA ptl_draw_count
     LDX back_buf_idx
-    BEQ @sub0
+    BEQ @store_count          ; buf0: count = ptl_draw_count, X=0
     SEC
-    SBC #16
-    JMP @store_count
-@sub0:
-    ; buf_off was 0, A already = count
+    SBC #16                   ; buf1: count = ptl_draw_count - 16
 @store_count:
     STA ptl_clr_count,X
     RTS

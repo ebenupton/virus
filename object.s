@@ -285,20 +285,19 @@ draw_object:
     LDA (obj_ptr),Y             ; color
     STA obj_color
 
-    ; Init bounding box to empty
-    LDA #0
-    STA obj_bb_max_sy
-    STA vtx_idx              ; vtx_idx = 0
-    LDA #160
-    STA obj_bb_min_sy
-
-    ; Clear per-vertex outcode array (A clobbered, reload 0 not needed)
+    ; Clear per-vertex outcode array first (leaves A=0 for bb init)
     LDX #MAX_OBJ_VERTICES-1
     LDA #0
 @clear_clip:
     STA obj_vtx_clip,X
     DEX
     BPL @clear_clip
+
+    ; Init bounding box to empty (A=0 from loop)
+    STA obj_bb_max_sy
+    STA vtx_idx              ; vtx_idx = 0
+    LDA #160
+    STA obj_bb_min_sy
 
 @proj_loop:
     LDA vtx_idx

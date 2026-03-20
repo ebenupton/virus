@@ -81,14 +81,8 @@ obj_vtx_clip:   .res MAX_OBJ_VERTICES   ; per-vertex 4-bit outcode
 bit_mask_table:
     .byte $01, $02, $04, $08, $10, $20, $40, $80
 
-; ── World positions (8.8 fixed-point), packed for indexed access ──
-OBJ_WORLD_ENEMY   = 0
-OBJ_WORLD_SHIP    = 6
-obj_world_pos:
-    ; Enemy: X=4.0, Y=1.0, Z=2.0
-    .byte $00, $04, $00, $01, $00, $02
-    ; Ship: X=4.0, Y=31/32, Z=4.0  (on plateau, height 31)
-    .byte $00, $04, $F8, $00, $00, $04
+; ── Object position staging area (written before each draw_object call) ──
+obj_pos:  .res 6                ; x_lo, x_hi, y_lo, y_hi, z_lo, z_hi
 
 ; ── Object: Octagonal bipyramid (10 vtx, 24 edges, 16 faces) ──
 ;
@@ -207,39 +201,53 @@ obj_ship:
     .byte 3, 1,2,5,     1,8,6             ; F4: right triangle
     .byte $FF                              ; sentinel
 
+obj_debris:
+    ; Header: 3 vertices, 3 edges, clippable, white
+    .byte 3, 3, $00, $15
+    ; Vertices (x, y, z) — 50% larger than base triangle
+    .byte   0,   0,  21         ; v0: front
+    .byte <(-18), 0, <(-11)     ; v1: back-left
+    .byte  18,   0, <(-11)      ; v2: back-right
+    ; Edges (v_from, v_to, color)
+    .byte 0, 1, $15              ; e0: white
+    .byte 1, 2, $15              ; e1: white
+    .byte 2, 0, $15              ; e2: white
+    ; Faces: two-sided (opposite winding, same edges)
+    .byte 3, 0, 1, 2,  0, 1, 2  ; F0: front
+    .byte 3, 0, 2, 1,  2, 1, 0  ; F1: back
+    .byte $FF                    ; sentinel
+
 ; ── Object: Tree (single triangle, 60° rotated so flat edge faces camera) ──
 ; =====================================================================
-; setup_obj_view — Compute view-space coords from packed world position
+; setup_obj_view — Compute view-space coords from obj_pos
 ; =====================================================================
 ;
-; Input:  Y = offset into obj_world_pos (OBJ_WORLD_ENEMY)
+; Input:  obj_pos populated with 6-byte world position
 ; Output: obj_view_x/y/z set
-;         On return: N set if view_z < 0 (behind camera)
-;                    N clear, Z set if view_z == 0 (at camera)
-;                    N clear, Z clear if view_z > 0 (visible)
+;         C=0 if visible, C=1 if behind camera
 
 setup_obj_view:
-    LDA obj_world_pos+0,Y
+    LDA obj_pos+0
     SEC
     SBC cam_x_lo
     STA obj_view_x
-    LDA obj_world_pos+1,Y
+    LDA obj_pos+1
     SBC cam_x_hi
     STA obj_view_x+1
 
-    LDA #CAM_HEIGHT_LO
+    LDA cam_y_lo
     SEC
-    SBC obj_world_pos+2,Y
+    SBC obj_pos+2
     STA obj_view_y
-    LDA #CAM_HEIGHT_HI
-    SBC obj_world_pos+3,Y
+    LDA cam_y_hi
+    SBC obj_pos+3
     STA obj_view_y+1
 
-    LDA obj_world_pos+4,Y
+    LDA obj_pos+4
     SEC
     SBC cam_z_lo
     STA obj_view_z
-    LDA obj_world_pos+5,Y
+    LDA obj_pos+5
     SBC cam_z_hi
     STA obj_view_z+1
     BMI @skip
@@ -564,10 +572,15 @@ draw_object:
     LDA cross_lo
     SEC
     SBC math_res_lo
+    TAY                       ; Y = cross_lo result
     LDA cross_hi
     SBC math_res_hi
-    ; A = cross_hi; front-facing when cross < 0
-    BPL @skip_face
+    ; front-facing when cross < 0, or cross == 0
+    BMI @face_visible
+    BNE @skip_face            ; cross_hi > 0 → back-facing
+    TYA                       ; cross_hi == 0: check lo
+    BNE @skip_face            ; cross_lo != 0 → small positive → back-facing
+@face_visible:
 
     ; ── Front-facing: restore face data from temps ──
     PLA                         ; n from stack

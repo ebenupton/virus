@@ -18,7 +18,7 @@ obj_bb_min_sy       = ZP_OBJECT + 10   ; bounding box min screen Y
 obj_bb_max_sy       = ZP_OBJECT + 11   ; bounding box max screen Y
 
 ; ── Constants ───────────────────────────────────────────────────────
-MAX_OBJ_VERTICES    = 24
-MAX_OBJ_EDGES       = 32
+MAX_OBJ_VERTICES    = 12
+MAX_OBJ_EDGES       = 24
 
 .endif

@@ -115,7 +115,7 @@ draw_grid:
     ; --- Combined sub_x + base_x ---
     ; Reading ship_x_lo once: extract sub_x (low 6 bits), then add
     ; K = $20 - HALF_COLS*$40 and extract bits 10:6 for base_x.
-    LDA obj_world_pos+OBJ_WORLD_SHIP+0   ; x lo
+    LDA ship_pos+0   ; x lo
     TAX
     AND #$3F
     STA sub_x
@@ -123,7 +123,7 @@ draw_grid:
     CLC
     ADC #<($20 - HALF_COLS * $40)         ; + $20
     STA scratch_0
-    LDA obj_world_pos+OBJ_WORLD_SHIP+1   ; x hi
+    LDA ship_pos+1   ; x hi
     ADC #>($20 - HALF_COLS * $40)         ; + $FF + carry
     ASL scratch_0
     ROL A
@@ -135,7 +135,7 @@ draw_grid:
     ; --- Combined sub_z + base_z + z_cam ---
     ; Reading ship_z_lo once: extract sub_z, compute base_z from
     ; bits 10:6, then z_cam from (biased_lo & $3F) = (sub_z ^ $20).
-    LDA obj_world_pos+OBJ_WORLD_SHIP+4   ; z lo
+    LDA ship_pos+4   ; z lo
     TAX
     AND #$3F
     STA sub_z
@@ -144,7 +144,7 @@ draw_grid:
     ADC #<($20 - (HALF_ROWS - 1) * $40)  ; + $A0
     TAX                                    ; save biased lo
     STA scratch_0
-    LDA obj_world_pos+OBJ_WORLD_SHIP+5   ; z hi
+    LDA ship_pos+5   ; z hi
     ADC #>($20 - (HALF_ROWS - 1) * $40)  ; + $FF + carry
     ASL scratch_0
     ROL A
@@ -350,12 +350,11 @@ add_cam_y_offset:
     ADC #16
     LDX cam_y_hi
     BEQ @aco_borrow
+@aco_loop:
     CLC
     ADC recip_val
     DEX
-    BEQ @aco_borrow
-    CLC
-    ADC recip_val
+    BNE @aco_loop
 @aco_borrow:
     LDX cam_y_lo
     CPX seg_count             ; was cam_y_lo >= h*8?
@@ -523,7 +522,18 @@ lookup_and_color:
     LDX z_interp_offset
     BEQ @lc_done
     JSR z_interp_vertex       ; A = z-interp h*8
-    STA vtx_cell            ; update for edge interp
+    STA vtx_cell              ; update for edge interp
+    ; --- Z colour override: h_color only (h-chains cross Z boundary) ---
+    LDA h_color
+    CMP #$15
+    BNE @lc_z_ret             ; only override white (plateau edge)
+    LDY hmap_col
+    LDA (interp_z_ptr),Y     ; Z-adjacent cell (inner row, same col)
+    JSR resolve_inner_colors  ; h_to = inner_h
+    LDA h_to
+    STA h_color
+@lc_z_ret:
+    LDA vtx_cell              ; restore A = z-interp h*8
 @lc_done:
     RTS
 
@@ -544,6 +554,59 @@ lookup_and_color:
     STA h_color
     PLA
     BNE @lc_z                ; unconditional (A=$F8)
+
+; =====================================================================
+; override_edge_color — X-adjacent v_color override for edge vertices
+; =====================================================================
+; At left/right edge vertices, override v_color only (v-chains cross
+; the X boundary; h-chains run along it and keep their colour).
+;
+; Input:  Y = inner heightmap column (preserved for interp_height)
+; Effect: May modify v_color
+; Scratch: h_from, h_to
+
+override_edge_color:
+    LDA v_color
+    CMP #$15
+    BNE @oec_done             ; only override white (plateau edge)
+    LDA (hmap_ptr),Y          ; X-adjacent inner cell
+    JSR resolve_inner_colors  ; h_from = inner_v
+    LDA h_from
+    STA v_color
+@oec_done:
+    RTS
+
+; =====================================================================
+; resolve_inner_colors — Resolve a cell byte into v/h colour indices
+; =====================================================================
+; Input:  A = heightmap cell byte
+; Output: h_from = inner_v, h_to = inner_h
+; Preserves: Y
+
+resolve_inner_colors:
+    TAX
+    AND #$07                  ; color bits (0-7)
+    STA h_from                ; temp: colour index
+    TXA
+    AND #$F8                  ; h*8
+    BEQ @ric_lookup           ; sea: index = color_bits + 0
+    CMP #$F8
+    LDA h_from
+    BCS @ric_plat
+    ; land: C=0 from CMP (h*8 < $F8)
+    ADC #32                   ; land tables at offset 32
+    BNE @ric_set              ; always taken (32..39)
+@ric_plat:
+    ADC #15                   ; C=1: plat tables at offset 16
+@ric_set:
+    STA h_from
+@ric_lookup:
+    LDX h_from
+    LDA v_color_sea,X         ; inner_v (unified table offset)
+    STA h_from                ; inner_v
+    LDA h_color_sea,X         ; inner_h
+    STA h_to                  ; inner_h
+    RTS
 
 ; =====================================================================
 ; do_middle_vertex — Lookup + project middle vertex (entry point 1)
@@ -690,6 +753,7 @@ do_row_body:
     TYA
     AND #$1F
     TAY                       ; Y = inner column
+    JSR override_edge_color
     LDA interp_offset_left
     JSR interp_height         ; sets vtx_cell+1
     LDA #64
@@ -714,6 +778,7 @@ do_row_body:
     TYA
     AND #$1F
     TAY                       ; Y = inner column
+    JSR override_edge_color
     LDA interp_offset_right
     JSR interp_height         ; sets vtx_cell+1
     LDA edge_offset

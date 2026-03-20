@@ -95,12 +95,16 @@ clear_particles:
 
 update_particles:
     LDX particle_count
-    BEQ @done
+    BNE @has_ptl
+    RTS
+@has_ptl:
     DEX
 @loop:
     ; Timer check: GC when reaches 0
     DEC ptl_timer,X
-    BEQ @gc
+    BNE @ptl_alive
+    JMP @gc
+@ptl_alive:
 
     ; Gravity: decrease upward velocity
     DEC ptl_vy,X
@@ -138,8 +142,25 @@ update_particles:
     INC ptl_z_hi,X
 @vz_done:
 
+    ; GC: remove if particle Y <= terrain height (clean 16-bit compare)
+    ; Terrain height = $00:h*8 (hi byte always 0, lo byte = h*8)
+    ; Particle Y = ptl_y_hi:ptl_y_lo
+    LDA ptl_y_hi,X
+    BMI @gc                   ; negative → below any terrain
+    BNE @ptl_next             ; y_hi > 0 → above terrain (terrain hi is always 0)
+    ; y_hi == 0 == terrain_hi: compare lo bytes
+    LDA ptl_x_hi,X
+    STA gm_scratch_2
+    LDA ptl_z_hi,X
+    STA gm_scratch_3
+    JSR get_terrain_h8        ; A = h*8
+    CMP ptl_y_lo,X            ; h*8 vs y_lo
+    BCS @gc                   ; h*8 >= y_lo → at or below terrain
+
+@ptl_next:
     DEX
-    BPL @loop
+    BMI @done
+    JMP @loop
 @done:
     RTS
 
@@ -230,12 +251,12 @@ draw_particles:
     SBC cam_x_hi
     STA obj_view_x+1
 
-    ; view_y = CAM_HEIGHT - ptl_y
-    LDA #CAM_HEIGHT_LO
+    ; view_y = cam_y - ptl_y
+    LDA cam_y_lo
     SEC
     SBC ptl_y_lo,X
     STA obj_view_y
-    LDA #CAM_HEIGHT_HI
+    LDA cam_y_hi
     SBC ptl_y_hi,X
     STA obj_view_y+1
 

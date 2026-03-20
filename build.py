@@ -288,14 +288,14 @@ def build_game():
     boot_size = assemble("boot.s", "boot.bin", "boot.o",
                          linker_cfg="boot_linker.cfg")
 
-    # Assemble game
-    game_size = assemble("game.s", "game.bin", "game.o",
-                         extra_flags=["-DUNROLL_SHALLOW=1"])
+    # Assemble game for SSD (no debug)
+    game_ssd_size = assemble("game.s", "game_ssd.bin", "game.o",
+                             extra_flags=["-DUNROLL_SHALLOW=1"])
 
-    # Concatenate: boot.bin + game.bin → game_boot.bin
+    # Concatenate: boot.bin + game_ssd.bin → game_boot.bin
     with open("boot.bin", "rb") as bf:
         boot_data = bf.read()
-    with open("game.bin", "rb") as gf:
+    with open("game_ssd.bin", "rb") as gf:
         game_data = gf.read()
     with open("game_boot.bin", "wb") as out:
         out.write(boot_data)
@@ -306,6 +306,10 @@ def build_game():
     # Create bootable SSD with load=$3000, exec=$3000
     create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
                load_addr=0x3000, exec_addr=0x3000)
+
+    # Assemble game for emulator (with debug)
+    game_size = assemble("game.s", "game.bin", "game.o",
+                         extra_flags=["-DUNROLL_SHALLOW=1", "-DEMU_DEBUG=1"])
 
     compile_emu()
     print(f"\nDone!  Run: ./emu game.bin")

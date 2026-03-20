@@ -132,6 +132,9 @@ static uint8_t mem_read(struct w65c02s_cpu *cpu, uint16_t addr)
         return (elapsed >> ((addr - 0xFE20) * 8)) & 0xFF;
     }
 
+    case 0xFE34:
+        return (uint8_t)(profile_frame_count & 0xFF);
+
     case 0xFE4D:
         return vsync_flag;
 
@@ -682,8 +685,8 @@ int main(int argc, char *argv[])
     }
 
     /* Load binary */
-    uint16_t load_addr = boot_mode ? 0x3000 : 0x0400;
-    long max_size = boot_mode ? 0x5000 : 0x2C00;
+    uint16_t load_addr = boot_mode ? 0x3000 : 0x032B;
+    long max_size = boot_mode ? 0x5000 : 0x2CD5;
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);
@@ -1010,13 +1013,13 @@ int main(int argc, char *argv[])
                         call_depth--;
                 }
             }
-            profile_frame_count++;
         } else {
             w65c02s_run_cycles(cpu, CYCLES_PER_FRAME);
         }
 
-        /* Set vsync flag */
+        /* Set vsync flag and increment frame counter */
         vsync_flag |= 0x02;
+        profile_frame_count++;
 
         /* Dump frame if requested */
         if (dump_dir)

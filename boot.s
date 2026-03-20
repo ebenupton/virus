@@ -1,15 +1,15 @@
 ; boot.s — Bootloader for BBC Micro real hardware
 ;
 ; Loads at $3000 via DFS. Sets up CRTC (MODE 2), Video ULA, System VIA,
-; copies game code to $0600, zeroes ZP and BSS, then enters the game.
+; copies game code to $02BD, zeroes ZP and BSS, then enters the game.
 ;
 ; build.py concatenates game.bin after boot_payload to form game_boot.bin.
 
 .setcpu "6502"
 .segment "BOOT"
 
-; Number of pages to copy: CODE segment $0600-$2FFF = $2A00 = 42 pages
-CODE_PAGES = $2A
+; Number of pages to copy: CODE+HEIGHTMAP = $02BD-$2FFF = $2D43 bytes ≈ 46 pages
+CODE_PAGES = $2E
 
 boot_entry:
     SEI
@@ -50,17 +50,34 @@ boot_entry:
     STA $FE4E               ; IER: disable all VIA interrupts
     STA $FE4D               ; IFR: clear all pending flags
 
-    ; ── Copy game code to $0600 ──
+    ; ── Zero ZP ($00-$FF), stack ($0100-$01FF), and BSS ($0200-$02BC) ──
+    LDA #0
+    TAX
+@zp:
+    STA $00,X
+    STA $0100,X
+    INX
+    BNE @zp
+
+    ; BSS: $0200-$02BC (GRIDBUF only, 189 bytes)
+    ; A=0, X=0 from ZP loop
+@bss0:
+    STA $0200,X              ; $0200-$02BC
+    INX
+    CPX #$BD
+    BCC @bss0
+
+    ; ── Copy game code ──
     ; Source: boot_payload (appended after bootloader in memory)
-    ; Dest:   $0600
-    ; Size:   CODE_PAGES pages (42 × 256 = $2A00 bytes)
+    ; Dest:   $02BD
+    ; Size:   CODE_PAGES pages
     LDA #<boot_payload
     STA $00
     LDA #>boot_payload
     STA $01
-    LDA #$00
+    LDA #$BD
     STA $02
-    LDA #$06
+    LDA #$02
     STA $03
     LDX #CODE_PAGES
     LDY #0
@@ -74,27 +91,7 @@ boot_entry:
     DEX
     BNE @copy
 
-    ; ── Zero ZP ($00-$FF) ──
-    ; (Copy loop used ZP pointers $00-$03; zero them now)
-    LDA #0
-    TAX
-@zp:
-    STA $00,X
-    INX
-    BNE @zp
-
-    ; ── Zero $0200-$03FF (2 pages: BSS) ──
-    ; A=0, X=0, Y=0 at this point (from loops above)
-    LDX #2
-@bss:
-    STA $0200,Y             ; SMC: high byte patched by INC below
-    INY
-    BNE @bss
-    INC @bss+2
-    DEX
-    BNE @bss
-
-    JMP $0400               ; enter game
+    JMP $02BD               ; enter game (CODE segment start)
 
 ; ── CRTC register table (indexed R0..R13) ──
 ; MODE 2 with R1=64 (128 pixels), R6=20 (160 scanlines), centered

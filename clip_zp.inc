@@ -24,6 +24,6 @@ clip_proj_sx = ZP_CLIP + 13   ; 1 byte  — projected P0 screen X
 clip_proj_sy = ZP_CLIP + 14   ; 1 byte  — projected P0 screen Y
 
 ; ── Workspace (written by object.s, used by clip.s routines) ────────
-clip_n      = ZP_CLIP + 16    ; 2 bytes — scratch / division numerator
+clip_n      = ZP_CLIP + 15    ; 2 bytes — scratch / division numerator
 
 .endif

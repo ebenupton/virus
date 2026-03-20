@@ -52,6 +52,7 @@ static uint8_t crtc_r13 = 0x00;
 
 /* System flags */
 static uint8_t vsync_flag = 0;     /* bit 1 = vsync occurred */
+static int debug_line_y = -1;      /* debug: draw red line at this Y (-1 = none) */
 
 /* VIA state */
 static uint8_t via_ora = 0;       /* last value written to $FE4F */
@@ -179,6 +180,20 @@ static void mem_write(struct w65c02s_cpu *cpu, uint16_t addr, uint8_t val)
         /* Debug newline */
         fprintf(stderr, "\n");
         break;
+    case 0xFE35:
+        /* Debug: set red overlay line Y position */
+        debug_line_y = (val < 160) ? val : -1;
+        break;
+    case 0xFE36:
+        /* Debug: dump 16 bytes from address val*256 */
+        {
+            uint16_t base = (uint16_t)val << 8;
+            fprintf(stderr, "[%04X]", base);
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, " %02X", memory[base + i]);
+            fprintf(stderr, "\n");
+        }
+        break;
     case 0xFE32:
         /* Dump call-stack profile and reset counters.
          * First hit just resets (discards init), subsequent hits
@@ -288,6 +303,13 @@ static void scanout_to_argb(uint32_t *pixels, int pitch)
             }
         }
     }
+
+    /* Debug: draw red line at debug_line_y */
+    if (debug_line_y >= 0 && debug_line_y < SCREEN_H) {
+        int stride = pitch / 4;
+        for (int x = 0; x < SCREEN_W; x++)
+            pixels[debug_line_y * stride + x] = 0xFFFF0000; /* red */
+    }
 }
 
 /* ── PPM output ─────────────────────────────────────────────────────── */
@@ -346,11 +368,11 @@ static void dump_frame_2x(const char *dir, int frame_num)
 
 /* ── Line statistics ───────────────────────────────────────────────── */
 
-/* ZP addresses from raster_zp.inc */
-#define ZP_X0 0x80
-#define ZP_Y0 0x81
-#define ZP_X1 0x82
-#define ZP_Y1 0x83
+/* ZP addresses from raster_zp.inc (ZP_RASTER = $24) */
+#define ZP_X0 0x24
+#define ZP_Y0 0x25
+#define ZP_X1 0x26
+#define ZP_Y1 0x27
 
 static uint16_t draw_line_addr = 0;  /* set from labels */
 
@@ -685,8 +707,8 @@ int main(int argc, char *argv[])
     }
 
     /* Load binary */
-    uint16_t load_addr = boot_mode ? 0x3000 : 0x032B;
-    long max_size = boot_mode ? 0x5000 : 0x2CD5;
+    uint16_t load_addr = boot_mode ? 0x3000 : 0x02BD;
+    long max_size = boot_mode ? 0x5000 : 0x2D43;
     FILE *f = fopen(binfile, "rb");
     if (!f) { perror(binfile); return 1; }
     fseek(f, 0, SEEK_END);
@@ -712,6 +734,7 @@ int main(int argc, char *argv[])
     /* Set reset vector */
     memory[0xFFFC] = load_addr & 0xFF;
     memory[0xFFFD] = (load_addr >> 8) & 0xFF;
+
 
     /* Load label map if available (for profiling) */
     if (profile_mode) {
@@ -740,6 +763,7 @@ int main(int argc, char *argv[])
     struct w65c02s_cpu *cpu = malloc(w65c02s_cpu_size());
     if (!cpu) { perror("malloc"); return 1; }
     w65c02s_init(cpu, mem_read, mem_write, NULL);
+
 
     /* Cycles per frame: 2 MHz / 50 Hz = 40,000 */
     const unsigned long CYCLES_PER_FRAME = 40000;
@@ -838,6 +862,7 @@ int main(int argc, char *argv[])
             }
             vsync_flag |= 0x02;  /* set vsync bit */
             profile_frame_count++;
+
 
             if (dump_dir)
                 dump_frame_2x(dump_dir, dump_num++);

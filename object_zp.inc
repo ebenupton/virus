@@ -18,7 +18,8 @@ obj_bb_min_sy       = ZP_OBJECT + 10   ; bounding box min screen Y
 obj_bb_max_sy       = ZP_OBJECT + 11   ; bounding box max screen Y
 
 ; ── Constants ───────────────────────────────────────────────────────
-MAX_OBJ_VERTICES    = 12
+MAX_OBJ_VERTICES    = 10
+; Note: enemy has 10 vertices (maximum object)
 MAX_OBJ_EDGES       = 24
 
 .endif

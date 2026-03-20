@@ -15,6 +15,6 @@ raster_x1           = ZP_RASTER + 2    ; end X    (0..127)
 raster_y1           = ZP_RASTER + 3    ; end Y    (0..159)
 
 ; ── Chaining state (set by set_page / draw_line / init_base) ────────
-raster_page         = ZP_RASTER + 8    ; screen buffer high byte ($30 or $58)
+raster_page         = ZP_RASTER + 4    ; screen buffer high byte ($30 or $58)
 
 .endif

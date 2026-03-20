@@ -1,22 +1,24 @@
 ; zp_layout.inc — Zero-page subsystem base addresses
 ;
-; Each subsystem owns contiguous 8-byte-aligned chunks.
+; Compact layout. ZP_GRID and ZP_BUFFERS overlap (never active simultaneously).
 ; Include-guarded: safe to .include from multiple files.
 
 .ifndef ZP_LAYOUT_INC
 ZP_LAYOUT_INC = 1
 
-ZP_SHARED  = $00   ; 1 chunk  (global scratch)
-ZP_VIDEO   = $08   ; 1 chunk  (external only)
-ZP_GAME    = $10   ; 3 chunks (1 ext + 2 int)
-ZP_RASTER  = $28   ; 3 chunks (1 ext + 2 int)
-ZP_MATH    = $40   ; 2 chunks (1 ext + 1 int)
-ZP_STATUS  = $50   ; 1 chunk  (internal scratch)
-ZP_OBJECT  = $58   ; 5 chunks (2 ext + 3 int)
-ZP_GRID    = $80   ; 7 chunks (1 ext + 6 int)
-ZP_CLIP    = $B8   ; 3 chunks (2 ext + 1 int)
-ZP_PARTICLE = $D0  ; 1 chunk  (particle system)
-; Total: $D8 used. Free: $D8-$FF (40 bytes)
+ZP_SHARED   = $00   ; 6 bytes  ($00-$05)
+ZP_VIDEO    = $06   ; 8 bytes  ($06-$0D)
+ZP_GAME     = $0E   ; 22 bytes ($0E-$23)
+ZP_RASTER   = $24   ; 13 bytes ($24-$30)
+ZP_MATH     = $31   ; 4 bytes  ($31-$34)
+ZP_STATUS   = $35   ; 4 bytes  ($35-$38)
+ZP_PARTICLE = $39   ; 4 bytes  ($39-$3C)
+ZP_OBJECT   = $3D   ; 38 bytes ($3D-$62)
+ZP_CLIP     = $63   ; 21 bytes ($63-$77)
+ZP_GRID     = $78   ; 52 bytes ($78-$AB, used during draw_grid)
+ZP_BUFFERS  = $78   ; 90 bytes ($78-$D1, used during draw_object)
+; Enemy state: $D2-$E7 (22 bytes)
+; Free: $E8-$FF (24 bytes)
 
 ; ── Shared scratch ────────────────────────────────────────────────────
 nmos_tmp        = ZP_SHARED + 0     ; NMOS carry-preserving INC A scratch

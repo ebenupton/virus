@@ -83,23 +83,28 @@ ship_y_lo       = ZP_GAME + 18
 ship_y_hi       = ZP_GAME + 19
 ship_z_lo       = ZP_GAME + 20
 ship_z_hi       = ZP_GAME + 21
-enemy_rot       = ZP_GAME + 22     ; enemy Y-axis rotation (increments each frame)
 ship_state      = ZP_GAME + 6      ; 0=alive, 1=dead, 2=ready
 debris_count    = ZP_GAME + 7      ; active debris pieces (0..4)
 STATE_ALIVE     = 0
 STATE_DEAD      = 1
 STATE_READY     = 2
 
-; Enemy state (3 dynamic enemies, free ZP $D8+)
+; Forward-declare grid scratch aliases (defined in grid.s, included later)
+; Needed for bilinear_height to use ZP addressing
+lerp_t          = ZP_GRID + 48
+h_to            = ZP_GRID + 49
+h_from          = ZP_GRID + 50
+
+; Enemy state (3 dynamic enemies, ZP $D2+)
 NUM_ENEMIES = 3
-enemy_x_lo  = $D8
-enemy_x_hi  = $DB
-enemy_z_lo  = $DE
-enemy_z_hi  = $E1
-enemy_vx    = $E4
-enemy_vz    = $E7
-enemy_yaw   = $EA
-enemy_idx   = $ED
+enemy_x_lo  = $D2
+enemy_x_hi  = $D5
+enemy_z_lo  = $D8
+enemy_z_hi  = $DB
+enemy_vx    = $DE
+enemy_vz    = $E1
+enemy_yaw   = $E4
+enemy_idx   = $E7
 
 ; Game scratch (ZP_SHARED spares, used only during thrust/drag)
 gm_scratch_0    = ZP_SHARED + 1
@@ -114,6 +119,15 @@ gm_scratch_4    = ZP_SHARED + 5
 
 entry:
     SEI
+.ifdef EMU_DEBUG
+    ; Dump heightmap and entry code to verify boot copy
+    LDA #$2C                  ; page $2C = heightmap
+    STA $FE36
+    LDA #$02                  ; page $02 = just before CODE
+    STA $FE36
+    LDA #$03                  ; page $03 = start of CODE area
+    STA $FE36
+.endif
     ; (status rows zeroed by init_status below, no separate clear needed)
     JSR init_screen
     JSR init_status
@@ -128,6 +142,12 @@ entry:
     LDA #160
     STA dirty_top_buf0
     STA dirty_top_buf1
+    ; No ship drawn yet
+    LDA #20
+    STA ship_top_buf0
+    STA ship_top_buf1
+    STA ship_bot_buf0
+    STA ship_bot_buf1
     ; Initialize rotation angle and orientation
     LDA #0
     STA obj_rot_angle
@@ -166,6 +186,7 @@ main_loop:
     JSR update_camera
     JSR update_physics
     JSR clear_screen
+    JSR clear_ship
     JSR clear_particles
     JSR draw_grid
 
@@ -188,10 +209,21 @@ main_loop:
     DEX
     BPL :-
     JSR setup_obj_view
-    BCS @ship_drawn
+    BCS @ship_not_drawn
     JSR draw_object
-@ship_drawn:
-    JMP @merge_dirty
+    ; Save ship stripe range NOW (before enemies overwrite obj_bb)
+    LDX back_buf_idx
+    LDA obj_bb_min_sy
+    LSR A
+    LSR A
+    LSR A
+    STA ship_top_buf0,X
+    LDA obj_bb_max_sy
+    LSR A
+    LSR A
+    LSR A
+    STA ship_bot_buf0,X
+@ship_not_drawn:
 
 @draw_debris:
     LDX debris_count
@@ -226,24 +258,17 @@ main_loop:
     JSR setup_obj_view
     BCS @skip_debris
     JSR draw_object
-@skip_debris:
-    ; Merge this debris dirty
+    ; Merge debris dirty (only when drawn)
     LDA obj_bb_min_sy
     CMP grid_min_sy
-    BCS :+
+    BCS @skip_debris
     STA grid_min_sy
-:
+@skip_debris:
     LDX gm_scratch_0
     DEX
     BPL @debris_loop
 
 @merge_dirty:
-    ; Merge ship/debris dirty into grid dirty
-    LDA obj_bb_min_sy
-    CMP grid_min_sy
-    BCS :+
-    STA grid_min_sy
-:
     ; Draw enemies — set up invariants outside loop
     JSR update_enemies
     LDA #<obj_enemy
@@ -275,15 +300,32 @@ main_loop:
     ADC #0
     STA obj_pos+3              ; y_hi (0 or 1)
 
-    ; Copy X and Z to obj_pos
+    ; Copy X and Z to obj_pos (toroidal wrap + quick reject if too far)
     LDA enemy_x_lo,X
     STA obj_pos+0
     LDA enemy_x_hi,X
+    LDY cam_x_hi
+    JSR torus_wrap
     STA obj_pos+1
+    SEC
+    SBC cam_x_hi
+    CLC
+    ADC #2                    ; shift range: [-4,+3] → [-2,+5]
+    CMP #5
+    BCS @skip_enemy           ; outside [-2,+2] → too far
+
     LDA enemy_z_lo,X
     STA obj_pos+4
     LDA enemy_z_hi,X
+    LDY cam_z_hi
+    JSR torus_wrap
     STA obj_pos+5
+    SEC
+    SBC cam_z_hi
+    CLC
+    ADC #2
+    CMP #5
+    BCS @skip_enemy
 
     ; Rotation
     LDA enemy_yaw,X
@@ -293,13 +335,12 @@ main_loop:
     JSR setup_obj_view
     BCS @skip_enemy
     JSR draw_object
-@skip_enemy:
-    ; Merge dirty
+    ; Merge enemy dirty (only when drawn)
     LDA obj_bb_min_sy
     CMP grid_min_sy
-    BCS :+
+    BCS @skip_enemy
     STA grid_min_sy
-:
+@skip_enemy:
     LDX enemy_idx
     DEX
     BPL @enemy_loop
@@ -307,10 +348,13 @@ main_loop:
     JSR update_particles
     JSR draw_particles
 
-    ; Dirty top for this buffer (covers grid + objects; particles self-clear)
+    ; Grid-only dirty top for this buffer
     LDA grid_min_sy
     LDX back_buf_idx
     STA dirty_top_buf0,X
+.ifdef EMU_DEBUG
+    STA $FE35                 ; debug: red line at dirty_top
+.endif
 
 .ifdef EMU_DEBUG
     ; Frame timing: show vsync delta as score's last digit
@@ -824,20 +868,18 @@ apply_drag:
 ; =====================================================================
 
 check_terrain:
-    ; Compute heightmap col from new-scale ship_x: (ship_x_hi >> 3) & $1F
+    ; Compute heightmap col from new-scale ship_x: ship_x_hi >> 3
     LDA ship_x_hi
     LSR A
     LSR A
     LSR A
-    AND #$1F
-    TAY                       ; Y = col
+    TAY                       ; Y = col (0..31, 3 LSRs guarantee 5 bits)
 
-    ; Compute heightmap row from new-scale ship_z: (ship_z_hi >> 3) & $1F
+    ; Compute heightmap row from new-scale ship_z: ship_z_hi >> 3
     LDA ship_z_hi
     LSR A
     LSR A
     LSR A
-    AND #$1F
 
     ; Build pointer: height_map + row * 32
     LDX #>height_map / 4
@@ -942,11 +984,6 @@ destroy_ship:
     STA ship_state
     LDA #4
     STA debris_count
-
-    ; Zero ship velocity
-    LDA #0
-    STA vel_y_hi
-    STA vel_y_lo
 
     ; Init 4 debris pieces at ship's old-scale position
     LDX #3
@@ -1146,6 +1183,27 @@ update_debris:
     RTS
 
 ; =====================================================================
+; torus_wrap — Wrap A to nearest image of Y on 8-unit torus
+; =====================================================================
+; Input:  A = position hi byte, Y = camera hi byte
+; Output: A = wrapped position hi byte
+; Preserves: X
+
+torus_wrap:
+    ; A=pos_hi, Y=cam_hi → A=wrapped pos_hi
+    STY h_from
+    SEC
+    SBC h_from
+    CLC
+    ADC #4
+    AND #$07
+    CLC
+    ADC h_from
+    SEC
+    SBC #4
+    RTS
+
+; =====================================================================
 ; init_enemies — Randomize position and velocity for all enemies
 ; =====================================================================
 
@@ -1154,10 +1212,10 @@ init_enemies:
 @ie_loop:
     JSR random_byte
     STA enemy_x_lo,X
-    STA enemy_z_hi,X          ; reuse for z_hi
-    JSR random_byte
+    STA enemy_z_hi,X
+    EOR #$C3
     STA enemy_x_hi,X
-    STA enemy_z_lo,X          ; reuse for z_lo
+    STA enemy_z_lo,X
     JSR random_byte
     STA enemy_yaw,X
     AND #$07
@@ -1212,7 +1270,6 @@ update_enemies:
 @ue_zd:
     ; Spin
     INC enemy_yaw,X
-    INC enemy_yaw,X
     DEX
     BPL @ue_loop
     RTS
@@ -1239,17 +1296,16 @@ bilinear_height:
     STY gm_scratch_4          ; save col
     PHA                       ; save h00
 
-    ; Read h10 (col+1, same row); save wrapped col+1
+    ; Read h10 (col+1, same row)
     INY
     TYA
     AND #$1F
-    TAY
-    STY gm_scratch_2          ; save col+1 wrapped (safe across lerp_height)
+    TAY                       ; Y = col+1 wrapped
     LDA (gm_scratch_0),Y
     AND #$F8
     STA h_to                  ; h10
 
-    ; Lerp top row
+    ; Lerp top row (Y preserved across lerp_height)
     PLA                       ; A = h00
     JSR lerp_height           ; A = h_top
     PHA                       ; save h_top
@@ -1267,20 +1323,17 @@ bilinear_height:
 @bh_no_wrap:
     STA gm_scratch_1
 
+    ; Read h11 (col+1, next row) — Y still has col+1
+    LDA (gm_scratch_0),Y
+    AND #$F8
+    STA h_to                  ; h11 → h_to for bottom lerp
+
     ; Read h01 (col, next row)
     LDY gm_scratch_4
     LDA (gm_scratch_0),Y
     AND #$F8
-    PHA                       ; save h01
 
-    ; Read h11 (col+1, next row) — reuse saved col+1
-    LDY gm_scratch_2          ; col+1 wrapped
-    LDA (gm_scratch_0),Y
-    AND #$F8
-    STA h_to
-
-    ; Lerp bottom row
-    PLA                       ; A = h01
+    ; Lerp bottom row: A = h01, h_to = h11
     JSR lerp_height           ; A = h_bot
 
     ; Final lerp Z

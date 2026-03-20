@@ -11,9 +11,9 @@
 .include "clip_zp.inc"
 
 ; ── Internal workspace (ZP_CLIP internal) ─────────────────────────
-clip_d      = ZP_CLIP + 18    ; 2 bytes — scratch / division denominator
-clip_q      = ZP_CLIP + 20    ; 1 byte  — t quotient (0.8)
-clip_out    = ZP_CLIP + 21    ; 1 byte  — sign flag for lerp
+clip_d      = ZP_CLIP + 17    ; 2 bytes — scratch / division denominator
+clip_q      = ZP_CLIP + 19    ; 1 byte  — t quotient (0.8)
+clip_out    = ZP_CLIP + 20    ; 1 byte  — sign flag for lerp
 
 ; ── Clip plane constants ──────────────────────────────────────────
 ; Left: -HALF_GRID_X
@@ -630,6 +630,12 @@ project_and_draw:
     LDX #159
     JSR clamp_add
     STA raster_y1
+
+    ; -- Update bounding box from clipped endpoints --
+    LDA raster_y0
+    JSR update_bb
+    LDA raster_y1
+    JSR update_bb
 
     ; -- Draw the line --
     PLA

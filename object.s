@@ -64,18 +64,16 @@ clip_has_isect  = ZP_OBJECT + 33    ; flag ($00=none, $FF=have first)
 ; Edge-drawn bitmap (moved from BUFFERS)
 obj_edge_drawn  = ZP_OBJECT + 34    ; 4 bytes — 32-bit drawn bitmap
 
-; ── Buffer allocations (BUFFERS segment) ────────────────────────────
-.segment "BUFFERS"
-obj_proj_sx:    .res MAX_OBJ_VERTICES   ; projected screen X (0..127)
-obj_proj_sy:    .res MAX_OBJ_VERTICES   ; projected screen Y (0..159)
-obj_vx_lo:      .res MAX_OBJ_VERTICES   ; view-space X lo
-obj_vx_hi:      .res MAX_OBJ_VERTICES   ; view-space X hi
-obj_vy_lo:      .res MAX_OBJ_VERTICES   ; view-space Y lo
-obj_vy_hi:      .res MAX_OBJ_VERTICES   ; view-space Y hi
-obj_vz_lo:      .res MAX_OBJ_VERTICES   ; view-space Z lo
-obj_vz_hi:      .res MAX_OBJ_VERTICES   ; view-space Z hi
-obj_vtx_clip:   .res MAX_OBJ_VERTICES   ; per-vertex 4-bit outcode
-.segment "CODE"
+; ── Buffer allocations (ZP, overlapping ZP_GRID — never active simultaneously)
+obj_proj_sx  = ZP_BUFFERS + 0    ; 10 bytes — projected screen X (0..127)
+obj_proj_sy  = ZP_BUFFERS + 10   ; 10 bytes — projected screen Y (0..159)
+obj_vx_lo    = ZP_BUFFERS + 20   ; 10 bytes — view-space X lo
+obj_vx_hi    = ZP_BUFFERS + 30   ; 10 bytes — view-space X hi
+obj_vy_lo    = ZP_BUFFERS + 40   ; 10 bytes — view-space Y lo
+obj_vy_hi    = ZP_BUFFERS + 50   ; 10 bytes — view-space Y hi
+obj_vz_lo    = ZP_BUFFERS + 60   ; 10 bytes — view-space Z lo
+obj_vz_hi    = ZP_BUFFERS + 70   ; 10 bytes — view-space Z hi
+obj_vtx_clip = ZP_BUFFERS + 80   ; 10 bytes — per-vertex 4-bit outcode
 
 ; ── Bit mask table for edge bit testing ──
 bit_mask_table:
@@ -412,8 +410,6 @@ draw_object:
     JSR clamp_add
     LDX vtx_idx
     STA obj_proj_sy,X
-    JSR update_bb
-
     INC vtx_idx
     JMP @proj_loop
 
@@ -451,7 +447,6 @@ draw_object:
     STA obj_proj_sx,X
     LDA #80
     STA obj_proj_sy,X
-    JSR update_bb
     INC vtx_idx
     JMP @proj_loop
 
@@ -900,6 +895,12 @@ draw_edge_dedup:
     STA raster_x1
     LDA obj_proj_sy,X
     STA raster_y1
+
+    ; Update bounding box from actual rasterised endpoints
+    LDA raster_y0
+    JSR update_bb
+    LDA raster_y1
+    JSR update_bb
 
     ; Draw (Y preserved from init_base)
     LDA face_color_val          ; per-face color

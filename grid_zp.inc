@@ -16,9 +16,9 @@ HALF_COLS       = GRID_COLS / 2  ; half-width in cells
 HALF_ROWS       = GRID_ROWS / 2  ; half-depth in cells
 ROW_STRIDE      = GRID_VTX_X * 3  ; bytes per vertex row in v_buf
 
-; ── Outputs (set by project_grid, read by game.s) ────────────────
-grid_min_sy     = ZP_GRID + 0   ; minimum screen Y across all grid vertices
-; ZP_GRID + 1 used internally (h_chain_sub_y)
+; ── Outputs (set by draw_grid, read by game.s) ────────────────
+; grid_min_sy must NOT be in ZP_GRID (overlaps ZP_BUFFERS during draw_object)
+grid_min_sy     = $E8           ; minimum screen Y across all grid vertices
 
 ; ── Derived geometry constants ──────────────────────────────────────
 HALF_GRID_X     = (GRID_COLS - 1) * $20   ; X half-extent in 8.8

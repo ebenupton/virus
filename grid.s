@@ -66,9 +66,7 @@ seg_count       = scratch_1        ; segments remaining
 saved_y         = scratch_3        ; saved sub-row Y
 v_color         = scratch_4        ; pre-resolved v_color for current vertex
 ; Aliases — interpolation (same ZP, different context)
-lerp_t          = scratch_1        ; interpolation offset (0..63)
-h_to            = scratch_2        ; target height
-h_from          = scratch_3        ; source height
+; lerp_t, h_to, h_from defined in game.s (forward declarations for bilinear_height)
 
 ; ── Buffer allocations (BUFFERS segment) ────────────────────────────
 .segment "GRIDBUF"
@@ -353,6 +351,7 @@ add_cam_y_offset:
 @aco_loop:
     CLC
     ADC recip_val
+    BCS @aco_clamp            ; overflow → off-screen below
     DEX
     BNE @aco_loop
 @aco_borrow:
@@ -362,8 +361,11 @@ add_cam_y_offset:
     SEC
     SBC recip_val             ; correct for 256-wrap
     BCS @aco_done
-    LDA #0                    ; clamp to 0
+    LDA #0                    ; underflow → clamp to 0
 @aco_done:
+    RTS
+@aco_clamp:
+    LDA #$FF                  ; overflow → clamp to 255 (rasteriser clips to screen)
     RTS
 
 ; =====================================================================

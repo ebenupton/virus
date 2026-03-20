@@ -193,12 +193,11 @@ recip8:
     AND #$7F
     TAY
     LDA recip_norm,Y
-    CPX #0
-    BEQ @done
 @shift:
-    LSR A
     DEX
-    BNE @shift
+    BMI @done
+    LSR A
+    BPL @shift                ; always taken (LSR clears bit 7)
 @done:
     RTS
 

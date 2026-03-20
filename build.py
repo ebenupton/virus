@@ -292,16 +292,18 @@ def build_game():
     game_ssd_size = assemble("game.s", "game_ssd.bin", "game.o",
                              extra_flags=["-DUNROLL_SHALLOW=1"])
 
-    # Concatenate: boot.bin + game_ssd.bin → game_boot.bin
+    # Concatenate: boot.bin + game_ssd.bin → game_boot.bin (page-padded)
     with open("boot.bin", "rb") as bf:
         boot_data = bf.read()
     with open("game_ssd.bin", "rb") as gf:
         game_data = gf.read()
+    total_raw = len(boot_data) + len(game_data)
+    pad = (256 - (total_raw % 256)) % 256
     with open("game_boot.bin", "wb") as out:
         out.write(boot_data)
         out.write(game_data)
-    total_size = len(boot_data) + len(game_data)
-    print(f"  game_boot.bin: {total_size} bytes (boot={len(boot_data)}, game={len(game_data)})")
+        out.write(b'\x00' * pad)
+    print(f"  game_boot.bin: {total_raw + pad} bytes (boot={len(boot_data)}, game={len(game_data)}, pad={pad})")
 
     # Create bootable SSD with load=$3000, exec=$3000
     create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",

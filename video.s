@@ -41,8 +41,6 @@ init_screen:
     JSR clear_screen
 
     ; Initialize double-buffer state: back buffer = buffer 1 ($5800)
-    ; A=0 from clear_screen loop
-    STA frame_count
     LDA #$58
     JSR set_page
     LDA #1
@@ -54,18 +52,14 @@ init_screen:
 ; =====================================================================
 
 wait_vsync:
-    LDA #0
-    STA frame_count
+    LDX #2
 @vs_loop:
     LDA SYS_VIA_IFR
     AND #$02
     BEQ @vs_loop
-    LDA #$02
-    STA SYS_VIA_IFR
-    INC frame_count
-    LDA frame_count
-    CMP #2
-    BCC @vs_loop
+    STA SYS_VIA_IFR           ; A=$02 from AND
+    DEX
+    BNE @vs_loop
     RTS
 
 ; =====================================================================
@@ -223,5 +217,69 @@ clr1_loop:
     INX
 clr1_bne:
     BNE clr1_loop
+    RTS
+
+; =====================================================================
+; clear_ship — Clear ship stripes above grid dirty line
+; =====================================================================
+; Zeros a 20-pixel-wide strip at screen centre for ship stripes that
+; are above the grid dirty line (not cleared by clear_screen).
+
+cs_ptr   = ZP_SHARED + 1
+cs_cur   = ZP_SHARED + 3
+cs_grid  = ZP_SHARED + 4
+cs_bot   = ZP_SHARED + 5
+
+clear_ship:
+    LDX back_buf_idx
+    LDA ship_top_buf0,X
+    CMP #20
+    BCS @cs_done              ; no ship drawn last frame
+
+    STA cs_cur
+    LDA dirty_top_buf0,X
+    LSR A
+    LSR A
+    LSR A
+    STA cs_grid
+    LDA ship_bot_buf0,X
+    STA cs_bot
+    LDA #20
+    STA ship_top_buf0,X
+    STA ship_bot_buf0,X
+
+@cs_loop:
+    LDA cs_cur
+    CMP cs_grid
+    BCS @cs_skip              ; >= grid dirty → already cleared
+
+    ASL A
+    CLC
+    ADC raster_page
+    STA cs_ptr+1
+    LDA #$D8
+    STA cs_ptr
+
+    LDA #0
+    LDY #39
+:   STA (cs_ptr),Y
+    DEY
+    BPL :-
+
+    INC cs_ptr+1
+    LDY #0
+    STY cs_ptr
+    LDY #39
+:   STA (cs_ptr),Y
+    DEY
+    BPL :-
+
+@cs_skip:
+    INC cs_cur
+    LDA cs_cur
+    CMP cs_bot
+    BCC @cs_loop
+    BEQ @cs_loop
+@cs_done:
     RTS
 

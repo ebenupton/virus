@@ -65,9 +65,9 @@ clear_particles:
     BEQ @start
     LDY #16
 @start:
-    STY gm_scratch_2            ; save array base (avoids ZP_SHARED+1/+2 alias)
+    STY gm_scratch_2            ; save array base
     CLC
-    ADC gm_scratch_2
+    ADC gm_scratch_2            ; A = count + base (A still has count from LDA above)
     STA gm_scratch_3            ; end index
     LDX gm_scratch_2
 @loop:
@@ -75,9 +75,8 @@ clear_particles:
     STA ZP_SHARED+1
     LDA ptl_clr_a0_hi,X
     STA ZP_SHARED+2
-    LDA ptl_clr_mask,X
     LDY #0
-    AND (ZP_SHARED+1),Y
+    LDA #0
     STA (ZP_SHARED+1),Y
     INX
     CPX gm_scratch_3
@@ -347,8 +346,6 @@ draw_particles:
     LDA #$15                    ; right pixel (white)
 @left:
     STA gm_scratch_2            ; OR mask
-    EOR #$FF
-    STA gm_scratch_3            ; AND mask (for clearing)
 
     ; Plot single pixel
     LDA gm_scratch_2
@@ -362,8 +359,6 @@ draw_particles:
     STA ptl_clr_a0_lo,X
     LDA raster_base+1
     STA ptl_clr_a0_hi,X
-    LDA gm_scratch_3
-    STA ptl_clr_mask,X
 
     ; Advance record index
     INC ptl_draw_count

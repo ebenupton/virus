@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build script for BBC Micro line rasterizer demo and Battlezone game.
+"""Build script for BBC Micro line rasterizer demo and Virus game.
 
 Usage:
     python3 build.py          # build demo (assembles demo.s, creates demo.ssd)
@@ -281,7 +281,7 @@ def build_demo():
 
 
 def build_game():
-    """Build the Battlezone game + emulator."""
+    """Build the Virus game + emulator."""
     generate_tables()
 
     # Assemble bootloader
@@ -306,7 +306,7 @@ def build_game():
     print(f"  game_boot.bin: {total_raw + pad} bytes (boot={len(boot_data)}, game={len(game_data)}, pad={pad})")
 
     # Create bootable SSD with load=$3000, exec=$3000
-    create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
+    create_ssd("game_boot.bin", "game.ssd", title=b"VIRUS   ", progname=b"GAME   ",
                load_addr=0x3000, exec_addr=0x3000)
 
     # Assemble game for emulator (with debug)
@@ -342,7 +342,7 @@ def build_game65c02():
     print(f"  game_boot.bin: {total_size} bytes (boot={len(boot_data)}, game={len(game_data)})")
 
     # Create bootable SSD with load=$3000, exec=$3000
-    create_ssd("game_boot.bin", "game.ssd", title=b"BATTLZON", progname=b"GAME   ",
+    create_ssd("game_boot.bin", "game.ssd", title=b"VIRUS   ", progname=b"GAME   ",
                load_addr=0x3000, exec_addr=0x3000)
 
     compile_emu()

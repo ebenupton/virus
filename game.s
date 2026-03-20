@@ -119,15 +119,6 @@ gm_scratch_4    = ZP_SHARED + 5
 
 entry:
     SEI
-.ifdef EMU_DEBUG
-    ; Dump heightmap and entry code to verify boot copy
-    LDA #$2C                  ; page $2C = heightmap
-    STA $FE36
-    LDA #$02                  ; page $02 = just before CODE
-    STA $FE36
-    LDA #$03                  ; page $03 = start of CODE area
-    STA $FE36
-.endif
     ; (status rows zeroed by init_status below, no separate clear needed)
     JSR init_screen
     JSR init_status
@@ -186,6 +177,13 @@ main_loop:
     JSR update_camera
     JSR update_physics
     JSR clear_screen
+    ; Redraw minimap if dirty region overlapped it (rows 16-47)
+    LDX back_buf_idx
+    LDA dirty_top_buf0,X
+    CMP #48
+    BCS @no_map_redraw
+    JSR draw_map
+@no_map_redraw:
     JSR clear_ship
     JSR clear_particles
     JSR draw_grid
@@ -310,22 +308,22 @@ main_loop:
     SEC
     SBC cam_x_hi
     CLC
-    ADC #2                    ; shift range: [-4,+3] → [-2,+5]
+    ADC #2
     CMP #5
-    BCS @skip_enemy           ; outside [-2,+2] → too far
+    BCS @skip_enemy           ; X distance > 2 → too far
 
     LDA enemy_z_lo,X
     STA obj_pos+4
     LDA enemy_z_hi,X
-    LDY cam_z_hi
+    LDY ship_pos+5            ; use ship Z (on 0-7 torus), not cam_z_hi
     JSR torus_wrap
     STA obj_pos+5
     SEC
-    SBC cam_z_hi
+    SBC ship_pos+5
     CLC
     ADC #2
     CMP #5
-    BCS @skip_enemy
+    BCS @skip_enemy           ; Z distance > 2 → too far
 
     ; Rotation
     LDA enemy_yaw,X
@@ -352,22 +350,6 @@ main_loop:
     LDA grid_min_sy
     LDX back_buf_idx
     STA dirty_top_buf0,X
-.ifdef EMU_DEBUG
-    STA $FE35                 ; debug: red line at dirty_top
-.endif
-
-.ifdef EMU_DEBUG
-    ; Frame timing: show vsync delta as score's last digit
-    LDA $FE34
-    TAX                       ; save current
-    SEC
-    SBC dbg_last_vsync
-    STX dbg_last_vsync
-    CMP #10
-    BCC :+
-    LDA #9
-:   STA score+3               ; overwrite entire byte (hi nibble irrelevant)
-.endif
 
     JSR draw_status
     JSR wait_vsync
@@ -470,12 +452,9 @@ vel_to_old_scale:
     ORA gm_scratch_0
     RTS
 
-.ifdef EMU_DEBUG
-dbg_last_vsync: .byte 0
-.endif
 
 ; ── Persistent object positions (8.8 fixed-point, 6 bytes each) ──────
-ship_pos:     .res 6              ; ship old-scale position (written by convert loop)
+ship_pos      = $E9               ; ship old-scale position (6 bytes ZP, $E9-$EE)
 
 ; (enemy state arrays in ZP, defined at top of file)
 
@@ -760,15 +739,48 @@ update_physics:
     SBC #>CAM_Z_BEHIND
     STA cam_z_hi
 
-    ; 7. Camera Y = ship_y + 1.5
+    ; 7. Camera Y — terrain focus when ship is close to ground
+    ; Bilinear terrain height at ship's old-scale XZ
+    LDA ship_pos+1
+    STA gm_scratch_2            ; x_hi
+    LDA ship_pos+5
+    STA gm_scratch_3            ; z_hi
+    LDA ship_pos+0
+    STA gm_scratch_4            ; x_lo
+    LDA ship_pos+4              ; z_lo
+    JSR bilinear_height         ; A = h*8
+
+    ; 16-bit gap: (ship_pos[3]:ship_pos[2]) - ($00:h*8)
+    STA gm_scratch_0            ; save terrain h*8
+    LDA ship_pos+2
+    SEC
+    SBC gm_scratch_0            ; lo byte of gap
+    TAX                         ; save gap_lo
+    LDA ship_pos+3
+    SBC #0                      ; hi byte of gap (with borrow)
+    BCC @use_terrain            ; negative → ship below terrain
+    BNE @use_ship               ; hi > 0 → gap >= 256 → well above
+    CPX #$40                    ; gap_lo < 0.25?
+    BCS @use_ship               ; >= 0.25 → ship focus
+
+@use_terrain:
+    ; cam_y = h*8 + $01C0 (terrain + 0.25 + CAM_HEIGHT); C=0 from BCC entry
+    LDA gm_scratch_0
+    ADC #$C0                    ; C known 0 from BCC
+    STA cam_y_lo
+    LDA #$01
+    ADC #0
+    BNE @cam_done               ; always (A >= 1)
+
+@use_ship:
     CLC
     LDA ship_pos+2
     ADC #CAM_HEIGHT_LO
     STA cam_y_lo
     LDA ship_pos+3
     ADC #CAM_HEIGHT_HI
+@cam_done:
     STA cam_y_hi
-
     RTS
 
 ; =====================================================================
@@ -941,26 +953,26 @@ check_terrain:
 ; =====================================================================
 ; get_terrain_h8 — Look up terrain h*8 from old-scale position
 ; =====================================================================
-; Input:  gm_scratch_2 = x_hi (old-scale), gm_scratch_3 = z_hi (old-scale)
-; Output: A = h*8 (0..248)
+; Input:  gm_scratch_2 = x_hi, gm_scratch_3 = z_hi,
+;         gm_scratch_4 = x_lo, A = z_lo  (all old-scale)
+; Output: A = h*8 (0..248), Y = col, gm_scratch_0/1 = row ptr
 ; Preserves: X
 ; Clobbers: A, Y, gm_scratch_0, gm_scratch_1
 
 get_terrain_h8:
-    ; col = (x_hi << 2) & $1F → Y
-    LDA gm_scratch_2
-    ASL A
-    ASL A
-    AND #$1F
+    ; col = ((x_hi << 2) | (x_lo >> 6)) & $1F → Y
+    PHA                       ; save z_lo
+    LDA gm_scratch_4          ; x_lo
+    JSR @gt_combine           ; A = col
     TAY                       ; Y = col
 
-    ; row = (z_hi << 2) & $1F → build pointer
-    LDA #>height_map / 4
-    STA gm_scratch_1
+    ; row = ((z_hi << 2) | (z_lo >> 6)) & $1F → build pointer
     LDA gm_scratch_3
-    ASL A
-    ASL A
-    AND #$1F
+    STA gm_scratch_2          ; z_hi into gm_scratch_2 for @gt_combine
+    LDA #>height_map / 4
+    STA gm_scratch_1          ; init pointer hi early (safe: @gt_combine won't touch it)
+    PLA                       ; z_lo
+    JSR @gt_combine           ; A = row
     ASL A
     ASL A
     ASL A
@@ -973,6 +985,20 @@ get_terrain_h8:
     ; Read cell
     LDA (gm_scratch_0),Y
     AND #$F8                  ; h*8
+    RTS
+
+; Shared: A=lo byte, gm_scratch_2=hi byte → A = ((hi<<2)|(lo>>6)) & $1F
+@gt_combine:
+    ASL A
+    ROL A
+    ROL A
+    AND #$03
+    STA gm_scratch_0
+    LDA gm_scratch_2
+    ASL A
+    ASL A
+    ORA gm_scratch_0
+    AND #$1F
     RTS
 
 ; =====================================================================
@@ -993,17 +1019,20 @@ destroy_ship:
     LDA ship_pos +1
     STA debris_x_hi,X
     LDA ship_pos +2
+    CLC
+    ADC #$10                  ; start debris slightly above ship
     STA debris_y_lo,X
     LDA ship_pos +3
+    ADC #0
     STA debris_y_hi,X
     LDA ship_pos +4
     STA debris_z_lo,X
     LDA ship_pos +5
     STA debris_z_hi,X
 
-    ; Random upward velocity (10..25)
+    ; Random upward velocity (10..21)
     JSR random_byte
-    AND #$0F
+    AND #$0B                  ; 0-11 (75% of original 0-15 variable range)
     CLC
     ADC #10
     STA debris_vy,X
@@ -1124,7 +1153,7 @@ update_debris:
     STA gm_scratch_2
     LDA debris_z_hi,X
     STA gm_scratch_3
-    JSR get_terrain_h8        ; A = h*8 (X preserved)
+    JSR get_terrain_h8        ; A = h*8 (X preserved, approx cell)
     CMP debris_y_lo,X         ; h*8 vs y_lo
     BCS @ud_gc                ; h*8 >= y_lo → at/below terrain
 
@@ -1284,14 +1313,16 @@ update_enemies:
 
 bilinear_height:
     ; A = z_lo on entry
+    TAY                       ; Y = z_lo (full, for get_terrain_h8)
     AND #$3F
     PHA                       ; save fz on stack
     LDA gm_scratch_4          ; x_lo
     AND #$3F
     STA lerp_t                ; fx
 
-    ; Build row pointer + col via get_terrain_h8 subroutine body
-    ; (gm_scratch_2 = x_hi, gm_scratch_3 = z_hi already set)
+    ; Build row pointer + col via get_terrain_h8
+    ; (gm_scratch_2 = x_hi, gm_scratch_3 = z_hi, gm_scratch_4 = x_lo already set)
+    TYA                       ; A = z_lo (full, for cell selection)
     JSR get_terrain_h8        ; A = h00*8, Y = col, gm_scratch_0/1 = row ptr
     STY gm_scratch_4          ; save col
     PHA                       ; save h00

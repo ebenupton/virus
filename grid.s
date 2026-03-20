@@ -345,7 +345,7 @@ height_to_sy:
 
 add_cam_y_offset:
     CLC
-    ADC #16
+    ADC #0                    ; horizon at top of screen
     LDX cam_y_hi
     BEQ @aco_borrow
 @aco_loop:
@@ -376,7 +376,9 @@ add_cam_y_offset:
 ; Note:   diff > 12 reads beyond table — acceptable approximation
 
 lut_lookup:
-    SBC #8                    ; (diff-1)×8 (C=1 from caller, no SEC needed)
+    AND #$F8                  ; round diff to multiple of 8 (prevents LUT overflow)
+    BEQ @ll_done              ; diff < 8 → delta = 0
+    SBC #8                    ; (diff-1)×8 (C=1 from caller, AND preserves C)
     ASL A                     ; (diff-1) << 4
     STA h_to
     LDA lerp_t
@@ -385,6 +387,7 @@ lut_lookup:
     ORA h_to                  ; (diff-1)<<4 | offset
     TAX
     LDA interp_lut,X
+@ll_done:
     RTS
 
 ; =====================================================================

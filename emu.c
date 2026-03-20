@@ -1,5 +1,5 @@
 /*
- * emu.c -- BBC Micro emulator for Battlezone-style game
+ * emu.c -- BBC Micro emulator for Virus game
  *
  * Uses w65c02s.h (65C02 CPU) + SDL2 (display/keyboard).
  * Loads a flat binary at $0800, sets reset vector to $0800.
@@ -939,7 +939,7 @@ int main(int argc, char *argv[])
     }
 
     SDL_Window *window = SDL_CreateWindow(
-        "BBC Micro - Battlezone",
+        "BBC Micro - Virus",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         SCREEN_W * 4, SCREEN_H * 2, 0);
     if (!window) {

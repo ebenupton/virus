@@ -67,10 +67,17 @@ boot_entry:
     CPX #$BD
     BCC @bss0
 
-    ; ── Copy game code ──
-    ; Source: boot_payload (appended after bootloader in memory)
-    ; Dest:   $02BD
-    ; Size:   CODE_PAGES pages
+    ; ── Copy game code via stub at $0100 ──
+    ; The copy destination ($02BD-$30BC) overlaps this bootloader code,
+    ; so we relocate the copy loop to $0100 (stack page) where it's safe.
+    LDX #(copy_stub_end - copy_stub - 1)
+@install:
+    LDA copy_stub,X
+    STA $0100,X
+    DEX
+    BPL @install
+
+    ; Set up pointers and run from $0100
     LDA #<boot_payload
     STA $00
     LDA #>boot_payload
@@ -81,17 +88,21 @@ boot_entry:
     STA $03
     LDX #CODE_PAGES
     LDY #0
-@copy:
+    JMP $0100
+
+; Relocatable copy stub — runs at $0100
+; Branch offsets are PC-relative so they work at any address.
+copy_stub:
     LDA ($00),Y
     STA ($02),Y
     INY
-    BNE @copy
+    BNE copy_stub
     INC $01
     INC $03
     DEX
-    BNE @copy
-
-    JMP $02BD               ; enter game (CODE segment start)
+    BNE copy_stub
+    JMP $02BD
+copy_stub_end:
 
 ; ── CRTC register table (indexed R0..R13) ──
 ; MODE 2 with R1=64 (128 pixels), R6=20 (160 scanlines), centered

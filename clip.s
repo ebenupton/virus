@@ -4,6 +4,41 @@
 ;           project_and_draw
 ; Requires: raster_zp.inc, math_zp.inc, grid_zp.inc
 ;           recip8, umul8x8, smul8x8, init_base, draw_line
+;
+; ── Pipeline ────────────────────────────────────────────────────────
+; The caller (object.s edge loop) loads a camera-space segment into
+; clip_x0..clip_z1 (16-bit signed 8.8, one lo/hi pair per coordinate)
+; and runs the planes in sequence, abandoning the edge on any C=1
+; reject:
+;   clip_line_left → clip_line_right → clip_line_near → clip_line_far
+;   → project_and_draw
+; The clip volume is a box, not a view pyramid: |x| <= HALF_GRID_X and
+; Z_NEAR_BOUND <= z <= Z_FAR_BOUND (the grid's extent).  There are no
+; Y planes: the projected screen Y is clamped by clamp_add instead.
+;
+; ── Common plane-clipper pattern ────────────────────────────────────
+; All four clip_line_* routines share one structure; only the axis,
+; the plane constant and the outside-test sign differ:
+;
+;   def clip_line_plane(P0, P1):
+;       out0 = outside(P0)            # sign bit of 16-bit coord-plane
+;       out1 = outside(P1)            #   (or plane-coord) difference
+;       if not out0 and not out1: return ACCEPT   # trivial accept
+;       if out0 and out1:         return REJECT   # trivial reject
+;       if not out0: swap(P0, P1)     # canonical: P0 out, P1 in
+;       # parametric intersection, t in (0,1) as a 0.8 fraction:
+;       t = (plane - P0.axis) / (P1.axis - P0.axis)    # div_16_8
+;       for c in the other two coordinates:            # lerp_coord
+;           P0.c += (t * (P1.c - P0.c)) >> 8
+;       P0.axis = plane               # exact — no rounding residue
+;       return ACCEPT
+;
+; N and D are both computed outside-minus-inside-wards so they are
+; positive by construction, as div_16_8 requires.  The swap means a
+; clipped edge can come back with its endpoints exchanged — harmless,
+; the rasterizer is direction-agnostic.  The outside tests keep only
+; the sign of the 16-bit difference: the lo-byte ADC/SBC is executed
+; purely to feed its carry into the hi-byte operation.
 
 .include "raster_zp.inc"
 .include "math_zp.inc"
@@ -56,6 +91,9 @@ clip_swap:
 ; Inputs:  clip_x0..clip_z1 set
 ; Outputs: C=0 accept (endpoints may be modified), C=1 reject
 ; Clobbers: A, X, Y, clip workspace
+;
+; Instance of the common pattern (see header): axis = X, plane =
+; -HALF_GRID_X, outside(P) = (P.x + HALF_GRID_X) < 0; lerps Y and Z.
 
 clip_line_left:
     ; -- Test P0: outside if x0 + HALF_GRID_X < 0 --
@@ -141,6 +179,9 @@ clip_line_left:
 ; Inputs:  clip_x0..clip_z1 set
 ; Outputs: C=0 accept, C=1 reject
 ; Clobbers: A, X, Y, clip workspace
+;
+; Instance of the common pattern (see header): axis = X, plane =
+; +HALF_GRID_X, outside(P) = (HALF_GRID_X - P.x) < 0; lerps Y and Z.
 
 clip_line_right:
     ; -- Test P0: outside if HALF_GRID_X - x0 < 0 --
@@ -221,6 +262,11 @@ clip_line_right:
 ; Inputs:  clip_x0..clip_z1 set
 ; Outputs: C=0 accept, C=1 reject
 ; Clobbers: A, X, Y, clip workspace
+;
+; Instance of the common pattern (see header): axis = Z, plane =
+; Z_NEAR_BOUND, outside(P) = (P.z - Z_NEAR_BOUND) < 0; lerps X and Y.
+; Accepted output guarantees z >= Z_NEAR_BOUND (>= 256), which is what
+; lets project_and_draw assume recip8 never sees z_hi = 0.
 
 clip_line_near:
     ; -- Test P0: outside if z0 - Z_NEAR_BOUND < 0 --
@@ -303,6 +349,9 @@ clip_line_near:
 ; Inputs:  clip_x0..clip_z1 set
 ; Outputs: C=0 accept, C=1 reject
 ; Clobbers: A, X, Y, clip workspace
+;
+; Instance of the common pattern (see header): axis = Z, plane =
+; Z_FAR_BOUND, outside(P) = (Z_FAR_BOUND - P.z) < 0; lerps X and Y.
 
 clip_line_far:
     ; -- Test P0: outside if Z_FAR_BOUND - z0 < 0 --
@@ -386,6 +435,23 @@ clip_line_far:
 ;          Requires 0 < N < D
 ; Output:  clip_q = floor(N*256/D) (8-bit, 0.8 format)
 ; Clobbers: A, X, Y
+;
+; Standard restoring long division producing one quotient bit per
+; iteration, with clip_n doubling as the shifting remainder:
+;
+;   q = 0
+;   for _ in range(8):
+;       n <<= 1                     # 16-bit shift
+;       if n >= d: n -= d; bit = 1  # trial subtract commits
+;       else:      bit = 0          # trial subtract discarded
+;       q = (q << 1) | bit
+;   return q                        # floor(N*256/D), since N < D
+;
+; The trial subtraction runs in Y (lo) / A (hi) and is only stored
+; back on no-borrow; the borrow flag itself is the quotient bit,
+; rolled into clip_q via the SEC/CLC + ROL at @shift.  Note the
+; shifted remainder must fit in 16 bits, i.e. D <= $7FFF — true for
+; all plane/coordinate spans here.
 
 div_16_8:
     LDA #0
@@ -420,6 +486,20 @@ div_16_8:
 ;         clip_q = t (0.8 quotient)
 ; Output: clip_x0+X modified (coord0 += t * (coord1 - coord0))
 ; Clobbers: A, Y, math_a, math_b, math_res, clip_n, clip_n+1, clip_out
+;
+; The signed 16-bit delta is reduced to sign + magnitude so the
+; correction can be built from two UNSIGNED 8x8 muls, then re-signed:
+;
+;   delta = coord1 - coord0             # 16-bit signed
+;   s, d  = sign(delta), abs(delta)
+;   corr  = t*d_hi + (t*d_lo >> 8)      # = (t * d) >> 8, 16-bit
+;   coord0 += corr if s >= 0 else -corr
+;
+; t < 1 (0.8 fraction), so corr <= d and coord0 never overshoots
+; coord1; truncation of the low product byte rounds |corr| down,
+; i.e. the clipped point lands fractionally short of the plane on
+; the interpolated axes (the driven axis is set exactly by the
+; caller afterwards).
 
 lerp_coord:
     ; delta = coord1 - coord0
@@ -505,6 +585,23 @@ lerp_coord:
 ; Input:  A = coord_lo, X = coord_hi, clip_n = recip
 ; Output: clip_d:clip_d+1 = signed offset, C pending from lo add
 ; Clobbers: A, X, math_a, math_b, math_res
+;
+; Computes offset = (coord * recip) >> 8 for a signed 16-bit coord and
+; unsigned 8-bit recip, split into two 8x8 muls by place value:
+;   coord * recip = coord_hi*recip*256 + coord_lo*recip
+;   offset        = smul(coord_hi, recip)          # signed weight
+;                 + (umul(coord_lo, recip) >> 8)   # lo byte unsigned
+; The low byte of a two's-complement value carries no sign of its own,
+; so only the hi-byte product needs smul8x8.
+;
+; The carry from the final low-byte ADC is deliberately NOT resolved
+; here: it is left pending for clamp_add, whose first instruction is
+; ADC #0 on the offset high byte.  The two routines form one sequence.
+;
+; Pseudocode:
+;   lo_hi  = (coord_lo * recip) >> 8     # umul8x8
+;   s      = coord_hi * recip            # smul8x8, 16-bit signed
+;   offset = (s >> 8) << 8 | ((s & $FF) + lo_hi)   # carry → clamp_add
 
 project_coord:
     STX nmos_tmp            ; save coord_hi
@@ -531,6 +628,28 @@ project_coord:
 ;         C=carry pending from caller's ADC
 ; Output: A=clamped value
 ; Clobbers: X, clip_out
+;
+; First folds project_coord's pending carry into the offset high byte,
+; then classifies the offset by that byte:
+;   hi == $00        small positive: r = center + offset_lo,
+;                      clamped to max (both on 8-bit overflow and on
+;                      r > max)
+;   hi == $FF        small negative: r = center + offset_lo (two's-
+;                      complement low byte); carry out means r >= 0,
+;                      otherwise clamp to 0
+;   otherwise        |offset| >= 256, off screen: the BMI (sign of
+;                      hi+1 from the CMP #$FF) sends $01..$7E to max
+;                      and $7F..$FE to 0
+;
+; Pseudocode:
+;   hi = offset_hi + pending_carry
+;   if hi == 0:
+;       r = center + offset_lo
+;       return max if r > 255 or r > max else r
+;   if hi == $FF:
+;       r = center + offset_lo - 256
+;       return r if r >= 0 else 0
+;   return max if hi > 0 else 0
 
 clamp_add:
     STA clip_out            ; save center
@@ -569,8 +688,33 @@ clamp_add:
 ; project_and_draw — Project both clip endpoints and draw line
 ; =====================================================================
 ; Inputs:  clip_x0..clip_z1 (clipped 3D endpoints in camera space)
+;          clip_color = line colour (right-pixel mask format)
+; Outputs: line drawn into the back buffer, endpoint pixel included;
+;          clip_proj_sx/sy = P0's screen position (read by the caller
+;          for intersection-point handling); obj bbox via update_bb
 ; Assumes: Z values are positive (caller must ensure)
 ; Clobbers: A, X, Y, math workspace, clip scratch
+;
+; Perspective projection: screen = centre + (coord * recip) >> 8 with
+; recip = recip8(z) = floor(32768/z), i.e. offset = coord * 128 / z.
+; Centres: X → 64 (mid-screen), Y → 16.  clamp_add pins the result to
+; the screen, so extreme offsets become edge-of-screen endpoints
+; rather than wild addresses (only Y needs this in principle — X is
+; bounded by the left/right clip planes — but both go through it).
+;
+; init_base must run while P0's coords are in raster_x0/y0, and recip8
+; (inside compute_recip_z2 for P1) clobbers Y — hence the PHA/PLA
+; parking of the sub-row around P1's projection.
+;
+; Pseudocode:
+;   for P in (P0, P1):
+;       recip = compute_recip_z2(P.z)              # 32768/z
+;       P.sx = clamp(64 + (P.x * recip) >> 8, 0, 127)
+;       P.sy = clamp(16 + (P.y * recip) >> 8, 0, 159)
+;       if P is P0: init_base(); save sub-row Y
+;   update_bb(P0.sy); update_bb(P1.sy)             # object dirty bbox
+;   draw_line(clip_color)                          # plots [P0, P1)
+;   plot_final_pixel(P1.sx)                        # complete segment
 
 project_and_draw:
     ; -- Project P0 --
@@ -654,6 +798,15 @@ project_and_draw:
 ; Output: pixel written to screen
 ; Preserves: X, Y
 ; Clobbers: A
+;
+; Completes a draw_line chain: draw_line stops one pixel short of the
+; endpoint but leaves raster_base/Y addressing it, so only X-parity
+; needs deciding here.  Uses the colour masks draw_line derived.
+;
+; Pseudocode:
+;   side = right if x & 1 else left
+;   b = screen[base + y]
+;   screen[base + y] = (b & clear_mask[side]) | color[side]
 
 plot_final_pixel:
     LSR A                   ; bit 0 → carry (left/right pixel)
@@ -675,6 +828,14 @@ plot_final_pixel:
 ; Input:  A = z_lo, X = z_hi
 ; Output: clip_n = floor(32768/z) >> 1 ≈ floor(16384/z)
 ; Clobbers: A, X, Y, math_b
+;
+; Thin wrapper marshalling z into recip8's convention (A = z_hi,
+; math_b = z_lo) and parking the result in clip_n for project_coord.
+; As implemented, recip8's return value floor(32768/z) is stored
+; unshifted (the "z2" in the name reads as reciprocal-of-2z:
+; 32768/z = 65536/(2z), matching grid.s's RECIP_* constants).
+; recip8 returns 0 for z < 256, which cannot occur here: the near
+; plane guarantees z >= Z_NEAR_BOUND ($01E0).
 
 compute_recip_z2:
     STA math_b

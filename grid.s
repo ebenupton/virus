@@ -92,6 +92,48 @@ v_row_offset_lo:
 ; Per-row: one recip8 call gives recip ≈ 64/z_cam.
 ; Per-vertex sy: combined multiply of (cam_y_lo - h*8) * recip, plus cam_y_hi offset.
 ; sx advances by a constant step = recip·0.25 per vertex (16-bit add).
+;
+; ── Architecture ─────────────────────────────────────────────────────
+; Inputs:  ship_pos (grid tracks the ship; Z_GRID_CENTER puts the
+;          centre one cell ahead of it), cam_y_lo/hi (camera height),
+;          height_map (32×32 toroidal, [h:5][colour:3] per cell)
+; Outputs: terrain drawn (XOR) into the back buffer; grid_min_sy =
+;          topmost touched scan line (dirty-rect seed for main_loop);
+;          v_buf filled with projected vertices
+; Clobbers: whole ZP_GRID window, math regs, raster state
+;
+; Precisely: recip_val = floor(32768/z_cam) with z_cam in 8.8, i.e.
+; ≈ 128/z in world units — the focal length is 128px against a 64px
+; half-screen. Screen-x per 0.25-unit cell = recip/4 px = step (8.8).
+;
+; The mesh is (n_cols × n_rows) vertices; interior vertices lie on
+; heightmap cell corners, but the outermost columns and the near/far
+; rows are clamped to fixed camera-relative positions (±7/8 unit in X,
+; Z_NEAR_BOUND/Z_FAR_BOUND in Z) so the silhouette doesn't swim as the
+; ship moves; their heights are interpolated between the two straddled
+; cell corners (interp_offset_* are the /64 lerp fractions). When the
+; ship sits exactly on a cell-centre line, the clamped edge coincides
+; with a real corner and one column/row is dropped (n_cols/n_rows).
+;
+; Horizontal chains (constant-Z lines) are drawn inline as each row of
+; vertices is projected; vertical chains (constant-X) need both rows,
+; so vertices are parked in v_buf (sx, sy, v_color) and the v-chains
+; are drawn in a second pass, column by column. A chain link whose
+; colour resolves to 0 (black) is skipped — the raster base is simply
+; re-seeded at the far endpoint.
+;
+; Pipeline (pseudocode):
+;   sub_x/base_x, sub_z/base_z ← ship_pos      # cell + /64 fraction
+;   interp offsets, n_cols/n_rows, run_factor  # per-frame constants
+;   z_cam = Z_NEAR_BOUND - sub-cell bias       # depth of row 0, 8.8
+;   hmap_ptr = &height_map[base_z][0]
+;   row 0 (near):  recip = RECIP_NEAR (const), Z-interp toward row 1
+;   rows 1..n-2:   recip = recip8(z_cam), on-corner (no Z interp)
+;   row n-1 (far): recip = RECIP_FAR (const), Z-interp toward row n-2
+;       each row: do_row_body() → project vertices + inline h-chains,
+;                 z_cam += $40, rotate hmap_ptr → next row
+;   for col in n_cols-1 .. 0:                  # second pass
+;       draw v-chain down v_buf (stride ROW_STRIDE)
 
 ; --- Init & z_cam setup ---
 ; grid_min_sy is set to 160 (off-screen) — tracks the topmost grid pixel
@@ -214,6 +256,9 @@ draw_grid:
     ROL hmap_ptr+1
     STA hmap_ptr
 
+    ; The clamped near/far rows sit at fixed camera depths, so their
+    ; reciprocals are assembly-time constants (= floor(32768/z), same
+    ; scale recip8 returns); only interior rows pay for a recip8 call.
     RECIP_NEAR = 65536 / (Z_NEAR_BOUND * 2)
     RECIP_FAR  = 65536 / (Z_FAR_BOUND * 2)
 
@@ -328,6 +373,15 @@ draw_grid:
 ; Input:  A = h*8 (0..248), math_b = recip_val
 ; Output: A = screen-y (clamped ≥ 0)
 ; Clobbers: A, X, Y, seg_count, math_res
+;
+; Perspective-projects a vertex height at the current row's depth:
+;   sy = (cam_y - h) * recip / 256      # h in old-scale lo units (h*8)
+; with the horizon (sy for cam_y == h) at screen row 0.
+;
+; Only the low bytes are multiplied: (cam_y_lo - h*8) is an 8-bit
+; unsigned subtraction that may wrap; add_cam_y_offset then adds
+; recip once per cam_y_hi count and corrects the wrap, which together
+; reconstruct the exact 16-bit (cam_y - h*8) * recip / 256.
 
 height_to_sy:
     STA seg_count             ; save h*8 for borrow check
@@ -342,6 +396,12 @@ height_to_sy:
 ; =====================================================================
 ; Input:  A = hi(combined * recip), seg_count = h*8
 ; Output: A = screen-y (clamped ≥ 0)
+;
+;   sy = A + cam_y_hi * recip          # small loop, cam_y_hi is 1..2
+;   if cam_y_lo < h*8: sy -= recip     # lo-byte multiply had wrapped
+;   clamp: overflow → 255 (below screen), underflow → 0 (above)
+; The rasteriser clips to the real screen, so 0/255 are just "far
+; off-screen" sentinels that keep the line endpoints sane.
 
 add_cam_y_offset:
     CLC
@@ -374,6 +434,11 @@ add_cam_y_offset:
 ; Input:  A = diff_h8 (8..248, multiple of 8), C = 1 (from caller's SBC)
 ; Output: A = LUT value (pre-scaled delta)
 ; Note:   diff > 12 reads beyond table — acceptable approximation
+;
+; interp_lut (see gen_interp.py) is diff-major, 16 entries per diff:
+;   lut[(diff-1)*16 + lerp_t/4] = round((lerp_t/4*4 + 2) * diff / 8)
+; i.e. delta ≈ diff_h8 * lerp_t / 64, with lerp_t quantised to 4s and
+; bin-centred. Index = (diff_h8 - 8) << 1 | (lerp_t >> 2).
 
 lut_lookup:
     AND #$F8                  ; round diff to multiple of 8 (prevents LUT overflow)
@@ -396,6 +461,11 @@ lut_lookup:
 ; Input:  A = h_a×8 (0..248), h_to = h_b×8 (0..248), lerp_t = offset (0..63)
 ; Output: A = interpolated height h×8 (0..248)
 ; Clobbers: h_from, h_to, X
+;
+;   return h_a + (h_b - h_a) * lerp_t / 64        # LUT-quantised
+; Split by direction so the LUT only ever sees a positive diff:
+; h_a > h_b subtracts the delta, h_b > h_a adds it, equal is free.
+; Shared by edge/Z vertex interpolation and by game.s bilinear_height.
 
 lerp_height:
     CMP h_to
@@ -427,6 +497,12 @@ lerp_height:
 ; Input:  A = sub value (0..63)
 ; Output: X = |sub - 32|, A = 64 - |sub - 32|
 ; Clobbers: none besides A, X
+;
+; The clamped edge vertex sits half a cell ($20/64) away from the
+; ship's sub-cell position, so its lerp fraction from the straddled
+; corner is |sub - 32|; the opposite edge gets the complement (the two
+; always sum to 64). X == 0 (sub == 32, edge exactly on a corner) is
+; the caller's cue to drop a column/row.
 
 compute_interp_offsets:
     CMP #$20
@@ -449,6 +525,13 @@ compute_interp_offsets:
 ; Interpolates vtx_cell's height (bits 3–7) between outer row (hmap_ptr)
 ; and inner row (interp_z_ptr) using z_interp_offset.
 ; Preserves colour bits (0–2) in vtx_cell.
+;
+; Input:  X = z_interp_offset (non-zero), hmap_col, vtx_cell
+; Output: A = interpolated h×8 (via lerp_height tail call)
+;
+;   return lerp(outer_h8, height_map[inner_row][col] & $F8, X/64)
+; Used for every vertex of the clamped near/far rows, whose true Z
+; lies between two heightmap rows.
 
 z_interp_vertex:
     STX lerp_t                ; X = z_interp_offset from caller
@@ -466,6 +549,17 @@ z_interp_vertex:
 ; Input:  Y = inner heightmap column, A = X interpolation offset (0..63)
 ; Effect: Recomputes vtx_cell+1 (sy) at interpolated height
 ; Handles corner-case bilinear interpolation (X + Z)
+;
+; For a clamped left/right edge vertex: its true X lies between the
+; outer column (already in vtx_cell, Z-interpolated by
+; lookup_and_color if needed) and the inner column.
+;
+;   h_inner = height_map[row][Y] & $F8
+;   if z_interp_offset:                     # corner vertex of a
+;       h_inner = lerp(h_inner,             # clamped near/far row →
+;                      inner_row[Y], z_off) # full bilinear
+;   h = lerp(h_outer, h_inner, A/64)
+;   vtx_cell+1 = height_to_sy(h)
 
 interp_height:
     PHA                       ; push X offset to stack
@@ -504,6 +598,19 @@ interp_height:
 ; Output: A = h*8 (0..248), vtx_cell = cell byte or z-interp h*8,
 ;         v_color = color LUT index
 ; Clobbers: X, Y
+;
+; The per-vertex heightmap fetch — one (hmap_ptr),Y read per vertex:
+;   cell = height_map[row][hmap_col]        # [h:5][pattern:3]
+;   class = sea (h==0) / plateau (h==31) / land
+;   v_color = v_color_<class>[pattern]      # LUTs in edge_color.inc
+;   h_color = h_color_<class>[pattern]
+;   if z_interp_offset:                     # clamped near/far row
+;       h*8 = z_interp_vertex()             # lerp toward inner row
+;       if h_color == white ($15):          # plateau outline colour
+;           h_color = h_colour of the inner-row cell
+;           # h-chains span the Z boundary, so a white edge must be
+;           # re-resolved from the cell actually being crossed into
+;   return h*8
 
 lookup_and_color:
     LDY hmap_col
@@ -569,6 +676,12 @@ lookup_and_color:
 ; Input:  Y = inner heightmap column (preserved for interp_height)
 ; Effect: May modify v_color
 ; Scratch: h_from, h_to
+;
+; Mirror of the Z override in lookup_and_color: a clamped edge vertex
+; is displaced in X, so its v-chain (which crosses the X boundary) may
+; have moved into the neighbouring cell. Only white ($15, the plateau
+; outline) is re-resolved, from the X-adjacent inner cell:
+;   if v_color == white: v_color = inner_v(height_map[row][Y])
 
 override_edge_color:
     LDA v_color
@@ -587,6 +700,13 @@ override_edge_color:
 ; Input:  A = heightmap cell byte
 ; Output: h_from = inner_v, h_to = inner_h
 ; Preserves: Y
+;
+; Full class+pattern colour resolution for an arbitrary cell byte
+; (the boundary-override path, cf. lookup_and_color's inlined LUTs).
+; Exploits the layout of edge_color.inc — the three 8-entry v/h table
+; pairs are contiguous, so one index into the sea tables reaches all:
+;   index = pattern + {sea: 0, plateau: 16, land: 32}
+;   inner_v = v_color_sea[index]; inner_h = h_color_sea[index]
 
 resolve_inner_colors:
     TAX
@@ -619,6 +739,26 @@ resolve_inner_colors:
 ; =====================================================================
 ; do_middle_vertex: no input needed (reads hmap state)
 ; do_vertex_tail:   A = sx, vtx_cell+1 = sy, v_color set
+;
+; do_middle_vertex — the interior-vertex hot path:
+;   h*8 = lookup_and_color(); sy = height_to_sy(h*8); sx = run_hi
+; (edge vertices instead go through interp_height and computed sx,
+; then jump straight into do_vertex_tail).
+;
+; do_vertex_tail — everything common to emitting one vertex:
+;   v_buf[v_off..+2] = (sx, sy, v_color)     # for the v-chain pass
+;   grid_min_sy = min(grid_min_sy, sy)       # dirty-top tracking
+;   if pending_h_color:                      # h-chain from prev vertex
+;       draw_line(prev → this, colour drawn is prev vertex's h_color)
+;   else:                                    # first vertex, or black
+;       init_base(this)                      # re-seed raster position
+;   pending_h_color = h_color                # for the next segment
+;   hmap_col = (hmap_col + 1) & 31           # toroidal column walk
+;   run += step                              # sx += recip/4 px (8.8)
+;
+; The raster chains: draw_line leaves raster_base/Y at the endpoint,
+; saved in h_chain_sub_y so the next segment continues without a
+; fresh init_base.
 
 do_middle_vertex:
     JSR lookup_and_color      ; A = h*8
@@ -694,6 +834,23 @@ do_vertex_tail:
 ; Effect: Projects all vertices for this row, draws h-chains inline,
 ;         rotates hmap pointers, advances z_cam and proj_row.
 ;         Falls through to compute_next_hmap.
+;
+;   # Per-row constants from recip (≈128/z px per world unit):
+;   step = recip << 6                  # 8.8 px per 0.25-unit cell
+;   edge_offset = recip - ceil(recip/8)   # = recip*7/8 px → the
+;                                      # clamped edges at x = ∓7/8 unit
+;   run = $4000 - K*recip              # sx of leftmost cell corner:
+;       # 64px centre minus (camera→column-0 distance K, 8.8) * recip;
+;       # K = $100+sub_x or $C0+sub_x depending on which side of the
+;       # cell centre the ship sits (run_factor/run_sub_recip encode
+;       # the $100 part as an extra whole recip subtraction)
+;   hmap_col = base_x; v_off = row base in v_buf; pending_h_color = 0
+;   left edge:  lookup, override v_color, X-interp height,
+;               sx = 64 - edge_offset            → do_vertex_tail
+;   middle:     n_cols-2 × do_middle_vertex (sx from run accumulator)
+;   right edge: mirror of left, sx = 64 + edge_offset
+;   prev/cur/next hmap row pointers rotate; hmap_row = (row+1) & 31
+;   z_cam += $40 (0.25 unit); proj_row += 1
 
 do_row_body:
     ; --- Step = recip * 64 (16-bit), the screen-x increment per cell ---
@@ -823,6 +980,10 @@ do_row_body:
 ; =====================================================================
 ; compute_next_hmap — Compute next_hmap_ptr = hmap_ptr + 32 (with wrap)
 ; =====================================================================
+; One heightmap row = 32 bytes; row 31 → row 0 wraps by stepping the
+; hi byte back $0400 (the whole 1K map). hmap_row must already hold
+; the *current* row index. Reached by fall-through from do_row_body
+; and called once directly for the near row's interp_z_ptr.
 
 compute_next_hmap:
     CLC

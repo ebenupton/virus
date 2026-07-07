@@ -19,6 +19,9 @@ ZP_GRID     = $78   ; 52 bytes ($78-$AB, used during draw_grid)
 ZP_BUFFERS  = $78   ; 90 bytes ($78-$D1, used during draw_object)
 ; Enemy state: $D2-$E7 (22 bytes)
 ; Free: $E8-$FF (24 bytes)
+; (Since then game.s/grid_zp.inc have claimed the low end of that
+;  range: $E8 = grid_min_sy, $E9-$EE = ship_pos; $EF-$FF remain free.
+;  Enemy arrays and ship_pos are equated in game.s, not here.)
 
 ; ── Shared scratch ────────────────────────────────────────────────────
 nmos_tmp        = ZP_SHARED + 0     ; NMOS carry-preserving INC A scratch

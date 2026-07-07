@@ -204,6 +204,19 @@ shallow_tbl_hi:
 ; Notes:    Skips the endpoint pixel — caller chains or plots it.
 ;           Setup uses X for |dx| so Y (sub-row) is never disturbed.
 ;           Zero-length lines (raster_x0==raster_x1 && raster_y0==raster_y1) return immediately.
+;
+; Pseudocode (setup + dispatch; loops documented at their sections):
+;   dx = abs(x1 - x0); dy = abs(y1 - y0)
+;   if dx == 0 and dy == 0: return
+;   if dy > dx:                          # steep: one pixel per Y-step
+;       minor, major, count = dx, dy, dy
+;       entry = steep_tbl[x0 & 1, x0 >= x1, y0 >= y1]
+;   else:                                # shallow: pixel pairs along X
+;       minor, major = dy, dx
+;       count = (dx + 1) // 2            # number of pairs
+;       entry = shallow_tbl[x0 & 1, ~(dx+1) & 1, x0 >= x1, y0 >= y1]
+;   err = major - minor                  # in A, C=1
+;   goto entry                           # via pushed-address RTS
 ; =====================================================================
 
 draw_line:
@@ -316,6 +329,37 @@ draw_line:
 ;
 ; Carry state on loop entry: C=1 (from dispatch SBC or loop-back SEC).
 ; The first SBC delta_minor consumes this carry.
+;
+; Pseudocode (one _end-loop iteration; a pair is the left+right pixel
+; of one byte; each pixel's Bresenham test decides whether Y steps
+; AFTER that pixel, i.e. before the next one):
+;   err -= minor                        # test for pixel 1
+;   if err >= 0:
+;       err -= minor                    # test for pixel 2
+;       if err >= 0:                    # fast-fast: no Y-step in pair
+;           screen[base + y] = color_both      # one write, no RMW
+;       else:                           # fast-slow: Y-step after pixel 2
+;           err += major
+;           screen[base + y] = color_both
+;           y += 1                      # (row cross every 8: base += 512)
+;   else:                               # slow: Y-step between the pixels
+;       err += major
+;       rmw_plot(base + y, first)       # first pixel on current row
+;       y += 1
+;       rmw_plot(base + y, second)      # second pixel on next row
+;       err -= minor                    # test for pixel 2
+;       if err < 0: err += major; y += 1
+;   base += 8 (right) or -= 8 (left)    # next byte column (page cross ~1/32)
+;   count -= 1; if count == 0: return
+; Right-moving pairs are (left,right); left-moving pairs are (right,left).
+;
+; The _mid variants run count-1 pairs through the _end loop, then draw
+; one trailing pixel and take a final Bresenham step so raster_base/Y
+; land exactly on the (unplotted) endpoint for chaining.  Entry points:
+; _l starts on a left (even-X) pixel, _r on a right (odd-X) pixel.  An
+; entry that starts on the pair's SECOND pixel (e.g. sdr_end_r) draws
+; that single pixel with RMW, then joins the loop at the second-pixel
+; Bresenham test — the first "pair" is one pixel.
 ;
 ; Column advance/retreat arithmetic:
 ;   Right-moving with C=1: SBC #$F8 = raster_base + 8  (since -(-8) = +8)
@@ -941,6 +985,17 @@ sul_mid_l:
 ; Each pixel: read-modify-write with AND/ORA, one Y-step (major axis),
 ; conditional X-step (minor axis) on Bresenham borrow.
 ;
+; Pseudocode (one iteration; side = left or right pixel of the byte):
+;   rmw_plot(base + y, side)            # AND mask, ORA colour
+;   err -= minor
+;   if err < 0:                         # X-step: toggle pixel side
+;       err += major
+;       if leaving the byte:            # right: from right pixel;
+;           base += 8 or -= 8           #   left: from left pixel
+;       side = other_side               # jump to paired phase's loop
+;   y += 1 or -= 1                      # major axis (row cross every 8)
+;   count -= 1; if count == 0: return
+;
 ; X-step toggles pixel parity: tdr_l_xstep jumps to tdr_r_ystep and
 ; vice versa.  The column advance/retreat is encoded in the xstep
 ; handler, which chains C=1 from ADC delta_major into the address
@@ -1292,6 +1347,13 @@ tul_l_xs_borrow:
 ;   The second ASL naturally shifts raster_x0 bit 6 (the byte_col >= 32 flag)
 ;   into the carry, which is then consumed by ADC raster_page to form
 ;   the high byte in a single branchless instruction.
+;
+; Pseudocode:
+;   base = raster_page*256 + (y0 >> 3)*512 + ((x0 >> 1) & 31)*8
+;                          + (256 if (x0 >> 1) >= 32 else 0)
+;   if buf0 and base hi-byte >= $58:    # start point below buf0's end
+;       base |= $8000                   # redirect writes into ROM
+;   Y = y0 & 7                          # sub-row, added by (base),Y
 ; =====================================================================
 
 init_base:
@@ -1339,6 +1401,24 @@ init_base:
 ; Input:  A = page ($30 for buf0, $58 for buf1)
 ; Trashes: A
 ;
+; Selects which buffer the rasterizer draws into, and reconfigures the
+; vertical-overflow guards in stripe_advance/stripe_retreat by SMC.
+;
+; Rationale: lines are clipped in 3D, not to the 2D screen, so a chain
+; may walk off the bottom (or back onto the top) of the buffer.  Buf0
+; ($3000-$57FF) is followed in RAM by buf1, so an overflowing buf0 line
+; would corrupt buf1: the guards catch a raster_base high byte crossing
+; $58 and set bit 7, turning further writes into harmless ROM writes
+; (and stripe_retreat undoes the mask when the chain climbs back).
+; Buf1 ($5800-$7FFF) is followed by ROM already, so for buf1 both guard
+; branches are patched to NOP NOP — zero overhead on the hot path.
+;
+; Pseudocode:
+;   raster_page = A
+;   if A == $58:  sa_smc/sr_smc = NOP,NOP          # buf1: no guard
+;   else:         sa_smc = BPL sa_fixup            # buf0: arm guards
+;                 sr_smc = BMI sr_fixup
+;
 set_page:
     STA raster_page
     CMP #$58
@@ -1370,6 +1450,11 @@ set_page:
 ; A preserved.  Carry on exit: undefined.
 ; Requires: set_page called to configure SMC.
 ;
+; Pseudocode:
+;   hi = raster_base_hi + 2              # +512 = next char row
+;   if buf0 and hi >= $58: hi |= $80     # off bottom → ROM (BPL guard)
+;   raster_base_hi = hi; Y = 0           # top scan-line of new row
+;
 stripe_advance:
     LDY raster_base+1
     INY
@@ -1398,6 +1483,12 @@ sa_fixup:
 ; A preserved.  Carry on exit: C=1 (common path preserves caller's C;
 ; fixup path sets C=1 via SEC).
 ; Requires: set_page called to configure SMC.
+;
+; Pseudocode:
+;   hi = raster_base_hi - 2              # -512 = previous char row
+;   if buf0 and hi was redirected and drops below $D8:   # BMI guard
+;       hi &= $7F                        # back on screen → unmask
+;   raster_base_hi = hi; Y = 7           # bottom scan-line of new row
 
 stripe_retreat:
     LDY raster_base+1

@@ -15,6 +15,9 @@ raster_x1           = ZP_RASTER + 2    ; end X    (0..127)
 raster_y1           = ZP_RASTER + 3    ; end Y    (0..159)
 
 ; ── Chaining state (set by set_page / draw_line / init_base) ────────
+; raster_page must be changed via set_page, never written directly:
+; set_page also patches the stripe_advance/stripe_retreat overflow
+; guards (SMC) to match the selected buffer.
 raster_page         = ZP_RASTER + 4    ; screen buffer high byte ($30 or $58)
 
 .endif

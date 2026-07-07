@@ -53,6 +53,21 @@ opBBR7      = $7F
 ; =============================================================================
 ; Entry point ($3000)
 ; =============================================================================
+;
+; MODE 4 is selected via the OS (which sets ULA, palette and CRTC
+; defaults), then four raw CRTC writes narrow the display to 32
+; characters (256 px) and move the screen base to $4000.  At 32 bytes
+; per scanline a character row is exactly 256 bytes, so stepping
+; between char rows is a single INC/DEC of the pointer high byte.
+;
+; Pseudocode:
+;   mode(4); cursor_off(); wait_vsync()
+;   crtc[1]=32; crtc[2]=45; crtc[10]=$20; crtc[12:13]=$0800  # base $4000
+;   memset($4000, 0, $4000)
+;   seed LFSR with $ACE1
+;   while True:
+;       x0,y0 = rand(), lfsr_hi; x1,y1 = rand(), lfsr_hi
+;       draw_line()
 
 entry:
     ; Switch to MODE 4 (320x256, 1bpp — sets up ULA, palette, CRTC defaults)
@@ -149,6 +164,13 @@ main_loop:
 ; XOR mask $B400 on high byte when carry out
 ; Returns: random byte in A (low byte of LFSR state)
 ; =============================================================================
+; Right-shifting Galois form; state in lfsr_hi:lfsr_lo, must be non-zero.
+; Preserves: X, Y
+;
+; Pseudocode:
+;   out = state & 1; state >>= 1
+;   if out: state ^= $B400
+;   return state & 0xFF
 
 lfsr_next:
     LSR lfsr_hi
@@ -182,6 +204,19 @@ rev_branch_table:
 ;
 ; Inputs: x0, y0, x1, y1  (0-255 each)
 ;         screen_page      (high byte of screen base, e.g. $40)
+; Output: line XOR-drawn from (x0,y0) to (x1,y1) inclusive
+; Clobbers: A, X, Y, base, mask_zp, delta_minor/major, cols/stripes_left,
+;           final_branch/bias; x0/y0 are overwritten in the reverse cases
+;
+; Screen bytes hold 8 pixels MSB-first; a character cell is 8 bytes
+; (8 scanlines) and a char row of 32 cells is one 256-byte page, so
+; addressing is base = page(y>>3) + (x & $F8), scanline index in Y.
+;
+; Pseudocode (integer Bresenham, error term d kept in X):
+;   if x1 < x0: swap endpoints          # dx >= 0 from here on
+;   dy = abs(y0 - y1); dx = x1 - x0
+;   if dx >= dy: shallow path           # step x every pixel, y sometimes
+;   else:        steep path             # step y every pixel, x sometimes
 ; =============================================================================
 
 draw_line:
@@ -219,7 +254,37 @@ draw_line:
 ; =============================================================================
 ; SHALLOW PATH — major axis X, minor axis Y
 ; =============================================================================
-
+;
+; One pixel per iteration along X: XOR mask_zp into (base),Y, then walk
+; the mask across the byte; the shift's carry-out (C=1) flags an
+; 8-pixel column boundary.  Y only ever steps upward (DEY, DEC base+1
+; across char rows) — when y1 > y0 the endpoints are swapped and the
+; line is drawn from the other end with x running right-to-left.
+;
+; The x direction is compiled into the loop via self-modifying code:
+;   smc_s_shift    LSR (fwd) / ASL (rev)  — mask walk direction
+;   smc_s_mask     #$80 / #$01            — mask reload after column step
+;   smc_s_advance  +8  / -8               — byte column advance (+C)
+;
+; Termination is also SMC: normal columns loop on BCC (no shift-out);
+; on entering the final column the 3-byte branch is rewritten to
+; BBR(n) mask_zp — n chosen from x1&7 so the branch falls through
+; right after the last pixel's shift lands on bit n.  End position 7
+; keeps the BCC (table sentinel $90): the shift-out itself ends the
+; column, and the negated cols_left counter (INC → 0 means "final
+; column next", >0 means done) supplies the exit.
+;
+; Loop invariant: C=0 on entry, error term d in X, delta_minor holds
+; dy-1 so `SBC delta_minor` with C=0 computes d - dy in one op.
+;
+; Pseudocode (forward case):
+;   d = dx - dy
+;   for each x from x0 to x1:
+;       screen[base + Y] ^= mask
+;       d -= dy
+;       if d < 0: d += dx; Y -= 1        # minor-axis step (up)
+;       mask >>= 1                       # next pixel; C=1 on column end
+;
 shallow_setup:
     ; Entry: A = dx, Y = |dy|, delta_minor = |dy|, C=1 from CMP
     STA delta_major
@@ -365,7 +430,35 @@ s_write_final_branch:
 ; =============================================================================
 ; STEEP PATH — major axis Y, minor axis X
 ; =============================================================================
-
+;
+; One pixel per iteration along Y, walked in 8-scanline stripes (one
+; char row each): Y counts the scanline 7..0 within the stripe, and a
+; stripe transition is DEC base+1.  As in the shallow path, Y always
+; steps upward and reverse lines (y1 > y0) are drawn from the other
+; endpoint; the occasional x step shifts mask_zp, with the same SMC
+; trio (smc_t_shift / smc_t_mask / smc_t_col_advance) selecting
+; direction.
+;
+; The stripe counter is negated: INC → negative means more full
+; stripes, zero means the final (possibly partial) stripe is next.
+; final_bias = y_end & 7 trims that last stripe — base is advanced by
+; the bias and Y starts at 7-bias so the loop stops exactly on y_end.
+; (In the single-stripe case the same adjustment is applied at setup.)
+;
+; Loop invariant: C=1 on entry (re-established after every step), so
+; `SBC delta_minor` computes d - dx directly; d lives in X.
+;
+; Pseudocode (forward case):
+;   d = dy - dx
+;   for each y from y0 down to y1:
+;       screen[base + Y] ^= mask
+;       d -= dx
+;       if d < 0:
+;           d += dy
+;           mask >>= 1                   # minor-axis step (x)
+;           if mask shifted out: base += 8; mask = $80   # next column
+;       Y -= 1                           # next scanline up
+;
 steep_setup:
     ; Entry: A = dx, Y = |dy|, delta_minor = |dy| (will be overwritten)
     STA delta_minor         ; delta_minor = dx
@@ -510,6 +603,11 @@ t_no_xstep:
 ; =============================================================================
 ; init_base — compute base pointer and mask from x0, y0
 ; Clobbers: A, X, Y
+; =============================================================================
+; Input:  x0, y0 (pixel coords), screen_page
+; Output: base    = (screen_page + y0/8) * 256 + (x0 & $F8)  # char cell
+;         Y       = y0 & 7          # scanline in cell; (base),Y = pixel byte
+;         mask_zp = $80 >> (x0 & 7) # MSB-first pixel bit
 ; =============================================================================
 
 init_base:

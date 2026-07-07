@@ -223,6 +223,13 @@ obj_debris:
 ; Input:  obj_pos populated with 6-byte world position
 ; Output: obj_view_x/y/z set
 ;         C=0 if visible, C=1 if behind camera
+; Clobbers: A
+;
+; Pseudocode:
+;   view_x = obj.x - cam_x           # world → camera-relative
+;   view_y = cam_y - obj.y           # Y flipped: screen Y grows downward
+;   view_z = obj.z - cam_z
+;   return C=0 if view_z > 0 else C=1   # at/behind camera → cull
 
 setup_obj_view:
     LDA obj_pos+0
@@ -266,6 +273,39 @@ setup_obj_view:
 ;   obj_view_x/y/z = view-space centre (set by caller)
 ;   obj_rot_angle = Y-axis rotation angle
 ;   obj_roll_angle = X-axis pitch angle
+; Outputs:
+;   Edges rasterised into the back buffer; obj_bb_min/max_sy updated
+;   with the screen-Y extent of everything drawn (for partial clears).
+; Clobbers: A, X, Y, ZP_OBJECT workspace, ZP_BUFFERS arrays, raster/clip regs
+;
+; Algorithm — two phases over the object data:
+;
+;   # Phase 1: transform & project every vertex (results → ZP buffers)
+;   sin,cos   = sincos(rot); rsin,rcos = sincos(roll)
+;   for v in vertices:
+;       y,z = rotate_x(v.y, v.z)         # pitch/roll about X (rsin,rcos)
+;       x,z = rotate_y(v.x, z)           # yaw about Y (sin,cos)
+;       vx  = view_x + x;  vy = view_y - y;  vz = view_z + z
+;       outcode[v] = clip_outcode(vx, vz)     # skipped if no-clip flag
+;       if vz > 0:
+;           r  = recip8(vz)                   # ~32768/vz
+;           sx = clamp(64 + hi(vx*r), 0, 127)
+;           sy = clamp(16 + hi(vy*r), 0, 159)
+;       else:
+;           sx, sy = 64, 80              # behind camera: park at centre;
+;                                        # real position comes from 3D clip
+;   # Phase 2: face-oriented draw
+;   for face in faces:                   # until $FF sentinel
+;       if screen cross(v0→v1, v0→v2) > 0: continue    # back-facing
+;       if no-clip or all face outcodes == 0:
+;           draw each edge once (32-bit dedup bitmap)
+;       else:                            # polygon clip walk
+;           for each polygon edge (v_i, v_i+1):
+;               both inside  -> draw with dedup
+;               both outside -> mark drawn, skip
+;               straddling   -> 3D clip vs L/R/near/far, project & draw;
+;                               remember 1st clip intersection, join it to
+;                               the 2nd with a boundary edge in obj_color
 
 draw_object:
     ; ── Phase 1: Transform & project vertices ──
@@ -517,6 +557,11 @@ draw_object:
     STA dy2                     ; v_c → $89
 
     ; ── Backface test ──
+    ; Screen-space cross product of the first two polygon edges:
+    ;   cross = dx1*dy2 - dy1*dx2, drawn only when cross <= 0.
+    ; sy deltas span ±159 so they are halved (arith >>1) to fit the
+    ; signed-byte smul8x8 inputs; this scales the cross by ~1/2 and
+    ; preserves its sign (up to floor-truncation on odd deltas).
     ; dx1 = sx[v_b] - sx[v_a]   (X = v_a)
     LDY dx2                     ; v_b
     LDA obj_proj_sx,Y
@@ -800,6 +845,19 @@ draw_object:
 ;         Bits: 0=left, 1=right, 2=near, 3=far
 ; Preserves: X
 ; Clobbers: A, Y
+;
+; The clip volume is an axis-aligned slab in view space (Y unbounded):
+;   -HALF_GRID_X <= vx <= HALF_GRID_X,  CLIP_NEAR <= vz <= CLIP_FAR
+; Each test computes the signed 16-bit margin and keeps only the sign
+; (final hi-byte N flag); outcode bit set when the margin is negative.
+;
+; Pseudocode:
+;   oc = 0
+;   if vx + HALF_GRID_X < 0: oc |= 1     # left
+;   if HALF_GRID_X - vx < 0: oc |= 2     # right
+;   if vz - CLIP_NEAR  < 0: oc |= 4      # near
+;   if CLIP_FAR - vz   < 0: oc |= 8      # far
+;   obj_vtx_clip[X] = oc
 
 compute_outcode:
     LDY #0                     ; outcode accumulator in Y
@@ -861,6 +919,13 @@ compute_outcode:
 ;         edge_tab_off ($83) set
 ; Output: edge drawn (or skipped if already drawn)
 ; Clobbers: A, X, Y, obj_n_vtx ($82), recip ($85), raster regs
+;
+; Pseudocode:
+;   if check_and_mark_edge(id): return          # already drawn this frame
+;   v_from, v_to, color = edge_table[id]        # 3 bytes at tab + id*3
+;   (x0,y0) = proj[v_from]; (x1,y1) = proj[v_to]
+;   update_bb(y0); update_bb(y1)
+;   draw_line(color); plot_final_pixel(x1)      # line is exclusive of end
 
 draw_edge_dedup:
     STA recip                   ; save edge_id → $85
@@ -919,6 +984,11 @@ draw_edge_dedup:
 ; Input:  recip ($85) = edge_id
 ; Output: C=1 if already drawn (skip), C=0 if newly marked
 ; Clobbers: A, X, Y
+;
+; Pseudocode:
+;   byte, bit = id >> 3, 1 << (id & 7)
+;   if obj_edge_drawn[byte] & bit: return C=1
+;   obj_edge_drawn[byte] |= bit;   return C=0
 
 check_and_mark_edge:
     LDA recip
@@ -950,6 +1020,17 @@ check_and_mark_edge:
 ;          local_z = (cos*lz - sin*lx) >> 7
 ; Trashes: math_a, math_b, math_res_lo/hi, A, X, Y
 ;          Uses stack for intermediate 16-bit value, vcoord_lo/hi as scratch
+;
+; sin_val/cos_val are signed Q7 (±127 ≈ ±1.0), so each product is a
+; signed 16-bit Q7 value; the ">>7" is done by shifting the 16-bit sum
+; left once and keeping the high byte (= arithmetic >>7, truncated to 8
+; bits).  Four smul8x8 calls total; math_b is reused across consecutive
+; calls that share a multiplicand (lx for 1-2, lz for 3-4).
+;
+; Pseudocode:
+;   lx2 = (cos*lx + sin*lz) >> 7      # standard 2D rotation of (lx,lz)
+;   lz2 = (cos*lz - sin*lx) >> 7
+;   local_x, local_z = lx2, lz2
 
 rotate_y:
     ; ── 1. sin * lx → push 16-bit result ──
@@ -1017,6 +1098,16 @@ rotate_y:
 ;          local_z = (sin*ly + cos*lz) >> 7
 ; Trashes: math_a, math_b, math_res_lo/hi, A, X, Y
 ;          Uses stack for intermediate 16-bit value, vcoord_lo/hi as scratch
+;
+; Same structure as rotate_y (see above): Q7 sin/cos, four smul8x8
+; calls, 16-bit sums reduced with ASL/ROL (arithmetic >>7).  Note the
+; sign pairing is the mirror of rotate_y's: for the same angle this
+; turns (ly,lz) in the opposite rotational sense.
+;
+; Pseudocode:
+;   ly2 = (cos*ly - sin*lz) >> 7      # 2D rotation of (ly,lz)
+;   lz2 = (sin*ly + cos*lz) >> 7
+;   local_y, local_z = ly2, lz2
 
 rotate_x:
     ; ── 1. sin * ly → push 16-bit result ──
@@ -1093,6 +1184,9 @@ sign_ext_sub:
 ; Output: vcoord_lo:vcoord_hi = base + sign_ext(A)
 ; Clobbers: A
 ; Preserves: X, Y
+;
+; Pseudocode:  vcoord = mem16[X] + A            # A sign-extended to 16 bits
+; (the sign extension is the hi-byte carry constant: +$00 or +$FF)
 
 sign_ext_add:
     CLC
@@ -1117,6 +1211,8 @@ sign_ext_add:
 ; Input:  A = screen Y value
 ; Output: obj_bb_min/max_sy updated
 ; Preserves: A, Y
+;
+; Pseudocode:  bb_min = min(bb_min, A);  bb_max = max(bb_max, A)
 
 update_bb:
     CMP obj_bb_min_sy

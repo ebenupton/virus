@@ -5,6 +5,15 @@
 ; Requires: particle_zp.inc, object_zp.inc, raster_zp.inc, math_zp.inc,
 ;           clip_zp.inc, video_zp.inc
 ; Emission is handled inline in game.s (thrust exhaust).
+;
+; Model: up to MAX_PARTICLES (16) point particles in struct-of-arrays
+; form.  Positions are 8.8 fixed point per axis (hi = world integer,
+; lo = fraction); velocities are signed bytes added to the .lo byte
+; each frame (i.e. velocity is in 1/256ths of a world unit per frame).
+; Each particle carries a countdown timer and dies on timer expiry or
+; on hitting the terrain.  Drawing is a single white pixel per
+; particle; the written byte addresses are recorded per back buffer so
+; the next frame using that buffer can erase them cheaply.
 
 .include "particle_zp.inc"
 .include "object_zp.inc"
@@ -38,7 +47,17 @@ ptl_clr_count:  .res 2    ; [0]=buf0 drawn count, [1]=buf1 drawn count
 ; =====================================================================
 ; random_byte — 16-bit Galois LFSR, returns random byte in A
 ; =====================================================================
+; Input:  particle_rng_lo/hi = LFSR state (must be seeded non-zero)
+; Output: A = new low byte of state (the random byte); state advanced
 ; Preserves: X, Y
+;
+; Left-shifting Galois form: on carry-out of bit 15 the feedback mask
+; $2D is XORed into the low byte.
+;
+; Pseudocode:
+;   state <<= 1                       # 16-bit shift
+;   if shifted-out bit: state ^= $002D
+;   return state & 0xFF
 
 random_byte:
     LDA particle_rng_lo
@@ -54,6 +73,21 @@ random_byte:
 ; clear_particles — AND-clear previously drawn particles from back buffer
 ; =====================================================================
 ; Runs after clear_screen. Uses back_buf_idx to select array half.
+;
+; Input:  back_buf_idx (0/1), ptl_clr_a0_lo/hi + ptl_clr_count records
+;         written by draw_particles two frames ago for this buffer
+; Output: each recorded screen byte zeroed; count reset to 0
+; Clobbers: A, X, Y, gm_scratch_2/3, ZP_SHARED+1/2 (pointer)
+;
+; Note: despite the banner name, the loop writes $00 to the whole
+; recorded byte (clearing both pixels of the pair) rather than ANDing
+; with ptl_clr_mask — the mask array is reserved but currently unused.
+;
+; Pseudocode:
+;   base  = 16 * back_buf_idx                 # record-array half
+;   for i in range(base, base + count[buf]):
+;       poke16(ptl_clr_a0[i], 0)              # zero the drawn byte
+;   count[buf] = 0
 
 clear_particles:
     LDX back_buf_idx
@@ -91,6 +125,25 @@ clear_particles:
 ; =====================================================================
 ; update_particles — Decrement timer, apply gravity + physics, GC
 ; =====================================================================
+; Input:  particle_count, ptl_* arrays
+; Output: positions integrated; expired/landed particles removed by
+;         swap-and-pop (order not preserved); particle_count updated
+; Clobbers: A, X, Y, gm_scratch_2/3 (via get_terrain_h8)
+;
+; Iterates X = count-1 .. 0 so swap-and-pop (which pulls the last live
+; slot down into X) never re-examines a moved particle.
+;
+; Pseudocode:
+;   for i in reversed(range(count)):
+;       timer[i] -= 1
+;       if timer[i] == 0: gc(i); continue
+;       vy[i] -= 1                        # gravity
+;       for axis in (y, x, z):            # 8.8 fixed-point integrate
+;           pos[i] += sign_extend(v[i])   # lo add + conditional hi carry
+;       # terrain kill: y is 16-bit, terrain height h*8 fits in one byte
+;       if y[i] < 0: gc(i)
+;       elif y_hi[i] == 0 and terrain_h8(x_hi[i], z_hi[i]) >= y_lo[i]: gc(i)
+;   def gc(i): count -= 1; slot[i] = slot[count]   # swap-and-pop
 
 update_particles:
     LDX particle_count
@@ -219,6 +272,29 @@ update_particles:
 ; draw_particles — Project 3D→2D, OR-draw single white pixel, record clear
 ; =====================================================================
 ; Clips against X and Z frustum planes. Single-pixel only.
+;
+; Input:  particle_count, ptl_* arrays, cam_x/y/z, back_buf_idx
+; Output: one white pixel OR-ed into the back buffer per visible
+;         particle; byte address recorded in ptl_clr_a0_lo/hi (this
+;         buffer's half) and ptl_clr_count[buf] set for clear_particles
+; Clobbers: A, X, Y, gm_scratch_0/2, obj_view_x/y/z, math/clip/raster regs
+;
+; Same view transform, clip slab and projection as the object renderer
+; (see setup_obj_view/compute_outcode in object.s), inlined per point.
+;
+; Pseudocode:
+;   rec = 16 * back_buf_idx                   # record-array half
+;   for each particle:
+;       vx = x - cam_x; vy = cam_y - y; vz = z - cam_z   # Y flipped
+;       if vz <= 0: continue
+;       if not (-HALF_GRID_X <= vx <= HALF_GRID_X): continue
+;       if not (CLIP_NEAR <= vz <= CLIP_FAR):        continue
+;       r  = recip8(vz)
+;       sx = clamp(64 + hi(vx*r), 0, 127)
+;       sy = clamp(16 + hi(vy*r), 0, 159)
+;       screen[byte(sx,sy)] |= $2A if sx even else $15   # MODE 2 white
+;       record[rec] = byte address; rec += 1
+;   ptl_clr_count[buf] = rec - 16*back_buf_idx
 
 draw_particles:
     LDA particle_count

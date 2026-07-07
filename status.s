@@ -30,6 +30,16 @@ score_drawn: .byte $FF, $FF, $FF, $FF   ; buffer 0
 ; init_status — Clear char row 0 and blit logo to both buffers
 ; =====================================================================
 ; Call once at startup, after init_screen.
+;
+; Input:  logo_data = 104 bytes (external, from status_data.inc)
+; Output: char row 0 (512 bytes) of both buffers zeroed; logo blitted
+;         to both at byte offset 8 (cell 1) of row 0
+; Clobbers: A, X
+;
+; Pseudocode:
+;   for base in ($3000, $5800):        # both frame buffers
+;       base[0:512] = 0                # char row 0
+;       base[8:8+104] = logo_data
 
 init_status:
     ; Clear char row 0 of both buffers (512 bytes each)
@@ -56,6 +66,25 @@ init_status:
 ; =====================================================================
 ; draw_status — Conditionally redraw score, update fuel bar
 ; =====================================================================
+; Input:  raster_page ($30/$58) selects buffer; score (4 BCD bytes,
+;         8 digits), fuel_target
+; Output: score digits re-rendered into this buffer's row 0 if they
+;         differ from score_drawn[buf]; fuel bar nudged one pixel
+;         toward fuel_target (via tail call to update_fuel)
+; Clobbers: A, X, Y, status_ptr, status_src, nmos_tmp
+;
+; Because row 0 persists (clear_screen skips it), each buffer caches
+; the last score it rendered; a redraw only happens when the score
+; changed since that buffer was last drawn to.
+;
+; Pseudocode:
+;   buf = 0 if raster_page == $30 else 1
+;   if score != score_drawn[buf]:
+;       score_drawn[buf] = score
+;       ptr = $3178 if buf == 0 else $5978      # row 0, cell 47
+;       for byte in score:                      # 4 bytes → 8 digits
+;           render_digit(byte >> 4); render_digit(byte & 15)
+;   update_fuel()                               # tail call
 
 draw_status:
     ; --- Check if score needs redrawing for current buffer ---
@@ -131,6 +160,16 @@ draw_status:
 
 ; render_digit — Render a single digit at status_ptr, advance by 16
 ;   A = digit value (0-9)
+;
+; Input:  A = digit, status_ptr = destination (cell-aligned, row 0)
+; Output: 16 font bytes copied (one glyph = 2 cells wide × 8 scanlines);
+;         status_ptr advanced by 16 to the next glyph position
+; Clobbers: A, Y, status_src   (preserves X)
+;
+; Pseudocode:
+;   src = font_data + digit*16        # glyphs are 16 bytes each
+;   dst[0:16] = src[0:16]
+;   status_ptr += 16
 render_digit:
     ; Compute status_src = font_data + A * 16
     ASL             ; ×2
@@ -167,6 +206,30 @@ render_digit:
 ;
 ; Grow pixel P: $08 (left green) if P even, $0C (both green) if P odd
 ; Shrink pixel P: $00 (both black) if P even, $08 (left green) if P odd
+;
+; Input:  raster_page, fuel_target, fuel_cur_0/1 (per-buffer level)
+; Output: at most one MODE 2 byte column (3 scanlines) rewritten;
+;         fuel_cur[buf] stepped ±1 toward fuel_target
+; Clobbers: A, X, Y, status_ptr, status_src
+;
+; Each buffer converges on fuel_target one pixel per frame, so a level
+; change animates as a smooth wipe.  A pixel pair shares one byte:
+; even positions are the byte's left pixel, odd its right — hence the
+; four write values above ($08/$0C draw, $00/$08 erase).
+;
+; Pseudocode:
+;   buf = 0 if raster_page == $30 else 1
+;   cur = fuel_cur[buf]
+;   if cur == fuel_target: return
+;   if cur > fuel_target:                 # shrink
+;       cur -= 1; P = cur
+;       val = $00 if P even else $08
+;   else:                                 # grow
+;       P = cur; cur += 1
+;       val = $08 if P even else $0C
+;   fuel_cur[buf] = cur
+;   col = (P & ~1) * 4                    # byte offset from column 15
+;   for i in range(3): bar_base[col + i] = val   # scanlines 3, 4, 5
 
 update_fuel:
     ; Set up bar base pointer: scanline 3 of byte column 15

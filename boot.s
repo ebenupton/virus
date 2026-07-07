@@ -11,6 +11,23 @@
 ; Number of pages to copy: CODE+HEIGHTMAP = $02BD-$2FFF = $2D43 bytes ≈ 46 pages
 CODE_PAGES = $2E
 
+; =====================================================================
+; boot_entry — Bare-metal bring-up, then relocate and enter the game
+; =====================================================================
+; Entered via DFS *RUN at $3000 with the OS still alive; after the SEI
+; here no OS routine is ever called again (OS workspace gets trashed).
+;
+; Pseudocode:
+;   disable IRQs, binary mode, S = $FF
+;   program CRTC R13..R0 from crtc_table     (custom MODE 2, 128x160)
+;   ULA control = $F4; load 16-entry identity palette
+;   System VIA: latch outputs, keyboard auto-scan off (manual polling),
+;               DDRA for keyboard column writes, all VIA IRQs disabled
+;   zero $0000-$01FF and BSS $0200-$02BC
+;   copy copy_stub -> $0100                  (stack page survives the copy)
+;   src=$00/01 <- boot_payload, dst=$02/03 <- $02BD, X=pages, Y=0
+;   jmp $0100                                (stub copies then JMPs $02BD)
+
 boot_entry:
     SEI
     CLD
@@ -92,6 +109,12 @@ boot_entry:
 
 ; Relocatable copy stub — runs at $0100
 ; Branch offsets are PC-relative so they work at any address.
+;
+; Contract on entry (set up above): ($00) = source = boot_payload,
+; ($02) = destination = $02BD, X = page count, Y = 0.
+; Copies X pages byte-by-byte (destination overwrites this loader's
+; original location, which is why the stub runs from the stack page),
+; then jumps to the game entry at $02BD.
 copy_stub:
     LDA ($00),Y
     STA ($02),Y
@@ -106,6 +129,7 @@ copy_stub_end:
 
 ; ── CRTC register table (indexed R0..R13) ──
 ; MODE 2 with R1=64 (128 pixels), R6=20 (160 scanlines), centered
+; R12:R13 = $0600 → display base $0600 × 8 = $3000 (frame buffer 0)
 crtc_table:
     ;     R0   R1   R2   R3   R4   R5   R6   R7
     .byte 127, 64,  90,  40,  38,  0,   20,  29

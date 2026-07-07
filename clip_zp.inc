@@ -9,6 +9,11 @@ CLIP_ZP_INC = 1
 .include "zp_layout.inc"
 
 ; ── Clipper API ─────────────────────────────────────────────────────
+; Camera-space segment endpoints, 16-bit little-endian.  Loaded by the
+; caller before the clip_line_* sequence; the plane clippers move the
+; outside endpoint onto the plane in place (and may swap P0/P1).
+; Layout is contiguous X0,Y0,Z0,X1,Y1,Z1 — clip_swap and lerp_coord
+; index across it (coord1 of a pair is always coord0 + 6 bytes).
 clip_x0     = ZP_CLIP + 0     ; 2 bytes — endpoint 0 X (8.8 signed)
 clip_y0     = ZP_CLIP + 2     ; 2 bytes — endpoint 0 Y (8.8 signed)
 clip_z0     = ZP_CLIP + 4     ; 2 bytes — endpoint 0 Z (8.8 signed)

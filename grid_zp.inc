@@ -18,6 +18,9 @@ ROW_STRIDE      = GRID_VTX_X * 3  ; bytes per vertex row in v_buf
 
 ; ── Outputs (set by draw_grid, read by game.s) ────────────────
 ; grid_min_sy must NOT be in ZP_GRID (overlaps ZP_BUFFERS during draw_object)
+; Doubles as the frame's dirty top: main_loop merges each drawn
+; object's obj_bb_min_sy into it, then stores it as the back buffer's
+; dirty_top (scan line, 0..160) for next frame's clear_screen.
 grid_min_sy     = $E8           ; minimum screen Y across all grid vertices
 
 ; ── Derived geometry constants ──────────────────────────────────────

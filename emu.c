@@ -671,6 +671,11 @@ int main(int argc, char *argv[])
     int headless = 0;
     int headless_frames = 0;
     int headless_keys = 0;   /* simulated key_state for headless mode */
+    int hash_mode = 0;       /* --hash: print FNV-1a64 of both screen buffers per frame */
+    /* --poke F:ADDR=VAL (repeatable): write VAL to ADDR at the START of frame F.
+     * Used by the bit-exactness sampler to inject ship/camera state. */
+    struct poke { int frame; uint16_t addr; uint8_t val; } pokes[64];
+    int n_pokes = 0;
     int boot_mode = 0;       /* --boot: fill RAM with garbage, load at $3000 */
     int log_mode = 0;        /* dump vertex coords to stderr each frame */
     const char *dump_dir = NULL;  /* if set, dump each scanout frame as 2x PPM */
@@ -696,6 +701,19 @@ int main(int argc, char *argv[])
             dump_mem_hi = (uint16_t)strtol(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--boot") == 0) {
             boot_mode = 1;
+        } else if (strcmp(argv[i], "--hash") == 0) {
+            hash_mode = 1;
+        } else if (strcmp(argv[i], "--poke") == 0 && i + 1 < argc && n_pokes < 64) {
+            int pf; unsigned pa, pv;
+            if (sscanf(argv[++i], "%d:%x=%x", &pf, &pa, &pv) == 3) {
+                pokes[n_pokes].frame = pf;
+                pokes[n_pokes].addr = (uint16_t)pa;
+                pokes[n_pokes].val = (uint8_t)pv;
+                n_pokes++;
+            } else {
+                fprintf(stderr, "bad --poke (want F:HEXADDR=HEXVAL): %s\n", argv[i]);
+                return 1;
+            }
         }
     }
 
@@ -782,6 +800,9 @@ int main(int argc, char *argv[])
         memset(fn_incl_cycles, 0, sizeof(fn_incl_cycles));
 
         for (int frame = 0; frame < headless_frames; frame++) {
+            for (int p = 0; p < n_pokes; p++)
+                if (pokes[p].frame == frame)
+                    memory[pokes[p].addr] = pokes[p].val;
             if (profile_mode) {
                 /* Step instruction-by-instruction, recording cycles per PC */
                 unsigned long frame_cycles = 0;
@@ -864,6 +885,16 @@ int main(int argc, char *argv[])
             profile_frame_count++;
 
 
+            if (hash_mode) {
+                /* FNV-1a 64 over both screen buffers ($3000-$7FFF) */
+                uint64_t h = 0xcbf29ce484222325ULL;
+                for (int a = 0x3000; a < 0x8000; a++) {
+                    h ^= memory[a];
+                    h *= 0x100000001b3ULL;
+                }
+                printf("%d %016llx\n", frame, (unsigned long long)h);
+            }
+
             if (dump_dir)
                 dump_frame_2x(dump_dir, dump_num++);
 
@@ -903,7 +934,7 @@ int main(int argc, char *argv[])
 
         /* Scanout final frame */
         scanout_to_argb(pixels, SCREEN_W * 4);
-        if (!profile_mode)
+        if (!profile_mode && !hash_mode)
             write_ppm(stdout, pixels);
 
         if (profile_mode) {
